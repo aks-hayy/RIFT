@@ -9,8 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from spoolstream.cluster import RiftClusterController, example_emulated_cluster
-from spoolstream.rift_yaml import write_yaml
+from rift.cluster import RiftClusterController, example_emulated_cluster
+from rift.rift_yaml import write_yaml
 
 
 JsonDict = dict[str, Any]

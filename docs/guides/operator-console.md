@@ -1,9 +1,9 @@
 # Operator Console Data
 
-The Seismic operator console is the current RIFT dashboard. It consumes the
-shipped local controller at `/api/rift` through a typed compatibility adapter.
-The Vite development server proxies that path to `RIFT_CONTROL_API`, which
-defaults to `http://127.0.0.1:8777`.
+The bundled RIFT operator console consumes the live local controller at
+`/api/rift` through the versioned API adapter. The contributor UI source lives
+under `ui/`; its development server may proxy to `RIFT_CONTROL_API`, which
+defaults to `http://127.0.0.1:8777`, but users run the packaged dashboard.
 
 The guided setup uses automatic Hugging Face discovery. Users select a task;
 RIFT supplies the repository and exact artifact after measuring the target
@@ -43,13 +43,13 @@ Preview surfaces can be disabled with `VITE_RIFT_PREVIEW_DATA=false`.
 Start the controller and console:
 
 ```powershell
-rift dashboard --no-browser
+rift start --no-browser
 ```
 
 In another terminal, verify the typed adapter against the live controller:
 
 ```powershell
-cd seismic-deploy-main
+cd ui
 npm run verify:controller
 ```
 
@@ -60,7 +60,7 @@ count.
 
 ## Known Boundary
 
-The console is source-checkout operational. Compiled frontend assets are not
-yet bundled into the Python wheel, and the current controller API predates the
-immutable `/api/rift/v1` contract. The adapter isolates that difference so the
-routes can migrate without another UI rewrite.
+The release console is bundled into the Python wheel and runs outside the
+source checkout. The current controller implementation exposes the legacy
+`/api/rift` paths alongside the documented versioned contract; unavailable
+routes render an explicit unavailable state rather than mock data.

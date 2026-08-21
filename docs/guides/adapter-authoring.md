@@ -88,7 +88,7 @@ GET /api/rift/v2/capabilities
 Run the shared suites before publishing an adapter:
 
 ```python
-from spoolstream.adapters.conformance import (
+from rift.adapters.conformance import (
     ArtifactConformanceSuite,
     BackendConformanceSuite,
 )

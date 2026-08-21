@@ -29,7 +29,7 @@ Not yet claimed by this increment: physical multi-node reliability, controller
 HA, mTLS rotation in production, real vLLM/SGLang/MLX acceptance, or a native
 RIFT inference engine. Those remain separately labelled below.
 
-Updated: 2026-08-18
+Updated: 2026-08-22
 
 This ledger distinguishes source-code completeness from real acceptance. A
 feature is not called production-ready because its interface exists or because
@@ -45,6 +45,8 @@ an emulated test passes.
   device was not available for physical execution.
 - `IMPLEMENTED_UNVERIFIED`: code and permission gates exist; target hardware or
   platform acceptance is still required.
+- `ARCHIVED_UNSHIPPED`: preserved for historical recovery but excluded from
+  the public release package and not counted as product capability.
 - `PENDING`: material product work remains.
 
 ## Roadmap Matrix
@@ -77,16 +79,17 @@ an emulated test passes.
 | 23. Mesh topology, routing, and leases | `EMULATED` | Sparse and consented intensive measurement plans, evidence-labelled links, local-first/privacy-aware routing, fallbacks, overload rerouting, and persisted policy-bound leases pass deterministic tests. | Measure heterogeneous physical links and carry real inference traffic directly between nodes under validated leases. |
 | 24. Mesh UI onboarding | `VERIFIED_LOCAL` | The TanStack setup flow consumes live mesh APIs, separates untrusted sightings from trusted nodes, exposes fingerprints, requires explicit approval, and production-builds locally. | Add browser E2E against physical discovery/pairing and recovery from expired or interrupted enrollment. |
 | 25. Controller recovery | `VERIFIED_TEST` | Recovery-key manual promotion and odd-quorum majority election primitives reject invalid keys, even/small quorums, and double votes. | Replicate state, fence stale controllers, transfer PKI custody, and verify manual and three-voter promotion under real partitions. |
-| 26. Android mesh client/node | `VERIFIED_STATIC` | Manifest/security tests cover HTTPS-only networking, non-exported telemetry, Keystore lease storage, local-first policy, explicit pairing UI, and an honest llama.cpp JNI boundary. | Install JDK/Android SDK, build and sign the APK, run physical enrollment/telemetry/remote inference, and integrate a real multi-ABI llama.cpp runtime. |
+| 26. Android mesh client/node | `ARCHIVED_UNSHIPPED` | The experimental Android project is preserved in `archive/native-android-2026-08-22`; no APK or Android runtime is part of this release branch. Python-side ADB/mass-storage discovery remains a transport contract only. | A future Android product must be developed and accepted separately with a real APK, device enrollment, telemetry, and inference runtime. |
 | 27. Mesh containers | `VERIFIED_STATIC` | Controller, node, gateway, and emulator OCI definitions plus Compose profiles pass static role, non-root, read-only, capability, health, volume, and secret checks. | Build/start images on an OCI host, verify Linux wheel compilation, mTLS, Compose networking, and NVIDIA passthrough. |
 | 28. Direct inference data plane | `IMPLEMENTED_UNVERIFIED` | The mTLS node agent now exposes a policy-gated `/v1/inference` proxy that derives upstream routes only from RIFT-managed service state, rejects arbitrary targets and streaming until raw-response forwarding is complete, and has deterministic upstream proxy coverage. | Bind inference requests to route leases, add direct streaming/backpressure, controller-side retry/fallback, request metrics, and physical saturation/failure tests. |
 
 ## Current Increment
 
-The operator lifecycle now has concise aliases: `rift up` is the explicit,
-permission-gated deployment path and `rift down --yes` is the explicit managed
-service stop path. These aliases share the existing plan/apply/destroy logic;
-they do not bypass download, install, remote, or launch permissions.
+The public lifecycle is intentionally small: `rift init`, `rift start`,
+`rift discover`, `rift plan`, `rift apply`, `rift status`, `rift doctor`, and
+`rift stop`. Model, backend, service, cluster, node, and system operations are
+grouped below those top-level commands; removed aliases are retained only in
+the historical development log.
 
 The controller state migration is complete for this increment. A fresh local
 or cluster controller creates a SQLite database in WAL mode and keeps the
@@ -105,17 +108,15 @@ physical multi-node serving.
 ## Latest Acceptance Run
 
 ```text
-Native build:                    39/39 compile and link steps passed
-Native and Python CTest suites:  24/24 passed
-CUDA execution target:          RTX 4060 Laptop GPU / sm_89
-CUDA runtime tests:             kernels, pipeline, speculation, KV, transformer, GPTQ passed
-Backend adapter conformance:    llama.cpp, vLLM, SGLang, MLX-LM passed
-Artifact adapter conformance:   GGUF, SafeTensors, AWQ, GPTQ, FP8, EXL2, MLX passed
-Third-party adapter loading:     backend and artifact entry-point fixtures passed
-Cluster control:                50-node placement, partition, recovery, rollout passed (emulated)
-PEP 517 native wheel:           rift-llm 1.1.0 built and installed
-Installed CLI smoke:            version, list, inspect, install-plan passed
-Pinned CUDA H2D calibration:    11.43 GB/s (8 MiB x 4 timed iterations)
+Pure-Python control-plane suites: 25/25 passed in an isolated verification venv
+Container manifest suite:         5/5 passed
+PEP 517 wheel:                   rift-llm 1.3.0 built successfully
+Wheel namespace audit:            61 rift entries, 0 spoolstream entries
+Bundled dashboard:                present in wheel
+Installed wheel smoke:            dashboard HTTP 200, controller health HTTP 200
+Release audit:                    PASS, 0 tracked/runtime violations, 0 unresolved licenses
+Model preservation:               4 weight-file SHA-256 comparisons matched after migration
+Native/Android acceptance:        archived or unverified; not counted as release evidence
 ```
 
 ## Release Position
@@ -139,11 +140,11 @@ native acceptance result. A Windows developer shell with the MSVC C++ workload
 must be installed before recreating the CUDA build and running CTest for this
 release candidate.
 
-RIFT is useful today as a local-workstation preview, llama.cpp operator, and
-testable Elastic Intelligence Mesh control-plane foundation. The UI can guide
-discovery and enrollment, while deterministic tests prove trust, topology,
-routing, lease, and recovery contracts. It is not yet honestly a production
-mesh or Kubernetes replacement. The next mesh release gate is authenticated
-controller ingress and direct inference across at least three heterogeneous
-physical nodes, including LAN/USB/Android discovery and failover; those gates
-cannot be substituted with more emulation on this machine.
+RIFT is useful today as a local-workstation operator, external-backend adapter
+host, and testable Elastic Intelligence Mesh control-plane foundation. The
+bundled UI can guide discovery and enrollment, while deterministic tests prove
+trust, topology, routing, lease, and recovery contracts. It is not yet
+honestly a production mesh or Kubernetes replacement. The next mesh release
+gate is authenticated controller ingress and direct inference across at least
+three heterogeneous physical nodes, including LAN/USB discovery and failover;
+those gates cannot be substituted with more emulation on this machine.

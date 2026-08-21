@@ -25,13 +25,13 @@ Search Hugging Face with hardware, artifact, disk, backend, and evidence
 constraints:
 
 ```powershell
-rift recommend --task chat --top 5
+rift model recommend --task chat --top 5
 ```
 
 For machine-readable output:
 
 ```powershell
-rift --json recommend --task coding --formats gguf,gptq > recommendations.json
+rift --json model recommend --task coding --formats gguf,gptq > recommendations.json
 ```
 
 RIFT labels recommendation quality as metadata, publisher evidence, curated
@@ -41,19 +41,19 @@ not presented as measured accuracy.
 ## 3. Generate Intent
 
 ```powershell
-rift generate --task chat --output rift.yaml
+rift model recommend --task chat --output rift.yaml
 ```
 
 For a private Hub-compatible endpoint:
 
 ```powershell
-rift generate --task chat --source private --endpoint https://models.example.com
+rift model recommend --task chat --source private --endpoint https://models.example.com
 ```
 
 For checkpoints already on disk:
 
 ```powershell
-rift generate --source local --models models/local --output rift.yaml
+rift model recommend --source local --models-dir models/local --output rift.yaml
 ```
 
 ## 4. Review The Plan
@@ -82,8 +82,6 @@ rift apply --config rift.yaml `
   --allow-install `
   --allow-launch
 
-# Equivalent concise deployment command:
-rift up --config rift.yaml --allow-download --allow-install --allow-launch
 ```
 
 Remote execution additionally requires `--allow-remote`.
@@ -99,15 +97,15 @@ rift service monitor --service chat --iterations 1
 Run a repeatable suite:
 
 ```powershell
-rift benchmark --service chat --suite --warmups 1 --repeats 3
+rift service benchmark --service chat --suite --warmups 1 --repeats 3
 ```
 
 Preview safe tuning candidates, then optionally measure them with controlled
 restarts:
 
 ```powershell
-rift tune --service chat
-rift tune --service chat --live --allow-restart
+rift service tune --service chat
+rift service tune --service chat --live --allow-restart
 ```
 
 Recovery remains permission-gated:
@@ -123,10 +121,7 @@ rift system backup --output .rift/backups/state-before-maintenance.db
 Stop a service without deleting model files:
 
 ```powershell
-rift destroy --service chat --yes
-
-# Equivalent concise stop command:
-rift down --service chat --yes
+rift stop --service chat --yes
 
 # Restore only after reviewing the validated backup; RIFT makes a pre-restore backup.
 rift system restore --input .rift/backups/state-before-maintenance.db --yes
@@ -134,29 +129,15 @@ rift system restore --input .rift/backups/state-before-maintenance.db --yes
 
 ## 7. Dashboard
 
-Install dashboard dependencies once from a source checkout:
-
-```powershell
-cd seismic-deploy-main
-npm install
-npm run verify:controller
-cd ..
-```
-
 Launch the operator interface and local control API:
 
 ```powershell
-rift dashboard --host 127.0.0.1 --port 8765 --control-port 8777
-rift dashboard --detach
+rift start --host 127.0.0.1 --port 8765 --control-port 8777
+rift start --detach
 ```
 
-RIFT searches the current checkout and parent directories for
-`seismic-deploy-main/`, then falls back to `dashboard/`. If the command is
-launched elsewhere, point it at the source explicitly:
-
-```powershell
-rift dashboard --root C:\path\to\RIFT\seismic-deploy-main
-```
+The dashboard is bundled with the installed wheel. Node.js is only required
+for contributors rebuilding the source UI under `ui/`.
 
 The UI is available at `http://127.0.0.1:8765`. Prometheus-format metrics are
 available at `http://127.0.0.1:8777/api/rift/metrics/prometheus`.
@@ -169,8 +150,8 @@ preview-only surfaces separately. See [Operator Console Data](operator-console.m
 Let RIFT discover the repository and exact artifact automatically:
 
 ```powershell
-rift pull --task chat --dry-run
-rift pull --task chat --output models/best
+rift model pull --task chat --dry-run
+rift model pull --task chat --output models/best
 ```
 
 The default flow does not ask for a Hugging Face repository ID. RIFT queries

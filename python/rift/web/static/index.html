@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RIFT // Control Plane</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1018; --panel:#111a26; --line:#263548; --text:#e8f0f8; --muted:#8ea3b8; --cyan:#57d5e6; --green:#61d095; --amber:#e8b86a; --red:#ef7d8a; }
+    * { box-sizing:border-box; } body { margin:0; min-width:320px; background:radial-gradient(circle at 12% 0%, #14283b 0, transparent 34rem), var(--bg); color:var(--text); font:14px/1.45 Inter, ui-sans-serif, system-ui, sans-serif; }
+    header { border-bottom:1px solid var(--line); padding:20px clamp(18px,4vw,52px); display:flex; justify-content:space-between; gap:24px; align-items:flex-start; }
+    .eyebrow { color:var(--cyan); font:11px/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing:.16em; text-transform:uppercase; }
+    h1 { margin:6px 0 0; font-size:24px; letter-spacing:.02em; } h2 { font-size:15px; margin:0; } p { margin:6px 0; color:var(--muted); }
+    main { max-width:1500px; margin:0 auto; padding:24px clamp(18px,4vw,52px) 52px; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:9px; align-items:center; } button { border:1px solid var(--line); background:#172536; color:var(--text); border-radius:4px; padding:8px 12px; cursor:pointer; } button:hover { border-color:var(--cyan); color:var(--cyan); } button.primary { background:#174657; border-color:#2e8190; }
+    .status { display:inline-flex; align-items:center; gap:8px; color:var(--muted); font:12px ui-monospace, SFMono-Regular, Consolas, monospace; } .dot { width:8px; height:8px; border-radius:50%; background:var(--amber); } .dot.ok { background:var(--green); } .dot.bad { background:var(--red); }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:20px 0; } .metric, .panel { border:1px solid var(--line); background:linear-gradient(145deg,rgba(20,35,52,.94),rgba(13,21,32,.96)); border-radius:6px; }
+    .metric { padding:15px; min-height:92px; } .metric label { display:block; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.08em; } .metric strong { display:block; margin-top:9px; font-size:21px; font-weight:550; }
+    .columns { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr); gap:12px; } .panel { overflow:hidden; } .panel > .panel-head { display:flex; justify-content:space-between; gap:12px; align-items:center; padding:13px 15px; border-bottom:1px solid var(--line); } .panel-body { padding:15px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { padding:10px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.08em; font-weight:500; } tr:last-child td { border-bottom:0; }
+    code, pre { font:12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; } pre { white-space:pre-wrap; overflow:auto; margin:0; color:#c6d8e9; } .muted { color:var(--muted); } .ok { color:var(--green); } .warn { color:var(--amber); } .bad { color:var(--red); }
+    .empty { color:var(--muted); padding:24px 0; text-align:center; } .error { color:var(--red); white-space:pre-wrap; } .section-gap { margin-top:12px; }
+    @media (max-width:900px) { .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .columns { grid-template-columns:1fr; } header { flex-direction:column; } }
+    @media (max-width:520px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><div class="eyebrow">RIFT // local control plane</div><h1>LLM deployment operations</h1><p>Live state from the RIFT controller. Estimates and measured results are kept separate.</p></div>
+    <div class="toolbar"><span id="connection" class="status"><i class="dot"></i> connecting</span><button class="primary" id="refresh">Refresh</button><button id="discover">Discover</button></div>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="metric"><label>Controller</label><strong id="controller">checking</strong></div>
+      <div class="metric"><label>Managed services</label><strong id="services-count">0</strong></div>
+      <div class="metric"><label>Active nodes</label><strong id="nodes-count">0</strong></div>
+      <div class="metric"><label>Latest report</label><strong id="latest-report">none</strong></div>
+    </section>
+    <section class="columns">
+      <div>
+        <div class="panel"><div class="panel-head"><h2>Services</h2><span class="muted">desired and observed state</span></div><div class="panel-body" id="services"><div class="empty">Loading live services...</div></div></div>
+        <div class="panel section-gap"><div class="panel-head"><h2>Deployment plan</h2><span class="muted">read-only view</span></div><div class="panel-body" id="plan"><div class="empty">Loading latest plan...</div></div></div>
+        <div class="panel section-gap"><div class="panel-head"><h2>Recent reports</h2><span class="muted">benchmarks and tuning</span></div><div class="panel-body" id="reports"><div class="empty">Loading reports...</div></div></div>
+      </div>
+      <div>
+        <div class="panel"><div class="panel-head"><h2>Hardware</h2><span class="muted">current workstation</span></div><div class="panel-body" id="hardware"><div class="empty">Loading hardware...</div></div></div>
+        <div class="panel section-gap"><div class="panel-head"><h2>Backends</h2><span class="muted">detected adapters</span></div><div class="panel-body" id="backends"><div class="empty">Loading backends...</div></div></div>
+        <div class="panel section-gap"><div class="panel-head"><h2>Events</h2><span class="muted">redacted operation timeline</span></div><div class="panel-body" id="events"><div class="empty">Loading events...</div></div></div>
+      </div>
+    </section>
+  </main>
+  <script src="/rift-config.js"></script>
+  <script>
+    const root = (window.RIFT_CONTROL_API || "").replace(/\/+$/, "") + "/api/rift";
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? "").replace(/[&<>\"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'\"':"&quot;"}[c]));
+    async function get(path) { const response = await fetch(root + path, {headers:{Accept:"application/json"}}); if (!response.ok) throw new Error(path + " returned HTTP " + response.status); return response.json(); }
+    function unavailable(id, error) { $(id).innerHTML = '<div class="error">Live data unavailable: ' + esc(error.message || error) + '</div>'; }
+    function serviceRows(data) { const entries = Object.entries(data || {}); if (!entries.length) return '<div class="empty">No RIFT-managed services.</div>'; return '<table><thead><tr><th>Service</th><th>State</th><th>Backend</th><th>Endpoint</th></tr></thead><tbody>' + entries.map(([name, value]) => { const v = value || {}; const runtime = v.runtime || {}; const phase = v.status || v.observed_state || v.desired_state || "unknown"; return '<tr><td><b>'+esc(name)+'</b><br><span class="muted">'+esc((v.model || {}).path || (v.model || {}).id || "model not selected")+'</span></td><td class="'+(String(phase).toLowerCase().includes("ready") ? "ok" : "warn")+'">'+esc(phase)+'</td><td>'+esc((v.backend || {}).name || (v.backend || {}).kind || v.selected_backend || "not selected")+'</td><td><code>'+esc(runtime.openai_base || (v.serving || {}).host && ((v.serving || {}).host + ":" + (v.serving || {}).port) || "not exposed")+'</code></td></tr>'; }).join('') + '</tbody></table>'; }
+    function backendRows(data) { const providers = (data || {}).providers || data || {}; const entries = Object.entries(providers); if (!entries.length) return '<div class="empty">No adapter diagnostics returned.</div>'; return '<table><thead><tr><th>Adapter</th><th>Available</th><th>Message</th></tr></thead><tbody>' + entries.map(([name, value]) => { const v=value||{}; const detection=v.detection||v; const ok=Boolean(detection.available); return '<tr><td><b>'+esc(name)+'</b></td><td class="'+(ok?'ok':'warn')+'">'+(ok?'ready':'not detected')+'</td><td class="muted">'+esc(detection.reason || detection.message || "adapter is not available")+'</td></tr>'; }).join('') + '</tbody></table>'; }
+    function reportRows(data) { const reports=(data||{}).reports||[]; if(!reports.length) return '<div class="empty">No benchmark reports yet.</div>'; return '<table><thead><tr><th>Model</th><th>Verdict</th><th>Tokens/sec</th></tr></thead><tbody>'+reports.slice(0,12).map(r=>'<tr><td>'+esc(r.model_path || "unknown")+'</td><td>'+esc(r.usability_verdict || r.status || "unknown")+'</td><td><code>'+esc(r.tokens_per_second ?? "not measured")+'</code></td></tr>').join('')+'</tbody></table>'; }
+    function eventRows(data) { const events=(data||{}).events||[]; if(!events.length) return '<div class="empty">No events recorded.</div>'; return '<pre>'+events.slice(-12).reverse().map(e=>esc(new Date(Number(e.created_unix_seconds||0)*1000).toLocaleTimeString()+"  "+(e.status||"info").toUpperCase()+"  "+(e.event||"event"))).join("\n")+'</pre>'; }
+    async function refresh() { $('connection').innerHTML='<i class="dot"></i> refreshing'; try { const [status, services, hardware, backends, plan, reports, events] = await Promise.all([get('/status'),get('/services'),get('/hardware'),get('/backends'),get('/plan'),get('/reports'),get('/timeline')]); $('connection').innerHTML='<i class="dot ok"></i> controller connected'; $('controller').textContent=status.ok?'online':'degraded'; $('services-count').textContent=Object.keys(services||{}).length; $('nodes-count').textContent=Object.keys((status||{}).nodes||{}).length || 'local'; $('latest-report').textContent=((reports||{}).reports||[]).length ? 'available' : 'none'; $('services').innerHTML=serviceRows(services); $('backends').innerHTML=backendRows(backends); $('reports').innerHTML=reportRows(reports); $('events').innerHTML=eventRows(events); $('hardware').innerHTML='<pre>'+esc(JSON.stringify(hardware||{},null,2))+'</pre>'; $('plan').innerHTML=plan && plan.available===false ? '<div class="empty">No deployment plan has been created.</div>' : '<pre>'+esc(JSON.stringify(plan||{},null,2))+'</pre>'; } catch(error) { $('connection').innerHTML='<i class="dot bad"></i> controller unavailable'; $('controller').textContent='offline'; ['services','hardware','backends','plan','reports','events'].forEach((id)=>unavailable(id,error)); } }
+    $('refresh').addEventListener('click', refresh); $('discover').addEventListener('click', async ()=>{ $('discover').disabled=true; try { await fetch(root+'/discover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({local:true})}); } finally { $('discover').disabled=false; await refresh(); } }); refresh(); setInterval(refresh,15000);
+  </script>
+</body>
+</html>

@@ -32,19 +32,17 @@ its loopback binding, or place it behind an authenticated TLS reverse proxy.
 
 ## Build Model
 
-The current `rift-llm` wheel includes the native CUDA extension even when a role
-only uses the Python control plane. Consequently, these image definitions use
-CUDA development and runtime bases and build a Linux wheel inside the builder
-stage. This is larger than the intended long-term control-plane image. Splitting
-the native survival runtime into an optional wheel is tracked architectural work;
-the images do not hide the present dependency.
+The RIFT control plane images are pure Python and do not require CUDA, CMake,
+Ninja, a compiler, or a native wheel build. Serving backends remain external
+processes managed by adapters. An inference worker can use the optional GPU
+Compose override when its separately managed backend needs NVIDIA passthrough.
 
 Requirements:
 
 - Docker Engine with Compose v2 and BuildKit
 - Internet access to the configured base-image and Python package registries
-- NVIDIA Container Toolkit only when using `deploy/compose.gpu.yaml`
-- Sufficient build disk for CUDA build layers
+- NVIDIA Container Toolkit only when a separately managed worker/backend uses
+  `deploy/compose.gpu.yaml`
 
 Build one role:
 
@@ -127,14 +125,15 @@ Verified in this development slice:
 - Exactly four role services are declared.
 - Every service has an explicit profile, health check, persistent state volume,
   read-only root filesystem, dropped capabilities, and no-new-privileges policy.
-- Dockerfiles use multi-stage wheel builds and non-root runtime users.
+- Dockerfiles use the pure-Python `python:3.12-slim` image and non-root runtime
+  users.
 - Static checks reject baked secret/key material and literal secret environment
   values.
 - Deploy-scoped Python entrypoints compile under the local Python interpreter.
 
 Not physically verified by the manifest test:
 
-- pulling the CUDA base images or compiling the Linux wheel
+- pulling the Python base images or starting the images with Docker/Compose
 - starting these images with Docker/Compose
 - NVIDIA runtime passthrough
 - a real CA-signed mutual-TLS node handshake

@@ -179,20 +179,14 @@ HA is an opt-in target, not a current production claim.
 
 ## Android Scope
 
-The Android module is a UI-first node/client scaffold. It includes:
+Android is an archived future client, not a shipped RIFT runtime in this
+release. The control plane retains ADB and removable-media discovery contracts
+so an independently developed node can be integrated later, but there is no
+APK, JNI library, or Android inference binary in the release tree.
 
-- passive controller mDNS discovery;
-- fingerprint review and pairing-code approval;
-- HTTPS-only controller and remote-inference clients;
-- a private foreground telemetry service;
-- Android Keystore AES-GCM storage for cached route leases;
-- deterministic local-first route choice; and
-- an explicit llama.cpp JNI boundary.
-
-No fake inference path is supplied. Local inference reports unavailable unless
-a real `librift_llama.so` and model are present. The APK has not been compiled or
-run on a physical device in the current workstation environment, and managed
-controller certificate rotation is not yet wired into the app.
+The archived design covers passive discovery, fingerprint review, pairing,
+HTTPS transport, local-first routing, and lease storage. None of those designs
+are counted as physical Android acceptance evidence.
 
 ## Container Roles
 
@@ -242,10 +236,11 @@ See [RIFT Controller OpenAPI](../reference/rift-controller.openapi.yaml) and
 
 ## Persistent State
 
-The controller stores mesh state below `.rift/mesh/`:
+The controller stores mesh state below the platform runtime directory:
+`RIFT_HOME/mesh/` (for example `%LOCALAPPDATA%/RIFT/mesh` on Windows).
 
 ```text
-.rift/mesh/
+RIFT_HOME/mesh/
   enrollment.json
   links.json
   route-leases.json

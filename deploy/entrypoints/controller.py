@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from spoolstream.server import serve_rift
+from rift.server import serve_rift
 
 
 def main() -> None:

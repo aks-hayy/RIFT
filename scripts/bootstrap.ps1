@@ -17,12 +17,13 @@ if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 10)) 
     throw "RIFT requires Python 3.10 or newer; detected $version."
 }
 
-$venv = Join-Path (Get-Location) ".venv"
+$root = (Get-Location).Path
+$venv = Join-Path $root ".venv"
 if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
     & $python -m venv $venv
 }
 $venvPython = Join-Path $venv "Scripts\python.exe"
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install .
+& $venvPython -m pip install --no-cache-dir $root
 
 Write-Host "RIFT is ready. Start it with: .\.venv\Scripts\rift.exe start"

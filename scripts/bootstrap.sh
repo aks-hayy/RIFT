@@ -21,9 +21,11 @@ if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 10 ]; }; then
     exit 1
 fi
 
+root_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root_dir"
 if [ ! -x .venv/bin/python ]; then
     "$python_cmd" -m venv .venv
 fi
 .venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install .
+.venv/bin/python -m pip install --no-cache-dir "$root_dir"
 echo "RIFT is ready. Start it with: .venv/bin/rift start"

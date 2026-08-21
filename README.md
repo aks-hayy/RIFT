@@ -44,12 +44,38 @@ published, estimated, and emulated evidence separately.
   consent-gated private-subnet/USB/ADB bootstrap, explicit pairing, controller
   CA-issued mTLS identities, live topology evidence, policy-aware routing, and
   short-lived route leases. Physical heterogeneous-node acceptance is pending.
-- Reproducible controller, node, gateway, and emulator container definitions,
-  plus an Android node/client scaffold with encrypted lease storage and an
-  explicit llama.cpp JNI boundary.
+- Reproducible controller, node, gateway, and emulator container definitions.
+  Mobile and native runtime experiments are preserved outside the release
+  branch in the archival source tag.
 
 See the [verified roadmap status](docs/roadmap/status.md) for exact support
 levels and unresolved production gates.
+
+## Fresh Clone
+
+The intended first-run workflow requires only Python 3.10+ and network access
+to install the declared Python dependencies. It does not install a model,
+serving backend, GPU runtime, or compiler.
+
+Windows:
+
+```powershell
+git clone <rift-repository>
+cd rift
+.\scripts\bootstrap.ps1
+.\.venv\Scripts\rift.exe start
+```
+
+Linux/macOS:
+
+```bash
+git clone <rift-repository>
+cd rift
+./scripts/bootstrap.sh
+./.venv/bin/rift start
+```
+
+The dashboard opens to onboarding. Use `--no-browser` on headless machines.
 
 ## Install From Source
 
@@ -101,7 +127,7 @@ rift model pull --task chat --dry-run
 rift model pull --task chat --output models/best
 
 # Generate explainable intent and review every action.
-rift model recommend --task chat --write-report .rift/reports/recommendations.json
+rift model recommend --task chat --write-report recommendations.json
 rift plan --config rift.yaml
 
 # Nothing downloads, installs, or launches without these explicit permissions.

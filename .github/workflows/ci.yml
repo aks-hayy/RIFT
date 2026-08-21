@@ -9,17 +9,20 @@ permissions:
 
 jobs:
   control-plane:
-    name: Python control plane
+    name: Python ${{ matrix.python-version }} control plane
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
-      - name: Install control-plane dependencies
-        run: python -m pip install PyYAML zeroconf cryptography
-      - name: Release provenance audit
-        run: python scripts/audit_release.py --root . --json
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package
+        run: python -m pip install --upgrade pip && python -m pip install .
       - name: Run deterministic Python suites
         shell: bash
         run: |
@@ -27,49 +30,54 @@ jobs:
           for test_file in tests/python/*_tests.py; do
             python "$test_file"
           done
+      - name: Release audit
+        run: python scripts/verify_release.py
 
-  dashboard:
-    name: Dashboard
+  package:
+    name: Wheel and clean install
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --no-isolation
+      - name: Install produced wheel in a clean environment
+        run: |
+          python -m venv /tmp/rift-clean-venv
+          /tmp/rift-clean-venv/bin/python -m pip install dist/*.whl
+          /tmp/rift-clean-venv/bin/rift --version
+          /tmp/rift-clean-venv/bin/rift --help
+
+  dashboard-source:
+    name: Dashboard source checks
+    runs-on: ubuntu-latest
+    if: ${{ hashFiles('ui/package.json') != '' }}
     defaults:
       run:
-        working-directory: seismic-deploy-main
+        working-directory: ui
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: seismic-deploy-main/package-lock.json
+          cache-dependency-path: ui/package-lock.json
       - run: npm ci
       - run: npm run lint
       - run: npx tsc --noEmit
       - run: npm run build
 
-  android:
-    name: Android client
+  containers:
+    name: Container manifest checks
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: android
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          submodules: recursive
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-      - uses: android-actions/setup-android@v3
-      - name: Install Android toolchain
-        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" "cmake;3.31.6"
-      - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.13"
-      - name: Run Android unit tests
-        run: gradle testDebugUnitTest
-      - name: Assemble debug APK
-        run: gradle assembleDebug
-
-# Native C++/CUDA acceptance runs on real CUDA hardware through CMakePresets.
-# A public self-hosted runner matrix will be added before the stable release.
+          python-version: "3.12"
+      - run: python tests/python/container_manifest_tests.py

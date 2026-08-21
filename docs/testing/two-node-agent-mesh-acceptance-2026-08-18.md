@@ -56,8 +56,14 @@ resource inventory before the controller should place workloads there.
 The temporary model services were stopped through RIFT, the controller and node
 containers and bridge network were removed, the ephemeral certificate/state
 directory was deleted, and the pre-test RIFT state backup was restored. The
-frontend dependencies remain installed in `seismic-deploy-main` so the UI can be
-started reproducibly; no model files were deleted.
+frontend dependencies remain installed in the historical checkout so the UI
+could be started reproducibly; the release tree now uses `ui/` as its only
+dashboard source and does not commit its dependency directory. No model files
+were deleted.
+
+This report predates the platform runtime-path migration. Its `.rift/reports/`
+references identify the original evidence location; current reports belong
+under the platform-specific `RIFT_HOME` reports directory.
 
 Reports generated during the run:
 

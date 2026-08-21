@@ -11,29 +11,20 @@ not a relicensing statement for those projects.
 | PyYAML | MIT | https://github.com/yaml/pyyaml/blob/main/LICENSE |
 | zeroconf | LGPL-2.1-or-later | https://github.com/python-zeroconf/python-zeroconf/blob/master/LICENSE |
 | cryptography | Apache-2.0 or BSD-3-Clause | https://github.com/pyca/cryptography/blob/main/LICENSE |
-| scikit-build-core | BSD-3-Clause | https://github.com/scikit-build/scikit-build-core/blob/main/LICENSE.txt |
-
-The exact versions used by a build are defined by the lockfiles or installer
-environment. Run `python scripts/audit_release.py --json` before packaging.
+The exact versions used by a build are defined by the package metadata and
+installer environment. Run `python scripts/audit_release.py --json` before
+packaging.
 
 ## Operator Console Dependencies
 
-The `seismic-deploy-main/` console is a separate npm application. Its direct
-and development dependencies, resolved versions, and package-declared
-licenses are recorded in `seismic-deploy-main/package-lock.json`. The release
-audit reads that lockfile and reports any missing package license metadata.
+The `ui/` dashboard source is a separate npm application. Its direct and
+development dependencies, resolved versions, and package-declared licenses
+are recorded in `ui/package-lock.json`. The release audit reads that lockfile
+and reports any missing package license metadata. The packaged Python wheel
+does not require those development dependencies.
 
-## Android Client Dependencies
-
-The Android client records resolved Gradle dependencies in its release SBOM:
-
-| Dependency | License | Upstream notice |
-| --- | --- | --- |
-| AndroidX Compose, Room, WorkManager, and lifecycle | Apache-2.0 | https://developer.android.com/ |
-| Kotlin coroutines | Apache-2.0 | https://github.com/Kotlin/kotlinx.coroutines/blob/master/LICENSE.txt |
-| Tink Android | Apache-2.0 | https://github.com/tink-crypto/tink-java/blob/master/LICENSE |
-| Bouncy Castle | MIT-style | https://www.bouncycastle.org/licence.html |
-| llama.cpp (pinned submodule) | MIT | https://github.com/ggml-org/llama.cpp/blob/master/LICENSE |
+Native-survival and Android experiments are preserved in the archival Git tag
+and are not part of the release tree or release dependency inventory.
 
 ## External Backends And Models
 

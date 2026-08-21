@@ -96,7 +96,12 @@ This is a lifecycle smoke test. It proves the control-plane path and a real loca
 - It does not benchmark model quality against an external evaluation set.
 - The recovery test exercises RIFT-managed restart, not an externally killed process or machine loss.
 - The RIFT gateway was not started in this run; the backend endpoint was tested directly through RIFT's benchmark command.
-- The native CUDA extension build remains a separate toolchain concern; this lifecycle used the managed external `llama.cpp` provider.
+- The optional native-survival experiments were outside this lifecycle; the
+  tested path used the managed external `llama.cpp` provider.
+
+This report predates the platform runtime-path migration. Its `.rift/`
+references identify the original evidence location; current state and reports
+belong under the platform-specific `RIFT_HOME` directory.
 
 ## Evidence Files
 
@@ -109,4 +114,3 @@ This is a lifecycle smoke test. It proves the control-plane path and a real loca
 - `.rift/reports/e2e-recovery-monitor.json`
 - `.rift/reports/1787062576-chat-benchmark-suite.json`
 - `.rift/reports/1787062705-chat-live-tuning.json`
-

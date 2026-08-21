@@ -105,9 +105,10 @@ class ContainerManifestTests(unittest.TestCase):
         for name, dockerfile in EXPECTED_DOCKERFILES.items():
             text = (ROOT / dockerfile).read_text(encoding="utf-8")
             with self.subTest(image=name):
-                self.assertRegex(text, r"(?m)^FROM\s+nvidia/cuda:[^\s]+-devel-[^\s]+\s+AS\s+builder")
-                self.assertRegex(text, r"(?m)^FROM\s+nvidia/cuda:[^\s]+-runtime-[^\s]+")
-                self.assertIn("pip wheel", text)
+                self.assertRegex(text, r"(?m)^FROM\s+python:3\.12-slim\s*$")
+                self.assertIn("pip install --no-cache-dir .", text)
+                self.assertNotIn("CMAKE_ARGS", text)
+                self.assertNotIn("nvidia/cuda", text)
                 self.assertRegex(text, r"(?m)^USER\s+(?!root\b)\S+")
                 self.assertRegex(text, r"(?m)^(ENTRYPOINT|CMD)\s+")
 

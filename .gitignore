@@ -39,16 +39,6 @@ __pycache__/
 .ruff_cache/
 
 # Dashboard dependencies and generated output
-dashboard/node_modules/
-dashboard/.output/
-dashboard/.tanstack/
-dashboard/.wrangler/
-dashboard/.lovable/
-seismic-deploy-main/node_modules/
-seismic-deploy-main/.output/
-seismic-deploy-main/.tanstack/
-seismic-deploy-main/.wrangler/
-seismic-deploy-main/.npm-cache/
 ui/node_modules/
 ui/.output/
 ui/.tanstack/
@@ -56,7 +46,6 @@ ui/.wrangler/
 ui/.npm-cache/
 
 # Platform runtime data when an operator points RIFT at the checkout
-RIFT/
 .rift-runtime/
 
 # Editor and operating-system files

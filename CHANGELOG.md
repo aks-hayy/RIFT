@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.3.0-rc1 - 2026-08-22
+
+### Release Hardening
+
+- Converted the public distribution to a pure-Python, cross-platform control
+  plane with no CUDA, CMake, compiler, or Node.js requirement for users.
+- Added platform-aware `RiftPaths`, backup-first checkout migration, durable
+  operation IDs, request-id idempotency, and a bounded reconciliation loop.
+- Reduced the CLI to the canonical workflow and grouped expert operations under
+  `model`, `backend`, `service`, `cluster`, `node`, and `system`.
+- Bundled the live dashboard into the wheel and added clean-clone bootstrap
+  scripts for Windows, Linux, and macOS.
+- Rebuilt controller, node, gateway, and emulator images on `python:3.12-slim`;
+  external serving backends remain adapter-managed and are never bundled.
+- Preserved native-survival and Android experiments in the archival Git tag
+  `archive/native-android-2026-08-22`; they are excluded from the release tree.
+
+### Verification Boundary
+
+The release candidate has deterministic control-plane, packaging, dashboard,
+state, recommendation, adapter, gateway, mesh, and container-manifest tests.
+Physical multi-node reliability, controller HA with PostgreSQL/Redis, mTLS
+rotation, and provider acceptance on Linux/Apple hardware remain explicitly
+`UNVERIFIED_EXTERNAL` until field evidence exists.
+
 ## 1.3.0-rc - 2026-08-18
 
 ### Recommendation Evidence And Release Hygiene
