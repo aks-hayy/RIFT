@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.0-rc1 - 2026-08-22
+## 1.3.0 - 2026-08-22
 
 ### Release Hardening
 
@@ -19,7 +19,7 @@
 
 ### Verification Boundary
 
-The release candidate has deterministic control-plane, packaging, dashboard,
+The release has deterministic control-plane, packaging, dashboard,
 state, recommendation, adapter, gateway, mesh, and container-manifest tests.
 Physical multi-node reliability, controller HA with PostgreSQL/Redis, mTLS
 rotation, and provider acceptance on Linux/Apple hardware remain explicitly
@@ -47,7 +47,7 @@ rotation, and provider acceptance on Linux/Apple hardware remain explicitly
   canonical operator console and removed generated outputs and the redundant
   source ZIP from the working tree.
 
-This is a release candidate for the verified local control-plane scope. It is
+This release covers the verified local control-plane scope. It is
 not a claim of universal model quality, production Kubernetes equivalence, or
 physical multi-node/provider acceptance.
 

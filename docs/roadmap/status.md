@@ -138,7 +138,7 @@ Native CMake/CTest:              blocked before compile; VS BuildTools has no cl
 The native blocker is an environment/toolchain prerequisite, not a passing
 native acceptance result. A Windows developer shell with the MSVC C++ workload
 must be installed before recreating the CUDA build and running CTest for this
-release candidate.
+release.
 
 RIFT is useful today as a local-workstation operator, external-backend adapter
 host, and testable Elastic Intelligence Mesh control-plane foundation. The
