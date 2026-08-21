@@ -1,0 +1,15 @@
+version: 1
+node_id: container-node
+host: 0.0.0.0
+port: 11750
+tls:
+  certificate: /run/secrets/rift/node.crt
+  private_key: /run/secrets/rift/node.key
+  client_ca: /run/secrets/rift/controller-ca.crt
+  minimum_version: TLSv1.2
+  client_certificate_required: true
+permissions:
+  allow_download: false
+  allow_install: false
+  allow_launch: false
+max_request_bytes: 4194304

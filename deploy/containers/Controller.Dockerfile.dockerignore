@@ -1,0 +1,16 @@
+*
+!CMakeLists.txt
+!pyproject.toml
+!README.md
+!CHANGELOG.md
+!LICENSE
+!native/
+!native/**
+!python/
+!python/**
+!docs/
+!docs/**
+!examples/
+!examples/**
+!deploy/
+!deploy/**

@@ -1,0 +1,137 @@
+{
+  "name": "rift-mesh",
+  "services": {
+    "controller": {
+      "build": {
+        "context": "..",
+        "dockerfile": "deploy/containers/Controller.Dockerfile"
+      },
+      "image": "rift/controller:local",
+      "profiles": ["mesh", "emulation"],
+      "init": true,
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "tmpfs": ["/tmp:rw,noexec,nosuid,size=64m"],
+      "environment": {
+        "RIFT_CONTROLLER_HOST": "0.0.0.0",
+        "RIFT_CONTROLLER_PORT": "8777"
+      },
+      "ports": ["127.0.0.1:${RIFT_CONTROLLER_PORT:-8777}:8777"],
+      "volumes": ["controller_state:/var/lib/rift"],
+      "networks": ["rift_mesh"],
+      "healthcheck": {
+        "test": ["CMD", "python3", "/opt/rift/deploy/healthcheck.py", "controller"],
+        "interval": "10s",
+        "timeout": "4s",
+        "retries": 5,
+        "start_period": "30s"
+      },
+      "restart": "unless-stopped"
+    },
+    "node": {
+      "build": {
+        "context": "..",
+        "dockerfile": "deploy/containers/Node.Dockerfile"
+      },
+      "image": "rift/node:local",
+      "profiles": ["mesh"],
+      "init": true,
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "tmpfs": ["/tmp:rw,noexec,nosuid,size=64m"],
+      "environment": {
+        "RIFT_NODE_PORT": "11750",
+        "RIFT_NODE_HEALTH_CA": "/run/secrets/rift/controller-ca.crt",
+        "RIFT_NODE_HEALTH_CERT": "/run/secrets/rift/health-client.crt",
+        "RIFT_NODE_HEALTH_KEY": "${RIFT_NODE_HEALTH_KEY:-/run/secrets/rift/health-client.key}"
+      },
+      "ports": ["${RIFT_NODE_PORT:-11750}:11750"],
+      "volumes": [
+        "node_state:/var/lib/rift",
+        "./config/node-agent.yaml:/etc/rift/node-agent.yaml:ro",
+        "${RIFT_SECRETS_DIR:-./secrets}:/run/secrets/rift:ro"
+      ],
+      "networks": ["rift_mesh"],
+      "healthcheck": {
+        "test": ["CMD", "python3", "/opt/rift/deploy/healthcheck.py", "node"],
+        "interval": "10s",
+        "timeout": "4s",
+        "retries": 5,
+        "start_period": "30s"
+      },
+      "restart": "unless-stopped"
+    },
+    "gateway": {
+      "build": {
+        "context": "..",
+        "dockerfile": "deploy/containers/Gateway.Dockerfile"
+      },
+      "image": "rift/gateway:local",
+      "profiles": ["mesh"],
+      "init": true,
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "tmpfs": ["/tmp:rw,noexec,nosuid,size=64m"],
+      "environment": {
+        "RIFT_GATEWAY_PORT": "11734",
+        "RIFT_GATEWAY_API_KEYS": "${RIFT_GATEWAY_API_KEYS:-}"
+      },
+      "ports": ["${RIFT_GATEWAY_PORT:-11734}:11734"],
+      "volumes": [
+        "gateway_state:/var/lib/rift",
+        "./config/rift.yaml:/etc/rift/rift.yaml:ro"
+      ],
+      "networks": ["rift_mesh"],
+      "healthcheck": {
+        "test": ["CMD", "python3", "/opt/rift/deploy/healthcheck.py", "gateway"],
+        "interval": "10s",
+        "timeout": "4s",
+        "retries": 5,
+        "start_period": "30s"
+      },
+      "restart": "unless-stopped"
+    },
+    "emulator": {
+      "build": {
+        "context": "..",
+        "dockerfile": "deploy/containers/Emulator.Dockerfile"
+      },
+      "image": "rift/emulator:local",
+      "profiles": ["emulation"],
+      "init": true,
+      "read_only": true,
+      "cap_drop": ["ALL"],
+      "security_opt": ["no-new-privileges:true"],
+      "tmpfs": ["/tmp:rw,noexec,nosuid,size=64m"],
+      "environment": {
+        "RIFT_EMULATOR_HOST": "0.0.0.0",
+        "RIFT_EMULATOR_PORT": "8788"
+      },
+      "ports": ["127.0.0.1:${RIFT_EMULATOR_PORT:-8788}:8788"],
+      "volumes": ["emulator_state:/var/lib/rift"],
+      "networks": ["rift_mesh"],
+      "healthcheck": {
+        "test": ["CMD", "python3", "/opt/rift/deploy/healthcheck.py", "emulator"],
+        "interval": "10s",
+        "timeout": "4s",
+        "retries": 5,
+        "start_period": "30s"
+      },
+      "restart": "unless-stopped"
+    }
+  },
+  "volumes": {
+    "controller_state": {},
+    "node_state": {},
+    "gateway_state": {},
+    "emulator_state": {}
+  },
+  "networks": {
+    "rift_mesh": {
+      "driver": "bridge"
+    }
+  }
+}

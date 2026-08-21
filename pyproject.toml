@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rift-llm"
+version = "1.3.0"
+description = "Hardware-aware deployment, orchestration, and operations for local LLM servers"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0.2",
+    "zeroconf>=0.132.0",
+    "cryptography>=42.0"
+]
+license = "Apache-2.0"
+authors = [
+    { name = "RIFT contributors" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence"
+]
+
+[project.scripts]
+rift = "rift.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "mypy>=1.10"
+]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["rift*"]
+
+[tool.setuptools.package-data]
+"rift" = ["web/static/**/*", "web/static/*"]

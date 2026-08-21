@@ -1,0 +1,273 @@
+openapi: 3.1.0
+info:
+  title: RIFT Adapter and Recommendation API
+  version: 2.0.0
+  description: |
+    Live controller API for versioned backend/artifact adapters, exact-artifact
+    compatibility, persisted recommendation runs, plans, and permission-gated
+    verification tournaments. Responses preserve adapter diagnostics and
+    evidence boundaries rather than substituting mock readiness.
+servers:
+  - url: http://127.0.0.1:8777/api/rift/v2
+tags:
+  - name: Adapters
+  - name: Artifacts
+  - name: Recommendations
+  - name: Verification
+paths:
+  /adapters:
+    get:
+      tags: [Adapters]
+      summary: List dynamically discovered backend adapters.
+      responses:
+        "200":
+          description: Backend adapter registry and diagnostics.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdapterCollection" }
+  /adapters/{adapterId}:
+    get:
+      tags: [Adapters]
+      summary: Inspect one backend adapter and its capabilities.
+      parameters:
+        - name: adapterId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Adapter details.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+        "404": { description: Adapter not found. }
+  /artifact-adapters:
+    get:
+      tags: [Adapters]
+      summary: List dynamically discovered artifact adapters.
+      responses:
+        "200":
+          description: Artifact adapter registry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdapterCollection" }
+  /converter-adapters:
+    get:
+      tags: [Adapters]
+      summary: List independently packaged, permission-gated converter adapters.
+      responses:
+        "200":
+          description: Converter adapter registry.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AdapterCollection" }
+  /capabilities:
+    get:
+      tags: [Adapters]
+      summary: Get normalized backend and artifact capability manifests.
+      responses:
+        "200":
+          description: Capability graph.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /artifacts:
+    get:
+      tags: [Artifacts]
+      summary: List persisted exact local artifact manifests.
+      responses:
+        "200":
+          description: Artifact manifests.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /artifacts/inspect:
+    post:
+      tags: [Artifacts]
+      summary: Inspect and hash a local artifact path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_path]
+              properties:
+                model_path: { type: string }
+                hash_mode: { type: string, enum: [none, metadata, model, all], default: model }
+      responses:
+        "200":
+          description: Exact artifact manifest and verification.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+        "400": { description: Invalid path or request. }
+  /compatibility:
+    post:
+      tags: [Artifacts]
+      summary: Rank all enabled backend adapters for an artifact and hardware profile.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artifact]
+              properties:
+                artifact: { $ref: "#/components/schemas/OpenObject" }
+                hardware: { $ref: "#/components/schemas/OpenObject" }
+                task: { type: string, default: chat }
+      responses:
+        "200":
+          description: Manifest-driven compatibility results.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /recommendations:
+    post:
+      tags: [Recommendations]
+      summary: Run format-neutral bounded model discovery and persist the result.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task: { type: string, default: chat }
+                top: { type: integer, minimum: 1, default: 10 }
+                candidate_limit: { type: integer, minimum: 1, maximum: 1000, default: 250 }
+                max_download_gb: { type: number, exclusiveMinimum: 0 }
+                formats: { oneOf: [{type: string}, {type: array, items: {type: string}}] }
+                include_gated: { type: boolean, default: false }
+                refresh: { type: boolean, default: false }
+                endpoint: { type: string, format: uri }
+      responses:
+        "200":
+          description: Recommendation Contract V2 run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecommendationRun" }
+  /recommendation-runs:
+    get:
+      tags: [Recommendations]
+      summary: List persisted recommendation runs.
+      responses:
+        "200":
+          description: Run summaries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /recommendation-runs/{runId}:
+    get:
+      tags: [Recommendations]
+      summary: Load one immutable recommendation run.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[A-Za-z0-9_.-]+$" }
+      responses:
+        "200":
+          description: Full recommendation run.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecommendationRun" }
+        "404": { description: Run not found. }
+  /plans:
+    post:
+      tags: [Recommendations]
+      summary: Materialize a persisted recommendation category into a deployment plan.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recommendation_run_id]
+              properties:
+                recommendation_run_id: { type: string }
+                selector: { type: string, default: best_estimated }
+                output: { type: string }
+      responses:
+        "200":
+          description: Materialized configuration and read-only plan.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /verification-runs:
+    get:
+      tags: [Verification]
+      summary: List persisted verification runs.
+      responses:
+        "200":
+          description: Verification summaries.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+    post:
+      tags: [Verification]
+      summary: Run a permission-gated install/pull/launch/benchmark/teardown tournament.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recommendation_run_id]
+              properties:
+                recommendation_run_id: { type: string }
+                finalists: { type: integer, minimum: 1, maximum: 10, default: 3 }
+                prompt: { type: string }
+                max_tokens: { type: integer, minimum: 1, default: 32 }
+                allow_download: { type: boolean, default: false }
+                allow_install: { type: boolean, default: false }
+                allow_launch: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Blocked preflight or completed verification result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+  /verification-runs/{runId}:
+    get:
+      tags: [Verification]
+      summary: Load one verification run.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string, pattern: "^[A-Za-z0-9_.-]+$" }
+      responses:
+        "200":
+          description: Full verification result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OpenObject" }
+        "404": { description: Run not found. }
+components:
+  schemas:
+    OpenObject:
+      type: object
+      additionalProperties: true
+    AdapterCollection:
+      type: object
+      required: [api_version, adapters]
+      properties:
+        api_version: { type: string, const: "2" }
+        registry: { $ref: "#/components/schemas/OpenObject" }
+        adapters:
+          type: array
+          items: { $ref: "#/components/schemas/OpenObject" }
+    RecommendationRun:
+      type: object
+      required: [schema_version, recommendation_run_id, recommendations]
+      properties:
+        schema_version: { type: integer, const: 2 }
+        recommendation_run_id: { type: string }
+        recommendations:
+          type: array
+          items: { $ref: "#/components/schemas/OpenObject" }
+        categories: { $ref: "#/components/schemas/OpenObject" }
+        adapter_diagnostics: { $ref: "#/components/schemas/OpenObject" }
+      additionalProperties: true

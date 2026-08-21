@@ -1,0 +1,348 @@
+openapi: 3.1.0
+info:
+  title: RIFT Node Agent API
+  version: 1.2.0
+  description: |
+    Lightweight desired-state and inventory API served by an enrolled RIFT
+    node. TLS 1.2 or newer and mutual certificate authentication are mandatory
+    for every implemented `/v1` operation. Node-side policy independently gates
+    downloads, installs, and launches even when the controller requests them.
+
+    The discovery bootstrap path is included as a mesh protocol target and is
+    explicitly marked pending: the current Python node-agent handler does not
+    serve it. Controller-side mesh enrollment, certificate issuance,
+    capability publication, link reporting, and route resolution are specified
+    in `rift-controller.openapi.yaml`.
+servers:
+  - url: https://rift-node.example:11750
+    description: Enrolled node-agent control endpoint
+tags:
+  - name: Bootstrap
+  - name: Health
+  - name: Inventory
+  - name: Desired state
+security:
+  - mutualTLS: []
+x-rift-controller-publish-contracts:
+  capabilities: /api/rift/v2/mesh/nodes/{nodeId}/capabilities
+  links: /api/rift/v2/mesh/links
+  route_resolve: /api/rift/v2/mesh/routes/resolve
+
+paths:
+  /.well-known/rift-node:
+    get:
+      tags: [Bootstrap]
+      operationId: getRiftNodeBootstrapRecord
+      summary: Return the untrusted discovery bootstrap record.
+      description: |
+        Protocol target consumed by HTTPS subnet and USB-network probes. The
+        TLS certificate observed by the client is hashed and compared with the
+        advertised fingerprint. This path does not enroll or authenticate a
+        node. The current Python node-agent handler does not implement this
+        route; physical discovery bootstrap acceptance is pending.
+      security: []
+      x-rift-implementation-status: PHYSICAL_ACCEPTANCE_PENDING
+      responses:
+        "200":
+          description: Untrusted bootstrap record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapRecord"
+        "404":
+          description: Current Python node agent has not enabled the bootstrap responder.
+
+  /v1/health:
+    get:
+      tags: [Health]
+      operationId: getNodeHealth
+      summary: Get node-agent health and desired-state generations.
+      responses:
+        "200":
+          description: Healthy node agent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeHealth"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+  /v1/discovery:
+    get:
+      tags: [Inventory]
+      operationId: getNodeDiscovery
+      summary: Get measured hardware, backend, artifact, and agent inventory.
+      responses:
+        "200":
+          description: Live node inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeDiscovery"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+  /v1/artifacts:
+    get:
+      tags: [Inventory]
+      operationId: getNodeArtifacts
+      summary: Get local model artifact inventory.
+      responses:
+        "200":
+          description: Artifact inventory rooted under `.rift/models`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactInventory"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+  /v1/state:
+    get:
+      tags: [Desired state]
+      operationId: getNodeState
+      summary: Get desired and observed node state.
+      responses:
+        "200":
+          description: Agent, desired-state, and runtime state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeState"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+  /v1/desired-state:
+    post:
+      tags: [Desired state]
+      operationId: submitNodeDesiredState
+      summary: Submit a monotonically increasing desired-state generation.
+      description: |
+        Repeating the same generation with identical content is idempotent.
+        Reusing a generation with different content or submitting an older
+        generation is rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DesiredStateRequest"
+      responses:
+        "200":
+          description: Accepted or idempotently retained generation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesiredStateAcceptance"
+        "400":
+          description: Stale generation, generation collision, or invalid config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentError"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+  /v1/reconcile:
+    post:
+      tags: [Desired state]
+      operationId: reconcileNodeDesiredState
+      summary: Plan or apply accepted desired state under node-side permissions.
+      description: |
+        A request permission is effective only when both the request and the
+        node's local policy allow it. Omitting `apply` produces a plan without
+        applying side effects.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReconcileRequest"
+      responses:
+        "200":
+          description: Reconciliation plan or apply result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReconcileResult"
+        "400":
+          description: Invalid request or desired state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentError"
+        "401":
+          description: A valid controller client certificate was not presented.
+
+components:
+  securitySchemes:
+    mutualTLS:
+      type: mutualTLS
+      description: Controller and node certificates chained to the configured client CA.
+
+  schemas:
+    OpenObject:
+      type: object
+      additionalProperties: true
+
+    AgentError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    BootstrapRecord:
+      type: object
+      required:
+        - endpoint
+        - node_hint
+        - api_version
+        - bootstrap_fingerprint
+      properties:
+        endpoint:
+          type: string
+          format: uri
+          pattern: "^https://"
+        node_hint:
+          type: string
+        api_version:
+          type: string
+          default: "2"
+        bootstrap_fingerprint:
+          type: string
+          pattern: "^sha256:[0-9a-f]{64}$"
+        ttl_seconds:
+          type: number
+          exclusiveMinimum: 0
+          default: 120
+        interface_id:
+          type: string
+        metadata:
+          $ref: "#/components/schemas/OpenObject"
+
+    NodeHealth:
+      type: object
+      required:
+        - ok
+        - node_id
+        - mutual_tls_required
+        - desired_generation
+        - last_reconciled_generation
+        - created_unix_seconds
+      properties:
+        ok:
+          type: boolean
+          const: true
+        node_id:
+          type: string
+        mutual_tls_required:
+          type: boolean
+          const: true
+        desired_generation:
+          type: integer
+          minimum: 0
+        last_reconciled_generation:
+          type: integer
+          minimum: 0
+        created_unix_seconds:
+          type: number
+
+    ArtifactInventory:
+      type: object
+      required: [model_root, artifacts]
+      properties:
+        model_root:
+          type: string
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/OpenObject"
+
+    NodeDiscovery:
+      type: object
+      required: [node_id, hardware, backends, artifact_inventory, agent]
+      properties:
+        node_id:
+          type: string
+        hardware:
+          $ref: "#/components/schemas/OpenObject"
+        backends:
+          $ref: "#/components/schemas/OpenObject"
+        artifact_inventory:
+          $ref: "#/components/schemas/ArtifactInventory"
+        agent:
+          $ref: "#/components/schemas/NodeHealth"
+
+    DesiredStateRequest:
+      type: object
+      required: [generation, config]
+      properties:
+        generation:
+          type: integer
+          minimum: 1
+        config:
+          $ref: "#/components/schemas/OpenObject"
+
+    DesiredStateAcceptance:
+      type: object
+      required: [accepted, changed, generation, config_fingerprint]
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        changed:
+          type: boolean
+        generation:
+          type: integer
+          minimum: 1
+        config_fingerprint:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+
+    ReconcileRequest:
+      type: object
+      properties:
+        apply:
+          type: boolean
+          default: false
+        permissions:
+          type: object
+          properties:
+            allow_download:
+              type: boolean
+              default: false
+            allow_install:
+              type: boolean
+              default: false
+            allow_launch:
+              type: boolean
+              default: false
+
+    ReconcileResult:
+      type: object
+      required: [reconciled, generation]
+      properties:
+        reconciled:
+          type: boolean
+        generation:
+          type: integer
+          minimum: 1
+        applied:
+          type: boolean
+        reason:
+          type: string
+        plan:
+          $ref: "#/components/schemas/OpenObject"
+      additionalProperties: true
+
+    NodeState:
+      type: object
+      required: [agent, desired_state, runtime]
+      properties:
+        agent:
+          $ref: "#/components/schemas/NodeHealth"
+        desired_state:
+          $ref: "#/components/schemas/OpenObject"
+        runtime:
+          $ref: "#/components/schemas/OpenObject"
