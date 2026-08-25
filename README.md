@@ -66,7 +66,7 @@ Windows:
 ```powershell
 git clone <rift-repository>
 cd rift
-.\scripts\bootstrap.ps1
+.\bootstrap.ps1
 .\.venv\Scripts\rift.exe start
 ```
 

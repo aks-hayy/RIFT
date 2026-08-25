@@ -8,13 +8,104 @@ capability report instead of failing during package import.
 from __future__ import annotations
 
 import ctypes
+import csv
 import os
 import platform
+import shutil
+import subprocess
+from io import StringIO
 from typing import Any
 
 
 InferenceEngine = None
 __version__ = "1.3.0"
+
+
+def _infer_compute_capability(device_name: str) -> tuple[int | None, int | None]:
+    """Return a conservative NVIDIA architecture mapping from the device name."""
+
+    name = device_name.upper()
+    if "RTX 50" in name:
+        return 12, 0
+    if "RTX 40" in name:
+        return 8, 9
+    if "RTX 30" in name or "A10" in name or "A40" in name:
+        return 8, 6
+    if "RTX 20" in name or "GTX 16" in name or "T4" in name:
+        return 7, 5
+    if "V100" in name:
+        return 7, 0
+    if "P100" in name:
+        return 6, 0
+    if "K80" in name:
+        return 3, 7
+    return None, None
+
+
+def _nvidia_hardware_profile() -> dict[str, Any]:
+    """Read GPU identity and memory through the installed NVIDIA driver tools."""
+
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return {}
+
+    query = "name,memory.total,memory.free,driver_version"
+    try:
+        completed = subprocess.run(
+            [executable, f"--query-gpu={query}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    if completed.returncode != 0:
+        return {}
+
+    devices: list[dict[str, Any]] = []
+    for row in csv.reader(StringIO(completed.stdout or "")):
+        if len(row) < 4:
+            continue
+        name = row[0].strip()
+        if not name:
+            continue
+        try:
+            total_vram = int(float(row[1].strip()) * 1024**2)
+            free_vram = int(float(row[2].strip()) * 1024**2)
+        except ValueError:
+            continue
+        major, minor = _infer_compute_capability(name)
+        devices.append(
+            {
+                "index": len(devices),
+                "name": name,
+                "total_vram_bytes": total_vram,
+                "free_vram_bytes": max(0, min(total_vram, free_vram)),
+                "driver_version": row[3].strip(),
+                "compute_capability_major": major,
+                "compute_capability_minor": minor,
+            }
+        )
+    if not devices:
+        return {}
+
+    primary = devices[0]
+    return {
+        "cuda_available": True,
+        "native_cuda_runtime_available": False,
+        "driver_visible": True,
+        "device_count": len(devices),
+        "device_name": primary["name"],
+        "cuda_device_id": primary["index"],
+        "compute_capability_major": primary["compute_capability_major"],
+        "compute_capability_minor": primary["compute_capability_minor"],
+        "total_vram_bytes": primary["total_vram_bytes"],
+        "free_vram_bytes": primary["free_vram_bytes"],
+        "driver_version": primary["driver_version"],
+        "devices": devices,
+        "measurement": "observed_nvidia_smi",
+    }
 
 
 class ControlPlaneRuntime:
@@ -25,8 +116,9 @@ class ControlPlaneRuntime:
 
     def hardware_profile(self) -> dict[str, Any]:
         total_ram, free_ram = _host_memory_bytes()
-        return {
+        profile = {
             "cuda_available": False,
+            "native_cuda_runtime_available": False,
             "device_count": 0,
             "device_name": None,
             "cuda_device_id": 0,
@@ -37,6 +129,8 @@ class ControlPlaneRuntime:
             "total_host_ram_bytes": total_ram,
             "free_host_ram_bytes": free_ram,
         }
+        profile.update(_nvidia_hardware_profile())
+        return profile
 
     def measure_h2d_bandwidth(self, **kwargs: Any) -> dict[str, Any]:
         return {
@@ -57,7 +151,7 @@ def build_info() -> dict[str, Any]:
 
 
 def cuda_device_count() -> int:
-    return 0
+    return int(_nvidia_hardware_profile().get("device_count") or 0)
 
 
 def inspect_model(*args: Any, **kwargs: Any) -> dict[str, Any]:
