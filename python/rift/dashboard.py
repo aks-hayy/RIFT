@@ -62,6 +62,53 @@ def bundled_dashboard_root() -> Path:
     return Path(__file__).resolve().parent / "web" / "static"
 
 
+def rich_dashboard_plan(
+    dashboard_root: str | Path | None = None,
+    *,
+    port: int = 8765,
+    control_port: int = 8777,
+) -> dict[str, str] | None:
+    """Return the optional contributor UI build when it is available locally."""
+
+    root = Path(dashboard_root).resolve() if dashboard_root else find_dashboard_root()
+    if root is None:
+        return None
+    server_script = root / "scripts" / "serve-dist.mjs"
+    server_bundle = root / "dist" / "server" / "server.js"
+    client_root = root / "dist" / "client"
+    if not server_script.is_file() or not server_bundle.is_file() or not client_root.is_dir():
+        return None
+    node = shutil.which("node")
+    if not node:
+        return None
+    return {
+        "node": node,
+        "root": str(root),
+        "server_script": str(server_script),
+        "server_bundle": str(server_bundle),
+        "client_root": str(client_root),
+        "port": str(int(port)),
+        "control_api": f"http://127.0.0.1:{int(control_port)}",
+    }
+
+
+def _launch_rich_dashboard(plan: dict[str, str]) -> subprocess.Popen[bytes]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "RIFT_UI_HOST": "127.0.0.1",
+            "RIFT_UI_PORT": plan["port"],
+            "RIFT_CONTROL_API": plan["control_api"],
+        }
+    )
+    return subprocess.Popen(
+        [plan["node"], plan["server_script"]],
+        cwd=plan["root"],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+    )
+
+
 def dashboard_launch_plan(
     *,
     host: str = "127.0.0.1",
@@ -131,20 +178,33 @@ def serve_dashboard(
         )
         control_thread.start()
 
-    static_server = _create_static_server(host, port, plan.control_api_url)
-    static_thread = threading.Thread(
-        target=static_server.serve_forever,
-        name="rift-dashboard-static",
-        daemon=True,
+    rich_process = None
+    static_server = None
+    static_thread = None
+    rich_plan = rich_dashboard_plan(
+        dashboard_root or find_dashboard_root(Path.cwd()), port=port, control_port=control_port
     )
-    static_thread.start()
+    if rich_plan is not None:
+        rich_process = _launch_rich_dashboard(rich_plan)
+    else:
+        static_server = _create_static_server(host, port, plan.control_api_url)
+        static_thread = threading.Thread(
+            target=static_server.serve_forever,
+            name="rift-dashboard-static",
+            daemon=True,
+        )
+        static_thread.start()
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if _dashboard_ready(plan.dashboard_url):
             break
         time.sleep(0.25)
     else:
-        static_server.shutdown()
+        if static_server is not None:
+            static_server.shutdown()
+        if rich_process is not None:
+            rich_process.terminate()
+            rich_process.wait(timeout=5)
         raise RuntimeError(
             f"Dashboard did not become ready at {plan.dashboard_url} within 30 seconds"
         )
@@ -174,9 +234,18 @@ def serve_dashboard(
     except KeyboardInterrupt:
         print("\nStopping the RIFT dashboard...")
     finally:
-        static_server.shutdown()
-        static_server.server_close()
-        static_thread.join(timeout=5)
+        if static_server is not None:
+            static_server.shutdown()
+            static_server.server_close()
+        if static_thread is not None:
+            static_thread.join(timeout=5)
+        if rich_process is not None and rich_process.poll() is None:
+            rich_process.terminate()
+            try:
+                rich_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rich_process.kill()
+                rich_process.wait(timeout=5)
         reconcile_stop.set()
         reconcile_thread.join(timeout=5)
         if control_server is not None:

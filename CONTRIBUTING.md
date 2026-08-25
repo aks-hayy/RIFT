@@ -5,7 +5,7 @@ Thank you for helping make local LLM serving more predictable.
 ## Development Setup
 
 1. Install Python 3.10 or newer.
-2. Run `scripts/bootstrap.ps1` on Windows or `scripts/bootstrap.sh` on
+2. Run `bootstrap.ps1` on Windows or `scripts/bootstrap.sh` on
    Linux/macOS. These create a local environment and install the pure-Python
    control plane.
 3. Run `python -m pip install -e .` when iterating on Python source.

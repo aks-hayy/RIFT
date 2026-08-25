@@ -28,6 +28,25 @@ def test_dashboard_source_discovery_and_launch_plan():
     assert plan.dependencies_ready is True
 
 
+def test_bundled_dashboard_has_rift_favicon():
+    bundled = ROOT / "python" / "rift" / "web" / "static"
+    html = (bundled / "index.html").read_text(encoding="utf-8")
+    assert 'rel="icon"' in html
+    assert 'href="/rift-mark.svg"' in html
+    assert (bundled / "rift-mark.svg").is_file()
+
+
+def test_rich_dashboard_build_plan_is_detected():
+    plan = dashboard.rich_dashboard_plan(ROOT / "ui", port=8766, control_port=8778)
+    assert plan is not None
+    assert plan["server_script"].endswith("ui\\scripts\\serve-dist.mjs") or plan[
+        "server_script"
+    ].endswith("ui/scripts/serve-dist.mjs")
+    assert plan["client_root"].endswith("ui\\dist\\client") or plan["client_root"].endswith(
+        "ui/dist/client"
+    )
+
+
 def test_dashboard_root_environment_override():
     previous = os.environ.get("RIFT_DASHBOARD_ROOT")
     try:
@@ -63,6 +82,8 @@ def test_dashboard_validation_errors_are_actionable():
 
 def main():
     test_dashboard_source_discovery_and_launch_plan()
+    test_bundled_dashboard_has_rift_favicon()
+    test_rich_dashboard_build_plan_is_detected()
     test_dashboard_root_environment_override()
     test_dashboard_validation_errors_are_actionable()
     print("RIFT dashboard launcher tests passed")
