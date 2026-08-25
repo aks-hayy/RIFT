@@ -193,6 +193,29 @@ def test_mlx_platform_fit_and_raw_server_security_gate():
         raise AssertionError("MLX-LM raw server accepted direct network exposure")
 
 
+def test_llama_install_falls_back_when_latest_release_has_only_marker_assets():
+    provider = llama_mod.LlamaCppProvider()
+    marker_release = {
+        "tag_name": "b9352",
+        "html_url": "https://github.com/ggml-org/llama.cpp/releases/tag/b9352",
+        "assets": [{"name": "nightly-tag.txt"}],
+    }
+    usable_asset = {
+        "name": "llama-b10486-bin-win-cuda-12.4-x64.zip",
+        "browser_download_url": "https://example.invalid/llama.zip",
+    }
+    fallback_release = {
+        "tag_name": "b10486",
+        "html_url": "https://github.com/ggml-org/llama.cpp/releases/tag/b10486",
+        "assets": [usable_asset],
+    }
+    provider._latest_release_info = lambda: marker_release
+    provider._release_history_info = lambda: [marker_release, fallback_release]
+    selected = provider._select_install_release(variant="cuda12")
+    assert selected["release"]["tag_name"] == "b10486"
+    assert selected["assets"] == [usable_asset]
+
+
 class OpenAIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = b'{"status":"ok"}'
@@ -245,6 +268,7 @@ def test_openai_health_and_benchmark_contract_for_all_new_adapters():
 
 def main():
     test_all_builtin_serving_adapters_pass_shared_contract_suite()
+    test_llama_install_falls_back_when_latest_release_has_only_marker_assets()
     test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mounts()
     test_vllm_and_sglang_wsl_launch_paths_are_explicit()
     test_mlx_platform_fit_and_raw_server_security_gate()

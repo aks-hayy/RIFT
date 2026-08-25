@@ -1322,6 +1322,13 @@ class RiftOrchestrator:
                 (item for item in download_results if item.get("service") == service_name),
                 None,
             )
+            if downloaded is None:
+                cached_download = (
+                    (state.get("services", {}).get(service_name) or {}).get("download")
+                    or {}
+                )
+                if cached_download.get("local_dir"):
+                    downloaded = {"service": service_name, **cached_download}
             if downloaded and downloaded.get("local_dir"):
                 downloaded_model_path = self._downloaded_model_path(downloaded, service.get("model") or {})
                 launch_plan = self._provider_launch_spec(
@@ -2510,7 +2517,27 @@ class RiftOrchestrator:
                 prompt=prompt,
                 max_tokens=max_tokens,
             )
-        plan = plan or self.plan(config_path=config_path, write=False)
+        if plan is None:
+            config_path_resolved = self._resolve_path(config_path)
+            if config_path_resolved.is_file():
+                plan = self.plan(config_path=config_path_resolved, write=False)
+            else:
+                active_state = self.read_state()
+                active_service = active_state.get("services", {}).get(service_name)
+                active_backend = str((active_service or {}).get("backend") or "")
+                active_launch_plan = dict((active_service or {}).get("launch_plan") or {})
+                if not active_backend or not active_launch_plan:
+                    plan = self.plan(config_path=config_path_resolved, write=False)
+                else:
+                    plan = {
+                        "services": {
+                            service_name: {
+                                "backend": active_backend,
+                                "launch_plan": active_launch_plan,
+                            }
+                        },
+                        "nodes": [{"hardware": self.engine.hardware_profile()}],
+                    }
         service = plan.get("services", {}).get(service_name)
         if not service:
             raise ValueError(f"service not found in plan: {service_name}")
@@ -2533,8 +2560,22 @@ class RiftOrchestrator:
             "mode": "plan_only",
         }
         if write:
+            config_path_value = plan.get("config_path")
+            if config_path_value:
+                source_config = self._resolve_path(str(config_path_value))
+                if source_config.is_file():
+                    optimized_path = self.rift_dir / "generated" / "rift.optimized.yaml"
+                    write_yaml(optimized_path, self._optimized_config(plan, report))
+                    report["optimized_config_path"] = str(optimized_path)
+                else:
+                    report["optimized_config_skipped_reason"] = (
+                        "the source configuration is no longer available"
+                    )
+            else:
+                report["optimized_config_skipped_reason"] = (
+                    "the deployment was recovered from active state without a source configuration"
+                )
             self._write_json(self._timestamped("reports", f"{service_name}-tuning"), report)
-            write_yaml(self.rift_dir / "generated" / "rift.optimized.yaml", self._optimized_config(plan, report))
         return report
 
     def _tune_service_live(
@@ -2589,6 +2630,15 @@ class RiftOrchestrator:
         hardware = self.engine.hardware_profile()
         baseline_plan = dict(service.get("launch_plan") or {})
         baseline_tuning = dict(baseline_plan.get("tuning") or {})
+        normalized_baseline = self._rebuild_launch_plan(
+            provider=provider,
+            service=service,
+            launch_plan=baseline_plan,
+            hardware=hardware,
+            tuning=baseline_tuning,
+        )
+        if normalized_baseline:
+            baseline_plan = normalized_baseline
         candidates = [baseline_tuning]
         candidates.extend(
             self._provider_tuning_space(provider, launch_plan=baseline_plan, hardware=hardware)
@@ -2851,6 +2901,12 @@ class RiftOrchestrator:
         tuning: JsonDict,
     ) -> JsonDict:
         model_path = self._model_path_from_launch_plan(launch_plan)
+        if model_path and not Path(model_path).is_file():
+            downloaded = service.get("download") or {}
+            model = service.get("model") or {}
+            materialized = self._downloaded_model_path(downloaded, model)
+            if materialized and Path(materialized).is_file():
+                model_path = materialized
         if not model_path:
             model = service.get("model") or {}
             model_path = str(
@@ -3036,6 +3092,7 @@ class RiftOrchestrator:
         services = state.get("services", {})
         names = [service_name] if service_name else list(services.keys())
         stopped = []
+        removed = []
         for name in names:
             service = services.get(name)
             if not service:
@@ -3044,13 +3101,10 @@ class RiftOrchestrator:
             if pid:
                 termination = self._terminate_pid(int(pid))
                 stopped.append({"service": name, **termination})
-            service["status"] = "stopped"
-            service["desired_state"] = "stopped"
-            service.setdefault("supervisor", self._default_supervisor_state())[
-                "consecutive_failures"
-            ] = 0
+            services.pop(name, None)
+            removed.append(name)
         self.write_state(state)
-        return {"stopped": stopped, "state_path": str(self.state_path)}
+        return {"stopped": stopped, "removed": removed, "state_path": str(self.state_path)}
 
     def _optimized_config(self, plan: JsonDict, tuning_report: JsonDict) -> JsonDict:
         config = self.load_config(plan["config_path"])

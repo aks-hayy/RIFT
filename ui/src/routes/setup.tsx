@@ -39,9 +39,11 @@ import type {
   ModelRecommendation,
   RecommendationSearchResult,
   Plan,
+  ApplyProgress,
   EnrollmentChallenge,
   MeshNode,
   MeshSighting,
+  ManagedEnrollment,
 } from "@/lib/rift/types";
 import { Unavailable } from "@/components/rift/unavailable";
 import { getNextSetupStep, getPreviousSetupStep } from "@/lib/rift/setup-flow";
@@ -76,6 +78,7 @@ interface SetupState {
   exposure: "local" | "lan" | "public";
   plan: Plan | null;
   applyStarted: boolean;
+  applyProgress: ApplyProgress | null;
 }
 
 const STEPS = [
@@ -105,6 +108,7 @@ function SetupPage() {
     exposure: "local",
     plan: null,
     applyStarted: false,
+    applyProgress: null,
   });
 
   const set = <K extends keyof SetupState>(k: K, v: SetupState[K]) =>
@@ -164,7 +168,7 @@ function SetupPage() {
             <StepMode value={s.mode} onChange={(v) => set("mode", v)} onNext={next} />
           )}
           {s.step === 1 && <StepDiscover mode={s.mode!} onNext={next} />}
-          {s.step === 2 && <StepEnroll onNext={next} />}
+          {s.step === 2 && <StepManagedEnroll onNext={next} />}
           {s.step === 3 && <StepNodesLive onNext={next} />}
           {s.step === 4 && (
             <StepUseCase value={s.useCase} onChange={(v) => set("useCase", v)} onNext={next} />
@@ -206,13 +210,16 @@ function SetupPage() {
           {s.step === 9 && (
             <StepApply
               plan={s.plan}
-              onApplied={() => {
+              onApplied={(progress) => {
+                set("applyProgress", progress);
                 set("applyStarted", true);
                 next();
               }}
             />
           )}
-          {s.step === 10 && <StepProgress plan={s.plan!} onNext={next} />}
+          {s.step === 10 && (
+            <StepProgress plan={s.plan!} initialProgress={s.applyProgress} onNext={next} />
+          )}
           {s.step === 11 && <StepFinish state={s} />}
         </div>
       </div>
@@ -401,6 +408,195 @@ function DiscoverProgress({ onDone }: { onDone: () => void }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+function StepManagedEnroll({ onNext }: { onNext: () => void }) {
+  const [windowState, setWindowState] = useState<Awaited<
+    ReturnType<typeof rift.openManagedEnrollmentWindow>
+  > | null>(null);
+  const [enrollments, setEnrollments] = useState<ManagedEnrollment[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [pairingCode, setPairingCode] = useState("");
+  const [phase, setPhase] = useState<"idle" | "opening" | "approving">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const [currentWindow, currentEnrollments] = await Promise.all([
+        rift.getManagedEnrollmentWindow(),
+        rift.listManagedEnrollments(),
+      ]);
+      setWindowState(currentWindow);
+      setEnrollments(currentEnrollments);
+      setError(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 1500);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const openWindow = async () => {
+    setPhase("opening");
+    setError(null);
+    try {
+      setWindowState(await rift.openManagedEnrollmentWindow(600));
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPhase("idle");
+    }
+  };
+
+  const approve = async () => {
+    if (!selected || !/^\d{6}$/.test(pairingCode)) return;
+    setPhase("approving");
+    setError(null);
+    try {
+      await rift.approveManagedEnrollment(selected, pairingCode);
+      setPairingCode("");
+      await refresh();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setPhase("idle");
+    }
+  };
+
+  const active = enrollments.some((item) => item.state === "ACTIVE");
+  return (
+    <div>
+      <StepTitle
+        eyebrow="Step 03 · Add node"
+        title="Enroll a RIFT node"
+        description="Open a short enrollment window, start the node command, then approve the code shown in that node's terminal. The controller never displays the expected code."
+      />
+      <div className="mt-6 rift-panel p-4 grid gap-4">
+        <div className="flex items-start gap-3">
+          <LockKeyhole className="size-4 text-primary mt-0.5 shrink-0" aria-hidden />
+          <div>
+            <div className="text-[13px] font-medium text-ink">
+              Identity first, permissions later
+            </div>
+            <p className="mt-1 text-[12.5px] text-ink-secondary">
+              New nodes receive no download, install, launch, or inference permission during
+              enrollment.
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={openWindow}
+          disabled={phase !== "idle"}
+          className="inline-flex items-center gap-2 h-10 px-4 rounded-[4px] bg-primary text-primary-foreground text-[13px] font-medium disabled:opacity-50 w-fit"
+        >
+          {phase === "opening" ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <RadioTower className="size-4" />
+          )}
+          {windowState?.open ? "Refresh enrollment window" : "Open enrollment window"}
+        </button>
+        {windowState?.open && (
+          <div className="grid gap-2 text-[12.5px] text-ink-secondary">
+            <div>
+              Window closes{" "}
+              {windowState.expiresAt
+                ? new Date(windowState.expiresAt).toLocaleTimeString()
+                : "soon"}
+              .
+            </div>
+            <code className="rift-mono bg-muted px-3 py-2 text-ink rounded-[4px]">
+              rift node start
+            </code>
+            <div>
+              For another network:{" "}
+              <code className="rift-mono">
+                rift node start --controller https://CONTROLLER:11748
+              </code>
+            </div>
+          </div>
+        )}
+      </div>
+      {error && (
+        <div className="mt-4 rift-surface p-4 text-[13px] text-error" role="alert">
+          {error}
+        </div>
+      )}
+      {enrollments.length > 0 && (
+        <div className="mt-4 rift-panel">
+          <header className="h-10 px-4 border-b border-border flex items-center justify-between">
+            <span className="rift-label">Enrollment requests</span>
+            <span className="rift-mono text-[11px] text-attention">untrusted until approved</span>
+          </header>
+          <ul className="divide-y divide-border">
+            {enrollments.map((item) => (
+              <li key={item.enrollmentId} className="px-4 py-3 flex items-center gap-3">
+                <Fingerprint className="size-4 text-primary shrink-0" aria-hidden />
+                <button
+                  type="button"
+                  className="text-left min-w-0 flex-1"
+                  onClick={() => setSelected(item.enrollmentId)}
+                >
+                  <span className="block text-[13px] font-medium text-ink">
+                    {item.displayName || item.nodeId || "Unnamed node"}
+                  </span>
+                  <span className="block rift-mono text-[11px] text-ink-secondary truncate">
+                    {item.nodeId} · {item.endpoint}
+                  </span>
+                </button>
+                <span className="rift-mono text-[10.5px] uppercase text-attention">
+                  {item.state.replaceAll("_", " ")}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {selected && !active && (
+        <div className="mt-4 rift-panel p-4 grid gap-3">
+          <label className="grid gap-1.5 max-w-sm">
+            <span className="rift-label">Six-digit code shown by the node</span>
+            <input
+              value={pairingCode}
+              onChange={(event) =>
+                setPairingCode(event.target.value.replace(/\D/g, "").slice(0, 6))
+              }
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              maxLength={6}
+              className="h-10 px-3 rounded-[4px] border border-border bg-raised rift-mono"
+              placeholder="000000"
+            />
+          </label>
+          <button
+            type="button"
+            onClick={approve}
+            disabled={phase !== "idle" || !/^\d{6}$/.test(pairingCode)}
+            className="inline-flex items-center gap-2 h-10 px-4 rounded-[4px] bg-primary text-primary-foreground text-[13px] font-medium disabled:opacity-50 w-fit"
+          >
+            {phase === "approving" ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <ShieldCheck className="size-4" />
+            )}
+            Approve and issue certificate
+          </button>
+        </div>
+      )}
+      {active && (
+        <div className="mt-4 rift-panel p-4 text-[13px] text-ink">
+          Node is <strong>ACTIVE</strong> and passed authenticated health verification.
+        </div>
+      )}
+      <PrimaryNext disabled={!active} onClick={onNext} label="Review trusted nodes" />
+    </div>
   );
 }
 
@@ -1273,6 +1469,14 @@ function StepPlan({
     let alive = true;
     rift
       .createPlan({
+        recommendationRunId: recommendation.recommendationRunId,
+        selector:
+          recommendation.artifact.repo ??
+          (recommendation.priority === "quality"
+            ? "highest_quality"
+            : recommendation.priority === "speed"
+              ? "fastest"
+              : "best_estimated"),
         artifactId: recommendation.artifact.id,
         backendKind: recommendation.backend.kind,
         targetNodeId: recommendation.targetNode,
@@ -1408,16 +1612,37 @@ export function PlanReview({ plan }: { plan: Plan }) {
   );
 }
 
-function StepApply({ plan, onApplied }: { plan: Plan | null; onApplied: () => void }) {
+function StepApply({
+  plan,
+  onApplied,
+}: {
+  plan: Plan | null;
+  onApplied: (progress: ApplyProgress) => void;
+}) {
   const [confirming, setConfirming] = useState(false);
   const [err, setErr] = useState<Error | null>(null);
+  const [allowDownload, setAllowDownload] = useState(false);
+  const [allowInstall, setAllowInstall] = useState(false);
+  const [allowLaunch, setAllowLaunch] = useState(false);
+
+  const needs = (group: Plan["actions"][number]["group"]) =>
+    Boolean(plan?.actions.some((action) => action.group === group));
+  const permissionsReady =
+    (!needs("download") || allowDownload) &&
+    (!needs("install") || allowInstall) &&
+    (!needs("launch") || allowLaunch);
 
   const apply = async () => {
     if (!plan) return;
     setConfirming(true);
     try {
-      await rift.applyPlan(plan.id, plan.hash);
-      onApplied();
+      const progress = await rift.applyPlan(plan.id, plan.hash, {
+        configPath: plan.configPath ?? "",
+        allowDownload,
+        allowInstall,
+        allowLaunch,
+      });
+      onApplied(progress);
     } catch (e) {
       setErr(e as Error);
       setConfirming(false);
@@ -1450,11 +1675,37 @@ function StepApply({ plan, onApplied }: { plan: Plan | null; onApplied: () => vo
             {err.message}
           </div>
         )}
+        <div className="mt-5 grid gap-2 border-t border-border pt-4">
+          {(
+            [
+              ["download", "Download the selected model artifact", allowDownload, setAllowDownload],
+              ["install", "Install the selected backend", allowInstall, setAllowInstall],
+              ["launch", "Launch the local inference service", allowLaunch, setAllowLaunch],
+            ] as const
+          ).map(([group, label, checked, setChecked]) =>
+            needs(group) ? (
+              <label key={group} className="flex items-start gap-2 text-[13px] text-ink">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-[var(--oxide)]"
+                  checked={checked}
+                  onChange={(event) => setChecked(event.target.checked)}
+                />
+                <span>
+                  <span className="block">{label}</span>
+                  <span className="rift-mono text-[11px] text-ink-secondary">
+                    Explicit permission for this apply only.
+                  </span>
+                </span>
+              </label>
+            ) : null,
+          )}
+        </div>
         <div className="mt-5 flex items-center gap-3">
           <button
             type="button"
             onClick={apply}
-            disabled={!plan || confirming}
+            disabled={!plan || confirming || !permissionsReady}
             className="inline-flex items-center gap-2 h-10 px-4 rounded-[4px] bg-primary text-primary-foreground text-[13px] font-medium hover:bg-[color:var(--oxide-deep)] disabled:opacity-60"
           >
             {confirming ? (
@@ -1473,28 +1724,53 @@ function StepApply({ plan, onApplied }: { plan: Plan | null; onApplied: () => vo
   );
 }
 
-function StepProgress({ plan, onNext }: { plan: Plan; onNext: () => void }) {
-  const [percent, setPercent] = useState(5);
-  const [phase, setPhase] = useState<string>("queued");
-  const [message, setMessage] = useState<string>("Waiting to start…");
-  const [done, setDone] = useState(false);
+function StepProgress({
+  plan,
+  initialProgress,
+  onNext,
+}: {
+  plan: Plan;
+  initialProgress: ApplyProgress | null;
+  onNext: () => void;
+}) {
+  const [percent, setPercent] = useState(initialProgress?.percent ?? 5);
+  const [phase, setPhase] = useState<string>(initialProgress?.phase ?? "queued");
+  const [message, setMessage] = useState<string>(initialProgress?.message ?? "Waiting to start…");
+  const [done, setDone] = useState(initialProgress?.phase === "succeeded");
 
   useEffect(() => {
-    const off = rift.subscribe(
-      (e) => {
-        if (e.kind === "plan.progress" && e.progress.planId === plan.id) {
-          setPercent(e.progress.percent);
-          setPhase(e.progress.phase);
-          setMessage(e.progress.message);
-          if (e.progress.phase === "succeeded") {
-            setDone(true);
-          }
-        }
-      },
-      () => {},
-    );
-    return off;
-  }, [plan.id]);
+    if (initialProgress?.phase === "succeeded") return undefined;
+    let alive = true;
+    const poll = async () => {
+      try {
+        const service = await rift.getService(plan.serviceId);
+        if (!alive) return;
+        setPhase(service.status === "running" ? "succeeded" : service.status);
+        setPercent(service.status === "running" ? 100 : 65);
+        setMessage(
+          service.status === "running"
+            ? "The service is healthy and ready."
+            : `Service status: ${service.status}`,
+        );
+        if (service.status === "running") setDone(true);
+      } catch {
+        // The controller may not publish the service until launch completes.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 2_000);
+    const timeout = window.setTimeout(() => {
+      if (alive && !done) {
+        setPhase("failed");
+        setMessage("The controller did not report a ready service within 60 seconds.");
+      }
+    }, 60_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+      window.clearTimeout(timeout);
+    };
+  }, [plan.id, plan.serviceId, initialProgress, done]);
 
   return (
     <div>
@@ -1520,7 +1796,10 @@ function StepProgress({ plan, onNext }: { plan: Plan; onNext: () => void }) {
 
 function StepFinish({ state }: { state: SetupState }) {
   const endpoint =
-    state.exposure === "local" ? "http://127.0.0.1:8000/v1" : "http://<controller-host>:8000/v1";
+    state.plan?.endpointUrl ??
+    (state.exposure === "local"
+      ? "http://127.0.0.1:11735/v1"
+      : "http://<controller-host>:11735/v1");
   return (
     <div>
       <StepTitle

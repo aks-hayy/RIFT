@@ -101,6 +101,7 @@ export type Priority = "recommended" | "quality" | "speed";
 
 export interface ModelRecommendation {
   id?: string;
+  recommendationRunId?: string;
   priority: Priority;
   artifact: ModelArtifact;
   backend: Backend;
@@ -211,6 +212,8 @@ export interface Plan {
   };
   createdAt: string;
   expiresAt: string;
+  configPath?: string;
+  endpointUrl?: string;
   provenance?: DataProvenance;
   previewOnly?: boolean;
 }
@@ -365,7 +368,34 @@ export interface MeshTopology {
   evidence: string;
 }
 
-export type EnrollmentState = "PAIRING_PENDING" | "APPROVED" | "EXPIRED" | "REJECTED";
+export type EnrollmentState =
+  | "PAIRING_PENDING"
+  | "ENROLLED"
+  | "CERTIFICATE_ISSUED"
+  | "VERIFYING"
+  | "ACTIVE"
+  | "APPROVED"
+  | "EXPIRED"
+  | "REJECTED"
+  | "CANCELLED";
+
+export interface ManagedEnrollmentWindow {
+  controllerId: string;
+  open: boolean;
+  expiresAt?: string;
+  pendingCount: number;
+  bootstrap?: { started: boolean; host?: string; port?: number; controller_id?: string };
+}
+
+export interface ManagedEnrollment {
+  enrollmentId: string;
+  nodeId?: string;
+  displayName?: string;
+  endpoint?: string;
+  state: EnrollmentState;
+  expiresAt?: string;
+  attempts?: number;
+}
 
 export interface EnrollmentChallenge {
   enrollmentId: string;

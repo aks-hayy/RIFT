@@ -116,10 +116,14 @@ def serve_dashboard(
     )
     control_server = None
     control_thread = None
+    control_runtime = None
     if not _control_api_ready(host, control_port):
         from .server import create_rift_server
 
-        control_server = create_rift_server(host=host, port=control_port)
+        from .server import RiftServerRuntime
+
+        control_runtime = RiftServerRuntime()
+        control_server = create_rift_server(host=host, port=control_port, runtime=control_runtime)
         control_thread = threading.Thread(
             target=control_server.serve_forever,
             name="rift-control-api",
@@ -178,6 +182,8 @@ def serve_dashboard(
         if control_server is not None:
             control_server.shutdown()
             control_server.server_close()
+        if control_runtime is not None:
+            control_runtime.shutdown()
         if control_thread is not None:
             control_thread.join(timeout=5)
 

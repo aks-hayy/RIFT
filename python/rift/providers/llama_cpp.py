@@ -24,6 +24,7 @@ JsonDict = dict[str, Any]
 class LlamaCppProvider(ProviderLifecycleMixin):
     name = "llama.cpp"
     release_api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+    release_history_api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20"
     manifest = AdapterManifest(
         adapter_id=name,
         display_name="llama.cpp",
@@ -172,9 +173,10 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             }
 
         target.mkdir(parents=True, exist_ok=True)
-        release = self._latest_release_info()
-        assets = release.get("assets", [])
-        selected_assets = self._select_windows_assets(assets, variant=variant)
+        selected_release = self._select_install_release(variant=variant)
+        release = selected_release["release"]
+        assets = selected_release["assets"]
+        selected_assets = selected_release["selected_assets"]
         if not selected_assets:
             return {
                 "installed": False,
@@ -233,6 +235,36 @@ class LlamaCppProvider(ProviderLifecycleMixin):
         if not isinstance(payload, dict):
             raise ValueError("GitHub latest release response was not an object")
         return payload
+
+    def _release_history_info(self) -> list[JsonDict]:
+        request = Request(self.release_history_api_url, headers={"User-Agent": "RIFT/1.0"})
+        with urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError("GitHub release history response was not an array")
+        return [release for release in payload if isinstance(release, dict)]
+
+    def _select_install_release(self, *, variant: str) -> dict[str, Any]:
+        latest = self._latest_release_info()
+        candidates = [latest]
+        latest_assets = latest.get("assets", [])
+        if not self._select_windows_assets(latest_assets, variant=variant):
+            candidates.extend(self._release_history_info())
+        seen_tags: set[str] = set()
+        for release in candidates:
+            tag = str(release.get("tag_name") or release.get("html_url") or "")
+            if tag in seen_tags:
+                continue
+            seen_tags.add(tag)
+            assets = release.get("assets", [])
+            selected_assets = self._select_windows_assets(assets, variant=variant)
+            if selected_assets:
+                return {
+                    "release": release,
+                    "assets": assets,
+                    "selected_assets": selected_assets,
+                }
+        return {"release": latest, "assets": latest_assets, "selected_assets": []}
 
     def _select_windows_assets(self, assets: list[JsonDict], *, variant: str) -> list[JsonDict]:
         candidates = [

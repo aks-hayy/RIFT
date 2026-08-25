@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import hashlib
+import ipaddress
 import os
 from pathlib import Path
 
@@ -48,6 +49,7 @@ class NodeCertificateAuthority:
             .not_valid_before(now - timedelta(minutes=5))
             .not_valid_after(now + timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
             .add_extension(
                 x509.KeyUsage(
                     digital_signature=True,
@@ -107,10 +109,60 @@ class NodeCertificateAuthority:
         node_id: str,
         csr_pem: str,
         validity_days: int = 90,
+        addresses: list[str] | None = None,
     ) -> dict[str, str]:
         x509, hashes, serialization, _, ExtendedKeyUsageOID, NameOID = self._imports()
+        return self._issue_identity_certificate(
+            x509=x509,
+            hashes=hashes,
+            serialization=serialization,
+            ExtendedKeyUsageOID=ExtendedKeyUsageOID,
+            NameOID=NameOID,
+            identity_kind="node",
+            identity_id=node_id,
+            csr_pem=csr_pem,
+            validity_days=validity_days,
+            addresses=addresses,
+        )
+
+    def issue_controller_certificate(
+        self,
+        *,
+        controller_id: str,
+        csr_pem: str,
+        validity_days: int = 365,
+        addresses: list[str] | None = None,
+    ) -> dict[str, str]:
+        x509, hashes, serialization, _, ExtendedKeyUsageOID, NameOID = self._imports()
+        return self._issue_identity_certificate(
+            x509=x509,
+            hashes=hashes,
+            serialization=serialization,
+            ExtendedKeyUsageOID=ExtendedKeyUsageOID,
+            NameOID=NameOID,
+            identity_kind="controller",
+            identity_id=controller_id,
+            csr_pem=csr_pem,
+            validity_days=validity_days,
+            addresses=addresses,
+        )
+
+    def _issue_identity_certificate(
+        self,
+        *,
+        x509,
+        hashes,
+        serialization,
+        ExtendedKeyUsageOID,
+        NameOID,
+        identity_kind: str,
+        identity_id: str,
+        csr_pem: str,
+        validity_days: int,
+        addresses: list[str] | None,
+    ) -> dict[str, str]:
         if validity_days <= 0 or validity_days > 365:
-            raise ValueError("node certificate validity must be between 1 and 365 days")
+            raise ValueError("identity certificate validity must be between 1 and 365 days")
         try:
             csr = x509.load_pem_x509_csr(csr_pem.encode("ascii"))
         except (ValueError, UnicodeEncodeError) as exc:
@@ -118,9 +170,18 @@ class NodeCertificateAuthority:
         if not csr.is_signature_valid:
             raise ValueError("CSR signature is invalid")
         common_names = csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-        if len(common_names) != 1 or common_names[0].value != node_id:
-            raise PermissionError("CSR common name must match the enrolled node identity")
+        if len(common_names) != 1 or common_names[0].value != identity_id:
+            raise PermissionError("CSR common name must match the enrolled identity")
         now = datetime.now(timezone.utc)
+        san_names = [x509.UniformResourceIdentifier(f"rift-{identity_kind}:{identity_id}")]
+        for address in addresses or []:
+            value = str(address).strip()
+            if not value:
+                continue
+            try:
+                san_names.append(x509.IPAddress(ipaddress.ip_address(value)))
+            except ValueError:
+                san_names.append(x509.DNSName(value))
         certificate = (
             x509.CertificateBuilder()
             .subject_name(csr.subject)
@@ -130,11 +191,18 @@ class NodeCertificateAuthority:
             .not_valid_before(now - timedelta(minutes=5))
             .not_valid_after(now + timedelta(days=validity_days))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=True)
             .add_extension(
-                x509.SubjectAlternativeName(
-                    [x509.UniformResourceIdentifier(f"rift-node:{node_id}")]
+                x509.ExtendedKeyUsage(
+                    [ExtendedKeyUsageOID.CLIENT_AUTH, ExtendedKeyUsageOID.SERVER_AUTH]
                 ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectAlternativeName(san_names),
+                critical=False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self._key.public_key()),
                 critical=False,
             )
             .sign(self._key, hashes.SHA256())

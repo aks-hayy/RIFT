@@ -21,12 +21,21 @@ import type {
   MeshNode,
   MeshSighting,
   MeshTopology,
+  ManagedEnrollment,
+  ManagedEnrollmentWindow,
   Plan,
   RiftEvent,
   RiftNode,
   Service,
   UseCase,
 } from "./types";
+import {
+  applyRequest,
+  isDeployableRecommendation,
+  planRequest,
+  recommendationSelector,
+} from "./action-contract";
+import { mapBenchmarkReport } from "./report-mapping";
 
 export class RiftUnavailable extends Error {
   constructor(
@@ -87,9 +96,10 @@ async function req<T>(
   path: string,
   body?: unknown,
   signal?: AbortSignal,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
 ): Promise<T> {
   const ac = new AbortController();
-  const timeoutId = setTimeout(() => ac.abort(), DEFAULT_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => ac.abort(), timeoutMs);
   const combined = signal ? new AbortController() : ac;
   if (signal) {
     signal.addEventListener("abort", () => combined.abort(), { once: true });
@@ -250,6 +260,20 @@ function mapEnrollmentChallenge(value: unknown): EnrollmentChallenge {
         ? state
         : "PAIRING_PENDING",
     nodeHint: text(raw.node_hint, text(raw.nodeHint)) || undefined,
+  };
+}
+
+function mapManagedEnrollment(value: unknown): ManagedEnrollment {
+  const raw = object(value);
+  const state = text(raw.state, "PAIRING_PENDING").toUpperCase() as ManagedEnrollment["state"];
+  return {
+    enrollmentId: text(raw.enrollment_id, text(raw.enrollmentId, text(raw.id))),
+    nodeId: text(raw.node_id, text(raw.nodeId)) || undefined,
+    displayName: text(raw.display_name, text(raw.displayName)) || undefined,
+    endpoint: text(raw.endpoint) || undefined,
+    state,
+    expiresAt: raw.expires_at || raw.expiresAt ? iso(raw.expires_at ?? raw.expiresAt) : undefined,
+    attempts: raw.attempts === undefined ? undefined : numeric(raw.attempts),
   };
 }
 
@@ -479,50 +503,10 @@ async function listIncidents(signal?: AbortSignal): Promise<Incident[]> {
   return [...active, ...history];
 }
 
-function reportSummary(value: unknown): JsonObject {
-  const report = object(value);
-  return Object.keys(object(report.summary)).length ? object(report.summary) : report;
-}
-
 async function listBenchmarks(serviceId: string, signal?: AbortSignal): Promise<Benchmark[]> {
   const payload = await req<JsonObject>("GET", "/reports", undefined, signal);
   return list(payload.reports)
-    .map((entry): Benchmark | null => {
-      const item = object(entry);
-      const path = text(item.path);
-      const summary = reportSummary(item);
-      if (!path.toLowerCase().includes("benchmark")) return null;
-      if (path.toLowerCase().includes("cluster")) return null;
-      const metrics = object(summary.metrics);
-      const backendTimings = object(summary.backend_timings);
-      const tokensPerSec = numeric(
-        summary.decode_tokens_per_second,
-        numeric(
-          summary.tokens_per_second_estimate,
-          numeric(metrics.tokens_per_second, numeric(backendTimings.predicted_per_second)),
-        ),
-      );
-      if (tokensPerSec <= 0) return null;
-      const created =
-        numeric(summary.created_unix_seconds) || numeric(basename(path).split("-")[0]);
-      const firstTokenMs =
-        1000 *
-        numeric(summary.time_to_first_token_seconds_estimate, numeric(metrics.first_token_seconds));
-      return {
-        id: basename(path),
-        serviceId,
-        measuredAt: isoFromUnix(created),
-        tokensPerSec,
-        firstTokenMs: Math.round(firstTokenMs),
-        concurrency: numeric(summary.concurrency, 1),
-        contextTokens: numeric(summary.context_tokens, numeric(summary.prompt_tokens, 0)),
-        outputTokens: numeric(
-          summary.generated_tokens_estimate,
-          numeric(metrics.generated_tokens, 0),
-        ),
-        provenance: "live",
-      };
-    })
+    .map((entry) => mapBenchmarkReport(entry, serviceId))
     .filter((item): item is Benchmark => item !== null)
     .sort((a, b) => b.measuredAt.localeCompare(a.measuredAt));
 }
@@ -565,7 +549,7 @@ async function listRevisions(
   return revisions;
 }
 
-function mapRecommendation(value: unknown, index: number): ModelRecommendation {
+function mapRecommendation(value: unknown, index: number, runId?: string): ModelRecommendation {
   const raw = object(value);
   const scores = object(raw.scores);
   const repo = text(raw.repo_id, `candidate-${index + 1}`);
@@ -577,6 +561,7 @@ function mapRecommendation(value: unknown, index: number): ModelRecommendation {
   const backend = backendKind(raw.backend);
   return {
     id: `recommendation-${index + 1}-${repo.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
+    recommendationRunId: runId || text(raw.recommendation_run_id) || undefined,
     priority: index === 0 ? "recommended" : index === 1 ? "quality" : "speed",
     artifact: {
       id: repo,
@@ -657,7 +642,7 @@ async function latestCachedRecommendation(task: string): Promise<JsonObject | nu
           "GET",
           `/v2/recommendation-runs/${encodeURIComponent(runId)}`,
         );
-        if (list(run.recommendations).length > 0) return run;
+        if (list(run.recommendations).some(isDeployableRecommendation)) return run;
       } catch {
         // A corrupt or concurrently removed historical run is not a reason to
         // hide the current Hub diagnostic. Continue to the next cached run.
@@ -692,7 +677,11 @@ async function recommendDetailed(input: {
     include_gated: false,
   });
   const task = input.useCase === "coding" ? "coding" : "chat";
-  const liveRecommendations = list(payload.recommendations).map(mapRecommendation);
+  const runId = text(payload.recommendation_run_id, text(payload.run_id));
+  const deployableRaw = list(payload.recommendations).filter(isDeployableRecommendation);
+  const liveRecommendations = deployableRaw.map((value, index) =>
+    mapRecommendation(value, index, runId),
+  );
   const queryArmErrors = list(payload.query_arms)
     .map((value) => object(value))
     .filter((arm) => text(arm.status).toLowerCase() === "error")
@@ -710,14 +699,18 @@ async function recommendDetailed(input: {
       returned: numeric(counts.returned),
     },
   };
-  if (liveRecommendations.length > 0 || queryArmErrors.length === 0) {
+  if (liveRecommendations.length > 0) {
     return { recommendations: liveRecommendations, stale: false, ...base };
   }
 
   const cached = await latestCachedRecommendation(task);
   if (cached) {
     return {
-      recommendations: list(cached.recommendations).map(mapRecommendation),
+      recommendations: list(cached.recommendations)
+        .filter(isDeployableRecommendation)
+        .map((value, index) =>
+          mapRecommendation(value, index, text(cached.recommendation_run_id, text(cached.run_id))),
+        ),
       stale: true,
       staleCreatedAt: isoFromUnix(cached.created_unix_seconds),
       headline: "Showing the last successful shortlist",
@@ -726,7 +719,18 @@ async function recommendDetailed(input: {
       candidateCounts: base.candidateCounts,
     };
   }
-  return { recommendations: [], stale: false, ...base };
+  return {
+    recommendations: [],
+    stale: false,
+    ...base,
+    detail:
+      queryArmErrors.length > 0
+        ? text(
+            base.detail,
+            "Live model search failed and no deployable cached shortlist is available.",
+          )
+        : "Live search returned no deployable model/backend pair for this hardware.",
+  };
 }
 
 async function fleetHealth(signal?: AbortSignal): Promise<FleetHealth> {
@@ -760,14 +764,16 @@ async function fleetHealth(signal?: AbortSignal): Promise<FleetHealth> {
   };
 }
 
-async function currentPlan(signal?: AbortSignal): Promise<Plan> {
-  const raw = await req<JsonObject>("GET", "/plan", undefined, signal);
-  if (raw.available === false) {
-    throw new RiftUnavailable("/plan", "GET", "not-implemented", text(raw.reason));
-  }
+function mapControllerPlan(raw: JsonObject): Plan {
   const created = numeric(raw.created_unix_seconds);
   const services = object(raw.services);
   const serviceId = Object.keys(services)[0] ?? "chat";
+  const service = object(services[serviceId]);
+  const launch = object(service.launch_plan);
+  const endpointUrl = text(
+    launch.openai_base,
+    text(launch.api_base, text(object(service.runtime).api_base)),
+  );
   const actions = list(raw.actions).map((entry, index) => {
     const item = object(entry);
     const kind = text(item.kind, "configure");
@@ -783,24 +789,47 @@ async function currentPlan(signal?: AbortSignal): Promise<Plan> {
     ].includes(kind)
       ? (kind as Plan["actions"][number]["group"])
       : "configure";
-    const launch = object(item.launch_plan);
+    const actionLaunch = object(item.launch_plan);
+    const requiredBytes = numeric(item.required_bytes, numeric(item.size_bytes));
     return {
       id: `${group}-${index + 1}`,
       group,
       summary: text(item.message, `${group} ${text(item.service, serviceId)}`),
-      nodeId: text(item.node, "local"),
-      ports: numeric(launch.port) ? [numeric(launch.port)] : undefined,
-      risk: group === "launch" || group === "install" ? ("medium" as const) : ("low" as const),
+      nodeId: text(item.node, text(object(service.placement).node, "local")),
+      artifact:
+        requiredBytes > 0 || text(item.selected_file)
+          ? {
+              sizeBytes: requiredBytes || undefined,
+              source: text(item.selected_file) || undefined,
+            }
+          : undefined,
+      reserves:
+        numeric(item.required_vram_bytes) || numeric(item.required_ram_bytes)
+          ? {
+              vramBytes: numeric(item.required_vram_bytes) || undefined,
+              ramBytes: numeric(item.required_ram_bytes) || undefined,
+            }
+          : undefined,
+      ports: numeric(actionLaunch.port) ? [numeric(actionLaunch.port)] : undefined,
+      risk: kind === "error" || group === "launch" || group === "install" ? "medium" : "low",
       reversible: group !== "download",
     };
   });
-  const hash = text(raw.fingerprint, text(raw.config_fingerprint, `legacy-${created}`));
+  const hash = text(
+    raw.fingerprint,
+    text(raw.config_fingerprint, text(raw.plan_hash, `legacy-${created}`)),
+  );
+  const affectedNodes = list(raw.nodes)
+    .map((node) => text(object(node).name, text(object(node).host)))
+    .filter(Boolean);
   return {
-    id: "latest",
+    id: `plan-${text(raw.recommendation_run_id, "latest")}`,
     hash,
     serviceId,
     actions,
-    affectedNodes: list(raw.nodes).map((node) => text(object(node).name, "local")),
+    affectedNodes: affectedNodes.length
+      ? affectedNodes
+      : [text(object(service.placement).node, "local")],
     expectedDowntimeMs: actions.some((action) => action.group === "launch") ? 30_000 : 0,
     rollback: {
       supported: true,
@@ -808,9 +837,19 @@ async function currentPlan(signal?: AbortSignal): Promise<Plan> {
     },
     createdAt: isoFromUnix(created),
     expiresAt: new Date((created || Date.now() / 1000) * 1000 + 24 * 3600 * 1000).toISOString(),
+    configPath: text(raw.materialized_config, text(raw.config_path)) || undefined,
+    endpointUrl: endpointUrl || undefined,
     provenance: "derived-live",
     previewOnly: false,
   };
+}
+
+async function currentPlan(signal?: AbortSignal): Promise<Plan> {
+  const raw = await req<JsonObject>("GET", "/plan", undefined, signal);
+  if (raw.available === false) {
+    throw new RiftUnavailable("/plan", "GET", "not-implemented", text(raw.reason));
+  }
+  return mapControllerPlan(raw);
 }
 
 export const rift = {
@@ -908,6 +947,52 @@ export const rift = {
       },
     };
   },
+  openManagedEnrollmentWindow: async (ttlSeconds = 600): Promise<ManagedEnrollmentWindow> => {
+    const payload = await req<JsonObject>("POST", "/v2/mesh/enrollment-window", {
+      ttl_seconds: ttlSeconds,
+    });
+    return {
+      controllerId: text(payload.controller_id, "unknown"),
+      open: bool(payload.open),
+      expiresAt: payload.expires_at ? iso(payload.expires_at) : undefined,
+      pendingCount: numeric(payload.pending_count),
+      bootstrap: object(payload.bootstrap) as ManagedEnrollmentWindow["bootstrap"],
+    };
+  },
+  getManagedEnrollmentWindow: async (): Promise<ManagedEnrollmentWindow> => {
+    const payload = await req<JsonObject>("GET", "/v2/mesh/enrollment-window");
+    return {
+      controllerId: text(payload.controller_id, "unknown"),
+      open: bool(payload.open),
+      expiresAt: payload.expires_at ? iso(payload.expires_at) : undefined,
+      pendingCount: numeric(payload.pending_count),
+    };
+  },
+  listManagedEnrollments: async (): Promise<ManagedEnrollment[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/mesh/enrollments");
+    return list(payload.enrollments).map(mapManagedEnrollment);
+  },
+  approveManagedEnrollment: async (
+    enrollmentId: string,
+    pairingCode: string,
+  ): Promise<ManagedEnrollment> =>
+    mapManagedEnrollment(
+      object(
+        await req<JsonObject>(
+          "POST",
+          `/v2/mesh/enrollments/${encodeURIComponent(enrollmentId)}/approve`,
+          { pairing_code: pairingCode },
+        ),
+      ).enrollment,
+    ),
+  cancelManagedEnrollment: async (enrollmentId: string): Promise<ManagedEnrollment> =>
+    mapManagedEnrollment(
+      await req<JsonObject>(
+        "POST",
+        `/v2/mesh/enrollments/${encodeURIComponent(enrollmentId)}/cancel`,
+        {},
+      ),
+    ),
 
   listServices,
   getService: async (id: string, signal?: AbortSignal) => {
@@ -920,29 +1005,66 @@ export const rift = {
   listBenchmarks,
   recommend,
   recommendDetailed,
-  createPlan: async (_input: {
+  createPlan: async (input: {
     recommendationId?: string;
+    recommendationRunId?: string;
+    selector?: string;
     artifactId: string;
     backendKind: string;
     targetNodeId: string;
     serviceName: string;
     exposure: "local" | "lan" | "public";
   }): Promise<Plan> => {
-    throw new RiftUnavailable(
-      "/plans",
-      "POST",
-      "not-implemented",
-      "The legacy controller cannot safely create an immutable plan from a UI recommendation yet.",
+    if (!input.recommendationRunId) {
+      throw new RiftUnavailable(
+        "/v2/plans",
+        "POST",
+        "not-implemented",
+        "The live recommendation run is missing; run model discovery again.",
+      );
+    }
+    return mapControllerPlan(
+      await req<JsonObject>(
+        "POST",
+        "/v2/plans",
+        planRequest(
+          input.recommendationRunId,
+          input.selector ?? recommendationSelector("recommended"),
+        ),
+      ),
     );
   },
   getPlan: async (_id: string, signal?: AbortSignal) => currentPlan(signal),
-  applyPlan: async (_id: string, _planHash: string): Promise<ApplyProgress> => {
-    throw new RiftUnavailable(
-      "/plans/apply",
+  applyPlan: async (
+    id: string,
+    planHash: string,
+    options: {
+      configPath: string;
+      allowDownload: boolean;
+      allowInstall: boolean;
+      allowLaunch: boolean;
+      optimize?: boolean;
+    },
+  ): Promise<ApplyProgress> => {
+    const payload = await req<JsonObject>(
       "POST",
-      "not-implemented",
-      "Apply remains CLI-only until plan hashes and permissions are enforced by the v1 controller.",
+      "/apply",
+      applyRequest(options.configPath, options),
+      undefined,
+      15 * 60 * 1000,
     );
+    if (payload.applied === false) {
+      throw new RiftApiError(409, "/apply", payload);
+    }
+    return {
+      planId: id,
+      planHash,
+      phase: "succeeded",
+      percent: 100,
+      message: "Plan applied and the service launch was recorded.",
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
   },
   rollback: async (): Promise<ApplyProgress> => {
     throw new RiftUnavailable("/deployments/actions", "POST", "not-implemented");
@@ -963,6 +1085,28 @@ export const rift = {
   backends: (signal?: AbortSignal) => req<JsonObject>("GET", "/backends", undefined, signal),
   reports: (signal?: AbortSignal) => req<JsonObject>("GET", "/reports", undefined, signal),
   currentPlan,
+  benchmarkService: async (
+    service: string,
+    prompt = "Explain what RIFT does in one sentence.",
+    maxTokens = 32,
+  ) => req<JsonObject>("POST", "/benchmark", { service, prompt, max_tokens: maxTokens }),
+  benchmarkSuite: async (service: string, warmups = 1, repetitions = 3) =>
+    req<JsonObject>("POST", "/benchmark-suite", {
+      service,
+      warmups,
+      repetitions,
+    }),
+  tuneService: async (
+    service: string,
+    options: { live?: boolean; allowRestart?: boolean; candidateLimit?: number } = {},
+  ) =>
+    req<JsonObject>("POST", "/tune", {
+      service,
+      live: options.live ?? false,
+      allow_restart: options.allowRestart ?? false,
+      candidate_limit: options.candidateLimit ?? 4,
+    }),
+  destroyService: async (service: string) => req<JsonObject>("POST", "/destroy", { service }),
 
   subscribe(onEvent: (event: RiftEvent) => void, onStale: (stale: boolean) => void): () => void {
     let closed = false;

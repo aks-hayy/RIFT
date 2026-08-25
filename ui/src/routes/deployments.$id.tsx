@@ -4,9 +4,10 @@ import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, StatDot, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
 import { useService, useRevisions, useBenchmarks, useLogs } from "@/lib/rift/hooks";
+import { rift } from "@/lib/rift/client";
 import { bytes, relativeTime } from "@/lib/rift/format";
 import { cn } from "@/lib/utils";
-import { Copy, Send, RotateCcw } from "lucide-react";
+import { Copy, Gauge, Loader2, RotateCcw, Send, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useState } from "react";
 import type { Service } from "@/lib/rift/types";
 
@@ -88,6 +89,9 @@ function DeploymentDetail() {
 
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
         {unavailable && <Unavailable endpoint={`/v1/services/${id}`} resource="Service" />}
+        {service && (
+          <ServiceActions service={service} onDeleted={() => navigate({ to: "/deployments" })} />
+        )}
         {service && tab === "overview" && <OverviewTab s={service} />}
         {service && tab === "playground" && <PlaygroundTab s={service} />}
         {service && tab === "performance" && <PerformanceTab s={service} />}
@@ -96,6 +100,129 @@ function DeploymentDetail() {
         {tab === "revisions" && <RevisionsTab id={id} />}
       </div>
     </AppShell>
+  );
+}
+
+function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: () => void }) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmTune, setConfirmTune] = useState(false);
+
+  const run = async (action: string, task: () => Promise<unknown>) => {
+    setBusy(action);
+    setMessage(null);
+    setError(null);
+    try {
+      const result = await task();
+      const payload =
+        result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+      setMessage(
+        typeof payload.reason === "string"
+          ? payload.reason
+          : `${action} completed; refresh the live service state for details.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+      setConfirmDelete(false);
+      setConfirmTune(false);
+    }
+  };
+
+  return (
+    <section className="rift-panel px-4 py-3" aria-label="Service operations">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rift-label mr-2">Operations</span>
+        <button
+          type="button"
+          disabled={busy !== null}
+          onClick={() => run("benchmark", () => rift.benchmarkSuite(service.name))}
+          className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-border text-[12px] hover:bg-muted disabled:opacity-50"
+        >
+          {busy === "benchmark" ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Gauge className="size-3.5" />
+          )}
+          Benchmark
+        </button>
+        <button
+          type="button"
+          disabled={busy !== null}
+          onClick={() => run("tune plan", () => rift.tuneService(service.name))}
+          className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-border text-[12px] hover:bg-muted disabled:opacity-50"
+        >
+          <SlidersHorizontal className="size-3.5" /> Tune plan
+        </button>
+        {confirmTune ? (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() =>
+              run("live tune", () =>
+                rift.tuneService(service.name, {
+                  live: true,
+                  allowRestart: true,
+                  candidateLimit: 2,
+                }),
+              )
+            }
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-attention text-ink text-[12px] font-medium disabled:opacity-50"
+          >
+            Confirm live tune
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => setConfirmTune(true)}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-border text-[12px] hover:bg-muted disabled:opacity-50"
+          >
+            Tune live
+          </button>
+        )}
+        {confirmDelete ? (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() =>
+              run("delete", async () => {
+                const result = await rift.destroyService(service.name);
+                onDeleted();
+                return result;
+              })
+            }
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-error text-white text-[12px] font-medium disabled:opacity-50"
+          >
+            Confirm delete
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => setConfirmDelete(true)}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-error/40 text-error text-[12px] hover:bg-error/10 disabled:opacity-50"
+          >
+            <Trash2 className="size-3.5" /> Delete service
+          </button>
+        )}
+      </div>
+      {(message || error || confirmTune || confirmDelete) && (
+        <div
+          className="mt-2 rift-mono text-[11px] text-ink-secondary"
+          role={error ? "alert" : undefined}
+        >
+          {error ??
+            message ??
+            (confirmTune
+              ? "Live tuning will restart the backend between candidates."
+              : "Deletion stops the service and removes its RIFT-managed state; model files are retained.")}
+        </div>
+      )}
+    </section>
   );
 }
 

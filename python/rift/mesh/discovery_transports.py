@@ -27,7 +27,7 @@ def _decode_property(properties: dict[bytes, bytes | None], name: str, fallback:
     return value.decode("utf-8", errors="strict") if isinstance(value, bytes) else fallback
 
 
-def _resolve_mdns(timeout_seconds: float) -> list[BootstrapRecord]:
+def _resolve_service(service_type: str, timeout_seconds: float) -> list[BootstrapRecord]:
     try:
         from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
     except ImportError as exc:
@@ -50,7 +50,6 @@ def _resolve_mdns(timeout_seconds: float) -> list[BootstrapRecord]:
         def remove_service(self, zeroconf, service_type, name):
             names.discard(name)
 
-    service_type = "_rift-node._tcp.local."
     zeroconf = Zeroconf()
     browser = ServiceBrowser(zeroconf, service_type, Listener())
     try:
@@ -84,6 +83,67 @@ def _resolve_mdns(timeout_seconds: float) -> list[BootstrapRecord]:
     finally:
         browser.cancel()
         zeroconf.close()
+
+
+def _resolve_mdns(timeout_seconds: float) -> list[BootstrapRecord]:
+    return _resolve_service("_rift-node._tcp.local.", timeout_seconds)
+
+
+def resolve_controller_mdns(timeout_seconds: float = 1.0) -> list[BootstrapRecord]:
+    """Discover enrollment-enabled controllers without touching operational APIs."""
+
+    records = _resolve_service("_rift-controller._tcp.local.", timeout_seconds)
+    for record in records:
+        record["controller_id"] = record.get("node_hint")
+    return records
+
+
+class ControllerAdvertiser:
+    """Short-lived mDNS advertisement for an open controller enrollment window."""
+
+    def __init__(self, *, controller_id: str, host: str, port: int, fingerprint: str) -> None:
+        self.controller_id = controller_id
+        self.host = host
+        self.port = int(port)
+        self.fingerprint = fingerprint
+        self._zeroconf = None
+        self._service = None
+
+    def start(self) -> None:
+        try:
+            from zeroconf import ServiceInfo, Zeroconf
+        except ImportError as exc:
+            raise RuntimeError("mDNS advertisement requires the 'zeroconf' package") from exc
+        import socket
+
+        try:
+            address = socket.inet_aton(self.host)
+        except OSError:
+            address = socket.inet_aton(socket.gethostbyname(self.host))
+        service_type = "_rift-controller._tcp.local."
+        name = f"{self.controller_id}.{service_type}"
+        self._zeroconf = Zeroconf()
+        self._service = ServiceInfo(
+            service_type,
+            name,
+            addresses=[address],
+            port=self.port,
+            properties={
+                b"controller": self.controller_id.encode("utf-8"),
+                b"api": b"2",
+                b"fingerprint": self.fingerprint.encode("ascii"),
+                b"interface": b"mdns",
+            },
+        )
+        self._zeroconf.register_service(self._service)
+
+    def stop(self) -> None:
+        if self._zeroconf is not None:
+            if self._service is not None:
+                self._zeroconf.unregister_service(self._service)
+            self._zeroconf.close()
+        self._zeroconf = None
+        self._service = None
 
 
 def _sighting_from_record(

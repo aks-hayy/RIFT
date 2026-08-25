@@ -23,6 +23,8 @@ from .discovery_transports import (
     MdnsDiscoveryProvider,
     PrivateSubnetDiscoveryProvider,
     UsbNetworkDiscoveryProvider,
+    ControllerAdvertiser,
+    resolve_controller_mdns,
 )
 from .failover import ControllerRecovery, QuorumElection
 from .leases import RouteLeaseStore
@@ -53,6 +55,8 @@ __all__ = [
     "MdnsDiscoveryProvider",
     "PrivateSubnetDiscoveryProvider",
     "UsbNetworkDiscoveryProvider",
+    "ControllerAdvertiser",
+    "resolve_controller_mdns",
     "ControllerRecovery",
     "QuorumElection",
     "RouteLeaseStore",

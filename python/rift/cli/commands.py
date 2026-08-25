@@ -11,6 +11,7 @@ from rift.adapters.conformance import BackendConformanceSuite
 from rift.dashboard import launch_dashboard_detached, serve_dashboard
 from rift.gateway import serve_gateway
 from rift.node_agent import default_node_agent_config, serve_node_agent
+from rift.node_bootstrap import NodeBootstrapClient, install_node_service
 from rift.orchestrator import ApplyPermissions, RiftOrchestrator
 from rift.providers import provider_lifecycle_gate
 from rift.rift import RiftEngine
@@ -516,6 +517,49 @@ def _cluster(args: Any, console: RiftConsole) -> int:
 
 
 def _node(args: Any, console: RiftConsole) -> int:
+    if args.node_command == "start":
+        client = NodeBootstrapClient(
+            root=args.root,
+            controller=args.controller,
+            display_name=args.name,
+            host=args.host,
+            advertise_host=args.advertise,
+            port=args.port,
+            output=lambda value: print(value),
+        )
+        if args.install_service:
+            result = client.enroll(timeout_seconds=args.timeout)
+            server = result.pop("server", None)
+            thread = result.pop("thread", None)
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if thread is not None:
+                thread.join(timeout=3)
+            installed = install_node_service(root=client.root)
+            console.render({"enrollment": result, "service": installed}, title="RIFT node service installed")
+            return 0
+        client.run_foreground()
+        return 0
+    if args.node_command == "stop":
+        from rift.node_enrollment import ManagedNodeStore
+        import os
+        import signal
+
+        store = ManagedNodeStore(Path(args.root).expanduser().resolve() if args.root else RiftPaths.from_environment().home)
+        pid_path = store.node_dir / "node.pid"
+        if not pid_path.is_file():
+            console.render({"stopped": False, "reason": "node agent is not running"}, title="RIFT node")
+            return 0
+        pid = int(pid_path.read_text(encoding="ascii"))
+        if os.name == "nt":
+            subprocess_result = __import__("subprocess").run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, capture_output=True, text=True)
+            if subprocess_result.returncode != 0:
+                raise RuntimeError((subprocess_result.stderr or subprocess_result.stdout or "taskkill failed").strip())
+        else:
+            os.kill(pid, signal.SIGTERM)
+        console.render({"stopped": True, "pid": pid}, title="RIFT node stopped")
+        return 0
     if args.node_command in {"init", "enroll"}:
         target = Path(args.config)
         if target.exists() and not args.force:
@@ -538,12 +582,34 @@ def _node(args: Any, console: RiftConsole) -> int:
         )
         return 0
     if args.node_command == "status":
+        if not args.config:
+            result = NodeBootstrapClient(root=args.root).status()
+            console.render(result, title="RIFT managed node status")
+            return 0
         from rift.node_agent import NodeAgentController, NodeAgentPolicy
 
         root = Path(args.root or ".").resolve()
         policy = NodeAgentPolicy.from_file(args.config)
         result = NodeAgentController(root=root, policy=policy).status()
         console.render(result, title="Node agent status")
+        return 0
+    if args.node_command == "permissions":
+        client = NodeBootstrapClient(root=args.root)
+        if args.permissions_command == "show":
+            console.render(client.status()["permissions"], title="RIFT node permissions")
+            return 0
+        updates = {}
+        for option, key in (("inference", "allow_inference"), ("download", "allow_download"), ("install", "allow_install"), ("launch", "allow_launch")):
+            value = getattr(args, option)
+            if value is not None:
+                updates[key] = value == "allow"
+        if not updates:
+            console.error("At least one permission flag is required", hint="Use `rift node permissions set --inference allow`.")
+            return 2
+        from rift.node_enrollment import ManagedNodeStore
+
+        result = ManagedNodeStore(client.root).update_permissions(updates)
+        console.render(result.get("permissions") or {}, title="RIFT node permissions updated")
         return 0
     if args.node_command == "serve":
         serve_node_agent(config_path=args.config, root=args.root)

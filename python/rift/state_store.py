@@ -7,11 +7,13 @@ from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import sqlite3
+import threading
 import time
 from typing import Any
 
 
 JsonDict = dict[str, Any]
+_MIRROR_WRITE_LOCK = threading.Lock()
 
 
 class StateConflictError(RuntimeError):
@@ -186,16 +188,19 @@ class StateStore:
         return payload
 
     def _write_mirror(self, state: JsonDict, revision: int) -> None:
-        self.legacy_path.parent.mkdir(parents=True, exist_ok=True)
-        mirror = dict(state)
-        mirror["state_store"] = {
-            "backend": "sqlite-wal",
-            "database": str(self.path),
-            "revision": revision,
-        }
-        temporary = self.legacy_path.with_suffix(self.legacy_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(mirror, indent=2, sort_keys=True), encoding="utf-8")
-        temporary.replace(self.legacy_path)
+        with _MIRROR_WRITE_LOCK:
+            self.legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            mirror = dict(state)
+            mirror["state_store"] = {
+                "backend": "sqlite-wal",
+                "database": str(self.path),
+                "revision": revision,
+            }
+            temporary = self.legacy_path.with_suffix(self.legacy_path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(mirror, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            temporary.replace(self.legacy_path)
 
 
 __all__ = ["StateConflictError", "StateStore"]

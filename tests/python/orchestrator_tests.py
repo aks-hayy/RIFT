@@ -294,6 +294,7 @@ def test_local_generate_plan_apply_gate_and_tune():
         assert installed["applied"] is True
         assert installed["install_results"][0]["installed"] is True
         assert installed["results"][0]["launched"]["pid"] == 1234
+        assert Path(fake_provider.last_model_path).is_absolute()
 
         tune = orch.tune_service(service_name="chat", plan=plan)
         assert tune["candidates"]
@@ -591,6 +592,123 @@ def test_live_tuning_measures_candidates_and_recovery_rolls_back():
         assert orch.read_state()["services"]["chat"]["launch_plan"]["tuning"]["batch"] == 1024
 
 
+def test_tune_plan_uses_active_state_when_default_config_missing():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        provider = FakeLiveTuningProvider()
+        orch.providers["llama.cpp"] = provider
+        baseline_plan = provider.plan_launch(
+            model_path="fixture.gguf",
+            host="127.0.0.1",
+            port=19011,
+            context_length=2048,
+            concurrency=1,
+            hardware=FakeNativeEngine().hardware_profile(),
+            tuning={"batch": 512},
+        )
+        orch.write_state(
+            {
+                "schema_version": 1,
+                "services": {
+                    "chat": {
+                        "backend": "llama.cpp",
+                        "model": {"id": "fixture.gguf", "format": "gguf"},
+                        "launch_plan": baseline_plan,
+                        "last_known_good_launch_plan": baseline_plan,
+                        "runtime": {
+                            "pid": 3100,
+                            "started_unix_seconds": int(time.time()) - 30,
+                            "api_base": baseline_plan["api_base"],
+                        },
+                        "desired_state": "running",
+                        "status": "healthy",
+                    }
+                },
+            }
+        )
+
+        report = orch.tune_service(
+            service_name="chat",
+            config_path=root / "missing-rift.yaml",
+        )
+
+        assert report["mode"] == "plan_only"
+        assert report["candidates"]
+        assert report["baseline"] == {"batch": 512}
+        assert "optimized_config_skipped_reason" in report
+        assert list((root / ".rift" / "reports").glob("*-chat-tuning.json"))
+
+
+def test_rebuild_launch_plan_materializes_downloaded_relative_model_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        model_dir = root / "models"
+        model_dir.mkdir()
+        model_file = model_dir / "fixture.gguf"
+        model_file.write_bytes(b"fixture")
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        provider = FakeLiveTuningProvider()
+        baseline_plan = provider.plan_launch(
+            model_path="fixture.gguf",
+            host="127.0.0.1",
+            port=19012,
+            context_length=2048,
+            concurrency=1,
+            hardware=FakeNativeEngine().hardware_profile(),
+            tuning={"batch": 512},
+        )
+        service = {
+            "model": {"selected_file": "fixture.gguf", "format": "gguf"},
+            "download": {"local_dir": str(model_dir)},
+            "serving": {"host": "127.0.0.1", "port": 19012, "context_length": 2048, "concurrency": 1},
+        }
+
+        rebuilt = orch._rebuild_launch_plan(
+            provider=provider,
+            service=service,
+            launch_plan=baseline_plan,
+            hardware=FakeNativeEngine().hardware_profile(),
+            tuning={"batch": 256},
+        )
+
+        assert rebuilt["command"][rebuilt["command"].index("-m") + 1] == str(model_file)
+
+
+def test_destroy_removes_service_state_but_retains_model_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        model_path = root / "models" / "fixture.gguf"
+        model_path.parent.mkdir()
+        model_path.write_bytes(b"model")
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        orch._terminate_pid = lambda pid: {
+            "pid": pid,
+            "stopped": True,
+            "status": "terminated",
+        }
+        orch.write_state(
+            {
+                "schema_version": 1,
+                "services": {
+                    "chat": {
+                        "status": "healthy",
+                        "desired_state": "running",
+                        "runtime": {"pid": 1234},
+                        "model": {"path": str(model_path)},
+                    }
+                },
+            }
+        )
+
+        result = orch.destroy(service_name="chat")
+
+        assert result["removed"] == ["chat"]
+        assert result["stopped"][0]["pid"] == 1234
+        assert "chat" not in orch.read_state()["services"]
+        assert model_path.read_bytes() == b"model"
+
+
 def test_external_provider_registry_and_launch_plans():
     registry = providers_mod.provider_registry()
     assert {"llama.cpp", "vllm", "sglang", "lmcache_aware"}.issubset(registry)
@@ -823,6 +941,9 @@ def main():
     test_hub_exact_artifact_flows_from_generate_to_launch()
     test_service_supervisor_recovery_backoff_and_degraded_state()
     test_live_tuning_measures_candidates_and_recovery_rolls_back()
+    test_tune_plan_uses_active_state_when_default_config_missing()
+    test_rebuild_launch_plan_materializes_downloaded_relative_model_path()
+    test_destroy_removes_service_state_but_retains_model_file()
     test_external_provider_registry_and_launch_plans()
     test_safetensors_config_routes_to_vllm_provider_gate()
     test_control_api_routes_use_orchestrator()

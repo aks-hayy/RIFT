@@ -67,8 +67,8 @@ physical multi-node/provider acceptance.
 - Cached backend probes within a recommendation run to reduce repeated
   external-tool detection overhead.
 
-All notable RIFT changes are recorded here. The detailed engineering history is
-preserved in [`docs/history/versions.md`](docs/history/versions.md).
+All notable RIFT changes are recorded here. The current product and operational
+documentation is maintained in `README.md`.
 
 ## 1.2.0 - 2026-08-14
 

@@ -30,6 +30,7 @@ class NodeAgentPolicy:
     certificate: str
     private_key: str
     client_ca: str
+    expected_controller_id: str | None = None
     allow_download: bool = False
     allow_install: bool = False
     allow_launch: bool = False
@@ -50,6 +51,7 @@ class NodeAgentPolicy:
             certificate=str(tls.get("certificate") or ""),
             private_key=str(tls.get("private_key") or ""),
             client_ca=str(tls.get("client_ca") or ""),
+            expected_controller_id=(str(tls.get("expected_controller_id")) if tls.get("expected_controller_id") else None),
             allow_download=bool(permissions.get("allow_download", False)),
             allow_install=bool(permissions.get("allow_install", False)),
             allow_launch=bool(permissions.get("allow_launch", False)),
@@ -347,6 +349,7 @@ class _NodeAgentHandler(BaseHTTPRequestHandler):
     server_version = "RIFTNode/1"
 
     def do_GET(self) -> None:  # noqa: N802
+        self._require_controller_identity()
         routes: dict[str, Callable[[], JsonDict]] = {
             "/v1/health": self.controller.health,
             "/v1/discovery": self.controller.discover,
@@ -364,6 +367,7 @@ class _NodeAgentHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         try:
+            self._require_controller_identity()
             payload = self._read_body()
             if self.path == "/v1/desired-state":
                 result = self.controller.submit_desired_state(payload)
@@ -379,6 +383,24 @@ class _NodeAgentHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception as exc:
             self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    def _require_controller_identity(self) -> None:
+        expected = self.controller.policy.expected_controller_id
+        if not expected:
+            return
+        from cryptography import x509
+
+        certificate = self.connection.getpeercert(binary_form=True)
+        if not certificate:
+            raise PermissionError("controller client certificate is required")
+        peer = x509.load_der_x509_certificate(certificate)
+        try:
+            san = peer.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            uris = {str(value) for value in san.get_values_for_type(x509.UniformResourceIdentifier)}
+        except x509.ExtensionNotFound as exc:
+            raise PermissionError("controller certificate has no URI identity") from exc
+        if f"rift-controller:{expected}" not in uris:
+            raise PermissionError("controller certificate identity does not match this node")
 
     def _read_body(self) -> JsonDict:
         length = int(self.headers.get("Content-Length") or 0)
@@ -401,7 +423,7 @@ class _NodeAgentHandler(BaseHTTPRequestHandler):
         return
 
 
-def serve_node_agent(*, config_path: str | Path, root: str | Path | None = None) -> None:
+def create_node_agent_server(*, config_path: str | Path, root: str | Path | None = None) -> ThreadingHTTPServer:
     config_file = Path(config_path).resolve()
     policy = NodeAgentPolicy.from_file(config_file)
     base = Path(root).resolve() if root is not None else config_file.parent
@@ -429,6 +451,11 @@ def serve_node_agent(*, config_path: str | Path, root: str | Path | None = None)
     context.load_cert_chain(certfile=str(certificate), keyfile=str(private_key))
     context.load_verify_locations(cafile=str(client_ca))
     server.socket = context.wrap_socket(server.socket, server_side=True)
+    return server
+
+
+def serve_node_agent(*, config_path: str | Path, root: str | Path | None = None) -> None:
+    server = create_node_agent_server(config_path=config_path, root=root)
     try:
         server.serve_forever()
     finally:
@@ -439,5 +466,6 @@ __all__ = [
     "NodeAgentController",
     "NodeAgentPolicy",
     "default_node_agent_config",
+    "create_node_agent_server",
     "serve_node_agent",
 ]

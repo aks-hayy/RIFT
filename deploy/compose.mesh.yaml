@@ -15,9 +15,13 @@
       "tmpfs": ["/tmp:rw,noexec,nosuid,size=64m"],
       "environment": {
         "RIFT_CONTROLLER_HOST": "0.0.0.0",
-        "RIFT_CONTROLLER_PORT": "8777"
+        "RIFT_CONTROLLER_PORT": "8777",
+        "RIFT_CONTROLLER_ADVERTISE_HOST": "controller"
       },
-      "ports": ["127.0.0.1:${RIFT_CONTROLLER_PORT:-8777}:8777"],
+      "ports": [
+        "127.0.0.1:${RIFT_CONTROLLER_PORT:-8777}:8777",
+        "127.0.0.1:${RIFT_CONTROLLER_BOOTSTRAP_PORT:-11748}:11748"
+      ],
       "volumes": ["controller_state:/var/lib/rift"],
       "networks": ["rift_mesh"],
       "healthcheck": {

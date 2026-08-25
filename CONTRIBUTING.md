@@ -20,7 +20,8 @@ Thank you for helping make local LLM serving more predictable.
 - Keep recommendations evidence-labelled. Metadata is not measured accuracy.
 - Mark emulated and fake-backend results as such.
 - Add focused tests for behavior changes and run the complete affected suite.
-- Update `CHANGELOG.md` and relevant documents for user-visible changes.
+- Update `CHANGELOG.md` and the relevant README section for user-visible
+  changes. Keep the OpenAPI contracts synchronized with API changes.
 
 ## Verification
 

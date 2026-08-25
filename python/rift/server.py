@@ -43,6 +43,11 @@ class RiftServerRuntime:
     lock: threading.Lock = field(default_factory=threading.Lock)
     _mesh_controller: MeshController | None = field(default=None, init=False, repr=False)
     operation_store: OperationStore | None = field(default=None, repr=False)
+    bootstrap_host: str = "0.0.0.0"
+    bootstrap_port: int = 11748
+    _bootstrap_server: Any = field(default=None, init=False, repr=False)
+    _bootstrap_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _bootstrap_advertiser: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.operation_store is None:
@@ -62,8 +67,59 @@ class RiftServerRuntime:
 
     def mesh_controller(self) -> MeshController:
         if self._mesh_controller is None:
-            self._mesh_controller = self.mesh_controller_factory()
+            if self.mesh_controller_factory is MeshController:
+                self._mesh_controller = MeshController(root=RiftPaths.from_environment().home / "mesh")
+            else:
+                self._mesh_controller = self.mesh_controller_factory()
         return self._mesh_controller
+
+    def start_bootstrap_listener(self) -> JsonDict:
+        if self._bootstrap_server is not None:
+            return {"started": True, "port": self._bootstrap_server.server_port}
+        from .mesh.bootstrap_server import create_bootstrap_server
+        from .mesh.discovery_transports import ControllerAdvertiser
+
+        advertised_host = os.environ.get("RIFT_CONTROLLER_ADVERTISE_HOST", "127.0.0.1")
+        server = create_bootstrap_server(
+            controller=self.mesh_controller(),
+            host=self.bootstrap_host,
+            port=self.bootstrap_port,
+            advertised_host=advertised_host,
+        )
+        thread = threading.Thread(target=server.serve_forever, name="rift-controller-bootstrap", daemon=True)
+        thread.start()
+        self._bootstrap_server = server
+        self._bootstrap_thread = thread
+        try:
+            material = self.mesh_controller().bootstrap_tls_material(addresses=[advertised_host])
+            advertiser = ControllerAdvertiser(
+                controller_id=self.mesh_controller().controller_id,
+                host=advertised_host,
+                port=server.server_port,
+                fingerprint=str(material["fingerprint"]),
+            )
+            advertiser.start()
+            self._bootstrap_advertiser = advertiser
+        except Exception:
+            self.stop_bootstrap_listener()
+            raise
+        return {"started": True, "host": advertised_host, "port": server.server_port, "controller_id": self.mesh_controller().controller_id}
+
+    def stop_bootstrap_listener(self) -> JsonDict:
+        if self._bootstrap_advertiser is not None:
+            self._bootstrap_advertiser.stop()
+            self._bootstrap_advertiser = None
+        if self._bootstrap_server is not None:
+            self._bootstrap_server.shutdown()
+            self._bootstrap_server.server_close()
+            self._bootstrap_server = None
+        if self._bootstrap_thread is not None:
+            self._bootstrap_thread.join(timeout=5)
+            self._bootstrap_thread = None
+        return {"stopped": True}
+
+    def shutdown(self) -> None:
+        self.stop_bootstrap_listener()
 
     def model_id(self) -> str:
         source = self.plan_path or self.model_path or "unconfigured"
@@ -170,6 +226,10 @@ class RiftServerRuntime:
         }
 
     def control_get(self, path: str) -> JsonDict:
+        if path == "/api/rift/v2/mesh/enrollment-window":
+            return self.mesh_controller().enrollment_window_status()
+        if path == "/api/rift/v2/mesh/enrollments":
+            return self.mesh_controller().managed_enrollments()
         if path == "/api/rift/v2/mesh/sightings":
             return self.mesh_controller().sightings()
         if path == "/api/rift/v2/mesh/nodes":
@@ -341,6 +401,11 @@ class RiftServerRuntime:
         raise KeyError(path)
 
     def control_post(self, path: str, payload: JsonDict, *, authorization: str | None = None) -> JsonDict:
+        if path == "/api/rift/v2/mesh/enrollment-window":
+            result = self.mesh_controller().open_enrollment_window(
+                ttl_seconds=int(payload.get("ttl_seconds") or 600)
+            )
+            return {**result, "bootstrap": self.start_bootstrap_listener()}
         if path == "/api/rift/v2/mesh/discover":
             providers = payload.get("providers")
             if providers is not None and not isinstance(providers, list):
@@ -363,6 +428,8 @@ class RiftServerRuntime:
                 if not pairing_code:
                     raise ValueError("pairing_code is required")
                 return self.mesh_controller().approve_enrollment(enrollment_id, pairing_code)
+            if action == "cancel":
+                return self.mesh_controller().enrollment_window.cancel(enrollment_id)
             if action == "activate":
                 fingerprint = str(payload.get("certificate_fingerprint") or "")
                 if not fingerprint:
@@ -641,6 +708,12 @@ class RiftServerRuntime:
             )
         raise KeyError(path)
 
+    def control_delete(self, path: str) -> JsonDict:
+        if path == "/api/rift/v2/mesh/enrollment-window":
+            result = self.mesh_controller().close_enrollment_window()
+            return {**result, "bootstrap": self.stop_bootstrap_listener()}
+        raise KeyError(path)
+
 
 class RiftRequestHandler(BaseHTTPRequestHandler):
     runtime: RiftServerRuntime
@@ -653,7 +726,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -807,6 +880,31 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/rift/"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+            return
+        request_id = self.runtime.request_id(self.headers.get("X-Request-ID"))
+        assert self.runtime.operation_store is not None
+        try:
+            prior = self.runtime.operation_store.load(request_id)
+            if prior is not None:
+                self._send_json(
+                    HTTPStatus.OK if prior.get("status") == "SUCCEEDED" else HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {**(prior.get("result") or {}), "request_id": request_id, "operation_id": prior.get("operation_id"), "replayed": True},
+                )
+                return
+            operation = self.runtime.operation_store.begin(request_id, action=parsed.path, actor=self.runtime.identity(self.headers.get("Authorization"), self.client_address[0]))
+            result = {**self.runtime.control_delete(parsed.path), "request_id": request_id, "operation_id": operation["operation_id"]}
+            self.runtime.operation_store.complete(request_id, result=result)
+            self._send_json(HTTPStatus.OK, result)
+        except KeyError:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+        except (PermissionError, ValueError, RuntimeError) as exc:
+            self.runtime.operation_store.fail(request_id, error=str(exc))
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return

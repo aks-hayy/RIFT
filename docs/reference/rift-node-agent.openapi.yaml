@@ -8,9 +8,8 @@ info:
     for every implemented `/v1` operation. Node-side policy independently gates
     downloads, installs, and launches even when the controller requests them.
 
-    The discovery bootstrap path is included as a mesh protocol target and is
-    explicitly marked pending: the current Python node-agent handler does not
-    serve it. Controller-side mesh enrollment, certificate issuance,
+    The controller-side discovery bootstrap listener exposes enrollment-only
+    routes for a short operator-controlled window. Controller-side mesh enrollment, certificate issuance,
     capability publication, link reporting, and route resolution are specified
     in `rift-controller.openapi.yaml`.
 servers:
@@ -51,6 +50,81 @@ paths:
                 $ref: "#/components/schemas/BootstrapRecord"
         "404":
           description: Current Python node agent has not enabled the bootstrap responder.
+
+  /.well-known/rift-controller:
+    get:
+      tags: [Bootstrap]
+      operationId: getRiftControllerBootstrapRecord
+      summary: Discover an enrollment-enabled controller.
+      description: The controller returns only its public identifier, bootstrap certificate fingerprint, and enrollment endpoint.
+      security: []
+      servers:
+        - url: https://rift-controller.example:11748
+      responses:
+        "200":
+          description: Controller bootstrap metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControllerBootstrapRecord"
+
+  /v1/bootstrap/enrollments:
+    post:
+      tags: [Bootstrap]
+      operationId: beginManagedNodeEnrollment
+      summary: Submit a node CSR and ephemeral pairing key.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BootstrapEnrollmentRequest"
+      responses:
+        "201":
+          description: Pairing challenge created. The six-digit code remains on the node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapEnrollmentChallenge"
+
+  /v1/bootstrap/enrollments/{enrollmentId}:
+    get:
+      tags: [Bootstrap]
+      operationId: getManagedNodeEnrollment
+      summary: Poll certificate issuance state.
+      security: []
+      parameters:
+        - name: enrollmentId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Safe enrollment state and, after approval, an encrypted certificate envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapEnrollmentStatus"
+
+  /v1/bootstrap/enrollments/{enrollmentId}/activate:
+    post:
+      tags: [Bootstrap]
+      operationId: activateManagedNodeEnrollment
+      summary: Verify a node over mTLS and activate it.
+      security: []
+      parameters:
+        - name: enrollmentId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Node passed authenticated health verification and is active.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapActivation"
 
   /v1/health:
     get:
@@ -220,6 +294,62 @@ components:
           type: string
         metadata:
           $ref: "#/components/schemas/OpenObject"
+
+    ControllerBootstrapRecord:
+      type: object
+      required: [controller_id, endpoint, api_version, bootstrap_fingerprint]
+      properties:
+        controller_id: { type: string }
+        endpoint: { type: string, format: uri, pattern: "^https://" }
+        api_version: { type: string, const: "2" }
+        bootstrap_fingerprint: { type: string, pattern: "^sha256:[0-9a-f]{64}$" }
+        ttl_seconds: { type: integer, minimum: 1 }
+
+    BootstrapEnrollmentRequest:
+      type: object
+      required: [node_id, display_name, endpoint, csr_pem, node_public_key]
+      properties:
+        node_id: { type: string }
+        display_name: { type: string }
+        endpoint: { type: string, format: uri, pattern: "^https://" }
+        csr_pem: { type: string, writeOnly: true }
+        node_public_key: { type: string, pattern: "^[0-9a-fA-F]{64}$", writeOnly: true }
+
+    BootstrapEnrollmentChallenge:
+      type: object
+      required: [enrollment_id, node_id, controller_public_key, transcript, state]
+      properties:
+        enrollment_id: { type: string }
+        node_id: { type: string }
+        controller_public_key: { type: string, writeOnly: true }
+        transcript: { type: string, writeOnly: true }
+        state: { type: string, enum: [PAIRING_PENDING] }
+        expires_at: { type: number }
+
+    BootstrapEnrollmentStatus:
+      type: object
+      required: [enrollment_id, state]
+      properties:
+        enrollment_id: { type: string }
+        node_id: { type: string }
+        state:
+          type: string
+          enum: [PAIRING_PENDING, ENROLLED, CERTIFICATE_ISSUED, ACTIVE, EXPIRED, REJECTED, CANCELLED]
+        certificate_envelope:
+          type: object
+          writeOnly: true
+          additionalProperties: true
+
+    BootstrapActivation:
+      type: object
+      required: [state, node_id, activation_envelope]
+      properties:
+        state: { type: string, const: ACTIVE }
+        node_id: { type: string }
+        activation_envelope:
+          type: object
+          writeOnly: true
+          additionalProperties: true
 
     NodeHealth:
       type: object

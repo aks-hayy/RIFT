@@ -1,5 +1,9 @@
 # RIFT
 
+> **RIFT is an experimental, research project. Please forgive the mistakes.**
+> APIs, adapters, deployment workflows, and platform support can change while
+> the project is being validated.
+
 RIFT is a hardware-aware control plane for local and small-cluster LLM serving.
 It discovers machines, recommends an exact model artifact and backend, generates
 an explainable deployment configuration, applies it with explicit permissions,
@@ -48,8 +52,8 @@ published, estimated, and emulated evidence separately.
   Mobile and native runtime experiments are preserved outside the release
   branch in the archival source tag.
 
-See the [verified roadmap status](docs/roadmap/status.md) for exact support
-levels and unresolved production gates.
+See the [Project Status](#project-status) section for current support levels
+and unresolved production gates.
 
 ## Fresh Clone
 
@@ -147,6 +151,103 @@ VRAM, host RAM, and free disk; free VRAM/RAM default to total capacity unless
 specified. Simulation is explicitly labelled and is read-only: it cannot pull,
 install, launch, or verify a model.
 
+### Give RIFT A Local Model
+
+For a model already on disk, RIFT can manage the exact artifact without Hub
+discovery:
+
+```powershell
+rift model inspect D:\models\my-model-Q4_K_M.gguf
+rift model verify D:\models\my-model-Q4_K_M.gguf
+rift model recommend --source local --models-dir D:\models --output rift.yaml
+rift plan --config rift.yaml
+rift apply --config rift.yaml --allow-launch
+```
+
+The equivalent explicit model section is:
+
+```yaml
+schema_version: 1
+services:
+  chat:
+    model:
+      source: local
+      id: my-model
+      local_path: "D:\\models\\my-model-Q4_K_M.gguf"
+    policy:
+      backend: llama.cpp
+```
+
+RIFT checks the exact file, backend compatibility, memory budgets, ports,
+context length, and permissions before launch. It refuses incompatible model
+and backend combinations instead of silently substituting a model.
+
+### Choose A Hugging Face Repository Yourself
+
+Automatic discovery is optional. For an exact repository, use its repository ID
+such as `org/model` rather than the browser URL:
+
+```powershell
+rift model pull org/model --dry-run --max-download-gb 12
+rift model pull org/model --output D:\models\org-model
+rift model inspect D:\models\org-model
+rift model verify D:\models\org-model --hash-mode all
+rift model recommend --source local --models-dir D:\models\org-model --output rift.yaml
+rift plan --config rift.yaml
+rift apply --config rift.yaml --allow-launch
+```
+
+The dry run checks repository files, disk capacity, artifact size, revision,
+and likely backend compatibility before any download. Private Hub-compatible
+endpoints can be selected with `--endpoint` and `--token`.
+
+### Node And Controller Enrollment
+
+On the controller, start RIFT and open the dashboard's **Add Node** flow. The
+controller opens a temporary enrollment window on port `11748`. On the new
+device, run:
+
+```powershell
+rift node start --controller https://controller:11748
+```
+
+The node creates a persistent identity, displays a six-digit pairing code, and
+waits for operator approval. The controller issues certificates and verifies
+the node through an mTLS health check before marking it `ACTIVE`. The pairing
+code is never shown in the controller UI. New nodes remain deny-by-default:
+
+```powershell
+rift node permissions show
+rift node permissions set --inference allow
+rift node permissions set --download allow --install allow --launch allow
+```
+
+Subsequent node starts reuse the identity and skip pairing. For Docker, the
+controller must advertise its service hostname, for example
+`RIFT_CONTROLLER_ADVERTISE_HOST=controller`, rather than advertising
+`127.0.0.1`.
+
+### Automatic Tuning
+
+Normal `rift apply` uses hardware-aware backend defaults. Preview candidate
+settings with:
+
+```powershell
+rift service tune --service chat
+```
+
+Run actual measured tuning with controlled restarts using:
+
+```powershell
+rift service tune --service chat --live --allow-restart
+```
+
+Live tuning measures a baseline and bounded backend candidates, waits for
+health after each restart, selects the highest valid measured throughput, saves
+the report, and restores the last known-good configuration if a candidate fails.
+The current `rift apply --optimize` path is intended for optimization but does
+not replace this explicit live tuning command yet.
+
 ## Focused Commands
 
 ```text
@@ -166,7 +267,7 @@ Cluster operations
   rift cluster discover|plan|apply|status|drain|destroy
 
 Node agent
-  rift node enroll|serve|status
+  rift node start|status|stop|permissions
 
 System and support
   rift system backup|restore|diagnostics|migrate
@@ -192,15 +293,11 @@ plans. Values derived from live state and preview-only future surfaces are
 labeled in the UI. Mutating operations remain guarded by the same permissions
 enforced by the CLI.
 
-See the [operator console data guide](docs/guides/operator-console.md) for the
-live/derived/preview boundary.
+The UI must treat live controller API data as authoritative. It must label
+measured, published, estimated, emulated, and unavailable values separately;
+it must never render operational mock data as real state.
 
-See [benchmark data policy](docs/legal/benchmark-data-policy.md) for the
-published-evidence boundary and [release audit](docs/legal/release-audit.md)
-for the source-tree checks required before publishing.
-
-Adapter authors should start with the
-[versioned adapter guide](docs/guides/adapter-authoring.md) and the
+Adapter authors should use the versioned
 [Adapter API V2 contract](docs/reference/rift-adapter-api-v2.openapi.yaml).
 
 ## Repository Layout
@@ -208,14 +305,15 @@ Adapter authors should start with the
 ```text
 ui/              canonical operator interface source
 python/rift/web/  bundled dashboard assets
-docs/            guides, architecture, roadmap, reference, and history
+ docs/            machine-readable OpenAPI contracts only
 deploy/          split OCI images and mesh Compose workflow
 python/rift/     public Python and CLI facade
 scripts/         contributor build helpers
 tests/python/    control-plane and provider tests
 ```
 
-More detail is available in the [repository layout](docs/architecture/repository-layout.md).
+The README is the canonical repository and operator guide. The OpenAPI files
+under `docs/reference/` are retained as machine-readable contracts.
 
 ## Safety Model
 
@@ -224,7 +322,28 @@ service, executes remote commands, exposes a public port, or overwrites user
 intent. Destructive operations require explicit confirmation, and public
 network exposure remains an operator responsibility.
 
-## Project Status
+## Testing And Verification
+
+Run the Python tests from an environment with the declared package
+dependencies:
+
+```powershell
+python -m compileall -q python tests
+Get-ChildItem tests\python -Filter '*_tests.py' | ForEach-Object {
+  python $_.FullName
+  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+```
+
+Container manifests under `deploy/containers/` and
+`deploy/compose.mesh.yaml` can exercise controller/node enrollment, Docker
+bridge-network discovery, mTLS activation, restart persistence, recovery, and
+cleanup without modifying host model files. Tests distinguish real hardware
+measurements, live backend measurements, deterministic emulation, and fake
+provider contract tests. Emulation is not evidence of physical fleet
+reliability.
+
+## Compatibility And Project Status
 
 RIFT is a pure-Python control plane suitable for local deployment workflows,
 adapter-based backend management, and deterministic mesh/control-plane
@@ -232,9 +351,21 @@ emulation. Physical heterogeneous-node reliability remains
 `UNVERIFIED_EXTERNAL`; this release does not claim to be a Kubernetes
 replacement or to bundle serving backends.
 
-- [Quickstart](docs/guides/quickstart.md)
-- [Compatibility](docs/reference/compatibility.md)
-- [Known limitations](docs/reference/known-limitations.md)
+Backend compatibility is the intersection of the exact artifact, architecture,
+backend version, operating system, accelerator, memory budget, and workload.
+llama.cpp with GGUF is the strongest locally verified path. vLLM, SGLang, and
+MLX-LM have adapter contracts and platform-specific planning, but their broad
+physical acceptance matrix is not yet complete. CPU-only fallback and remote
+node plans are valid strategies when local acceleration is unavailable.
+
+Known limits include incomplete physical heterogeneous-node evidence, limited
+real-backend tuning coverage, no guarantee that every model family is
+deployable, and no claim of Kubernetes-level production HA. These limits are
+reported rather than hidden.
+
+- [Controller OpenAPI](docs/reference/rift-controller.openapi.yaml)
+- [Node Agent OpenAPI](docs/reference/rift-node-agent.openapi.yaml)
+- [Adapter API V2 OpenAPI](docs/reference/rift-adapter-api-v2.openapi.yaml)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
 - [Changelog](CHANGELOG.md)

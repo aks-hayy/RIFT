@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 import sys
 import tempfile
+import threading
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,9 +82,36 @@ def test_state_store_rejects_stale_revision_and_restores_backup():
         assert store.read()["marker"] == "first"
 
 
+def test_state_store_serializes_legacy_mirror_writes_across_readers():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        database = root / "state.db"
+        legacy = root / "state.json"
+        StateStore(database, legacy_path=legacy).write(
+            {"schema_version": 2, "services": {}, "marker": "concurrent"}
+        )
+        errors = []
+
+        def read_state():
+            try:
+                StateStore(database, legacy_path=legacy).read()
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        workers = [threading.Thread(target=read_state) for _ in range(12)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=5)
+
+        assert not errors, errors
+        assert json.loads(legacy.read_text(encoding="utf-8"))["marker"] == "concurrent"
+
+
 def main():
     test_state_store_imports_legacy_json_and_writes_sqlite_authoritatively()
     test_state_store_rejects_stale_revision_and_restores_backup()
+    test_state_store_serializes_legacy_mirror_writes_across_readers()
     print("RIFT state store tests passed")
 
 

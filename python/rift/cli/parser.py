@@ -441,12 +441,23 @@ def _add_node_group(commands) -> None:
         "Run the optional mTLS worker agent on a cluster node",
         epilog=(
             "Workflow:\n"
-            "  rift node init --node-id worker-01\n"
-            "  # provision the declared CA/node certificates\n"
-            "  rift node serve --config node-agent.yaml"
+            "  rift node start --controller https://controller:11748\n"
+            "  # approve the six-digit code in the controller dashboard\n"
+            "  rift node status"
         ),
     )
     sub = _subcommands(node, title="node commands", dest="node_command")
+    start = _parser(sub, "start", "Enroll this machine once, then run its authenticated node agent")
+    start.add_argument("--controller", help="Enrollment listener URL; mDNS is used when omitted")
+    start.add_argument("--name", help="Human-readable node name")
+    start.add_argument("--host", default="0.0.0.0", help="Node agent bind address")
+    start.add_argument("--advertise", help="Address the controller can reach; defaults to host or 127.0.0.1")
+    start.add_argument("--port", type=int, default=11750, help="Authenticated node-agent port")
+    start.add_argument("--install-service", action="store_true", help="Install a user auto-start service after enrollment")
+    start.add_argument("--root", help="Override RIFT_HOME for this node")
+    start.add_argument("--timeout", type=float, default=600.0, help="Enrollment wait timeout in seconds")
+    stop_node = _parser(sub, "stop", "Stop the foreground or installed RIFT node agent")
+    stop_node.add_argument("--root", help="Override RIFT_HOME for this node")
     init = _parser(sub, "init", "Create a locked-down node-agent config template")
     init.add_argument("--config", default="node-agent.yaml")
     init.add_argument("--node-id", default="rift-node")
@@ -459,8 +470,16 @@ def _add_node_group(commands) -> None:
     serve.add_argument("--config", default="node-agent.yaml")
     serve.add_argument("--root")
     status = _parser(sub, "status", "Show node-agent health and local desired state")
-    status.add_argument("--config", default="node-agent.yaml")
+    status.add_argument("--config", help="Deprecated expert config path")
     status.add_argument("--root")
+    permissions = _parser(sub, "permissions", "Show or change local deny-by-default node permissions")
+    permission_sub = _subcommands(permissions, title="permission commands", dest="permissions_command")
+    permission_show = _parser(permission_sub, "show", "Show effective local permissions")
+    permission_show.add_argument("--root", help="Override RIFT_HOME for this node")
+    permission_set = _parser(permission_sub, "set", "Change selected local permissions")
+    for name in ("inference", "download", "install", "launch"):
+        permission_set.add_argument(f"--{name}", choices=("allow", "deny"))
+    permission_set.add_argument("--root", help="Override RIFT_HOME for this node")
 
 
 def _add_system_group(commands) -> None:

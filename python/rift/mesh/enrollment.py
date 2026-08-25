@@ -130,6 +130,61 @@ class EnrollmentService:
         self._save()
         return {"enrollment": self._public_record(record), "node": dict(node)}
 
+    def adopt_approved(
+        self,
+        *,
+        enrollment_id: str,
+        node_id: str,
+        node_hint: str,
+        endpoint: str,
+        provider: str = "controller-bootstrap",
+        bootstrap_fingerprint: str = "sha256:managed-bootstrap",
+    ) -> dict[str, object]:
+        """Persist a node approved by the managed bootstrap handshake."""
+
+        if not enrollment_id.strip() or not node_id.strip() or not endpoint.strip():
+            raise ValueError("managed enrollment identity and endpoint are required")
+        enrollments = self._state["enrollments"]
+        nodes = self._state["nodes"]
+        assert isinstance(enrollments, dict)
+        assert isinstance(nodes, dict)
+        existing = enrollments.get(enrollment_id)
+        if isinstance(existing, dict):
+            if existing.get("node_id") != node_id:
+                raise RuntimeError("enrollment id is already bound to another node")
+            return {"enrollment": self._public_record(existing), "node": dict(nodes[str(node_id)])}
+        now = float(self._clock())
+        record = {
+            "enrollment_id": enrollment_id,
+            "sighting_id": f"bootstrap-{enrollment_id}",
+            "node_id": node_id,
+            "node_hint": node_hint,
+            "endpoint": endpoint,
+            "provider": provider,
+            "bootstrap_fingerprint": bootstrap_fingerprint,
+            "created_at": now,
+            "approved_at": now,
+            "state": TrustState.ENROLLED.value,
+        }
+        node = {
+            "node_id": node_id,
+            "hostname": node_hint,
+            "endpoint": endpoint,
+            "provider": provider,
+            "trust_state": TrustState.ENROLLED.value,
+            "mtls_status": "CERTIFICATE_ISSUED",
+            "certificate_fingerprint": None,
+            "routable": False,
+            "enrolled_at": now,
+            "last_seen_at": now,
+            "hardware": {},
+            "runtime_offers": [],
+        }
+        enrollments[enrollment_id] = record
+        nodes[node_id] = node
+        self._save()
+        return {"enrollment": self._public_record(record), "node": dict(node)}
+
     def activate(self, enrollment_id: str, *, certificate_fingerprint: str) -> dict[str, object]:
         if not certificate_fingerprint.strip():
             raise ValueError("certificate fingerprint is required")
@@ -224,6 +279,17 @@ class EnrollmentService:
         nodes = self._state["nodes"]
         assert isinstance(nodes, dict)
         return [dict(nodes[key]) for key in sorted(nodes)]
+
+    def list_enrollments(self) -> list[dict[str, object]]:
+        """Return persisted enrollment records without pairing secrets."""
+
+        enrollments = self._state["enrollments"]
+        assert isinstance(enrollments, dict)
+        return [
+            self._public_record(enrollments[key])
+            for key in sorted(enrollments)
+            if isinstance(enrollments[key], dict)
+        ]
 
     @staticmethod
     def _public_record(record: dict[str, object]) -> dict[str, object]:

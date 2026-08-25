@@ -129,8 +129,8 @@ function ModelsPage() {
         {!search && (
           <Panel title="Model discovery" aside={<SourceBadge source="live" />}>
             <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
-              Choose a workload and start discovery. RIFT will show only live controller results;
-              no catalog records are fabricated when the controller has no data.
+              Choose a workload and start discovery. RIFT will show only live controller results; no
+              catalog records are fabricated when the controller has no data.
             </div>
           </Panel>
         )}
