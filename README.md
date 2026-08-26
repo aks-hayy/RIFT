@@ -130,18 +130,63 @@ rift model pull --task chat --dry-run
 # Remove --dry-run when the selection looks right.
 rift model pull --task chat --output models/best
 
-# Generate explainable intent and review every action.
+# Generate explainable intent and review every action. The command prints a
+# recommendation run ID; use that ID to materialize a deployable config.
 rift model recommend --task chat --write-report recommendations.json
-rift plan --config rift.yaml
+rift plan --recommendation-run <recommendation-run-id>
 
-# Nothing downloads, installs, or launches without these explicit permissions.
-rift apply --config rift.yaml --allow-download --allow-install --allow-launch
+# Plans are saved in the repository's plans/ directory.
+rift plan list
+
+# After reviewing the generated plan, apply its materialized config explicitly.
+# Or run `rift apply` to choose from the saved plans interactively.
+rift apply
+
+# Non-interactive plan selection:
+rift apply --plan 1 `
+  --allow-download --allow-install --allow-launch
+
+# Explicit YAML application still bypasses plan selection.
+rift apply --config plans/recommendation-<recommendation-run-id>.yaml `
+  --allow-download --allow-install --allow-launch
+
+# For a hand-authored rift.yaml, use the same explicit permission gates:
+# rift apply --config rift.yaml --allow-download --allow-install --allow-launch
 
 # Operate the deployed service.
 rift status
 rift service benchmark --service chat --suite
 rift service tune --service chat
 rift stop --service chat --yes
+```
+
+### Choose A Model During Planning
+
+`rift plan` can start from an existing recommendation download, one Hub
+repository, one local model, or a directory of local models. It inspects and
+shows the candidates before materializing a plan; it never downloads or
+launches by itself.
+
+Every generated deployment plan is written to `plans/` in the current
+repository. RIFT also keeps a runtime copy for the control API. Older plans
+created before repository-local plan storage remain visible as legacy runtime
+plans until they are recreated.
+
+```powershell
+# Review pulled recommendation models and choose interactively.
+rift plan
+
+# Inspect one Hub repository or URL.
+rift plan --huggingface Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+
+# Inspect one local artifact.
+rift plan --local-model D:\models\coder\model-Q4_K_M.gguf
+
+# Rank a directory of local artifacts and choose one.
+rift plan --models-dir D:\models
+
+# Automation: select the displayed candidate without prompting.
+rift plan --models-dir D:\models --select 2
 ```
 
 Use `rift --json COMMAND ...` for automation. Human-readable tables are the
@@ -282,9 +327,11 @@ rift dashboard --port 8765 --control-port 8777
 rift dashboard --detach
 ```
 
-The canonical contributor UI source is `ui/`. The installed package serves
-`python/rift/web/static` directly, so users do not need npm. From an installed
-wheel, `rift start` and `rift dashboard` work outside the source checkout.
+The canonical contributor UI source is `ui/`. Its production rich-console
+bundle is published into `python/rift/web/static`, so users do not need an npm
+install at runtime. When Node.js is available, `rift start` and `rift dashboard`
+serve that bundled operator console; Node-less environments use the packaged
+static fallback. Both paths work outside the source checkout.
 
 The current console starts with discovery and trust onboarding, then provides
 live mesh nodes, certificate/routability state, measured links, hardware,

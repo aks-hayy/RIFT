@@ -1051,7 +1051,7 @@ export const rift = {
       "/apply",
       applyRequest(options.configPath, options),
       undefined,
-      15 * 60 * 1000,
+      30 * 60 * 1000,
     );
     if (payload.applied === false) {
       throw new RiftApiError(409, "/apply", payload);
@@ -1105,6 +1105,12 @@ export const rift = {
       live: options.live ?? false,
       allow_restart: options.allowRestart ?? false,
       candidate_limit: options.candidateLimit ?? 4,
+    }),
+  recoverService: async (service: string) =>
+    req<JsonObject>("POST", "/recover", {
+      service,
+      allow_launch: true,
+      force: true,
     }),
   destroyService: async (service: string) => req<JsonObject>("POST", "/destroy", { service }),
 

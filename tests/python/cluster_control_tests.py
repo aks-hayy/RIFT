@@ -110,6 +110,18 @@ def test_emulated_cluster_lifecycle_tuning_and_disaster_recovery():
         assert controller.status()["summary"]["phases"] == {"stopped": 3}
 
 
+def test_cluster_recovery_on_fresh_state_is_actionable():
+    with tempfile.TemporaryDirectory() as tmp:
+        controller = cluster_mod.RiftClusterController(root=Path(tmp))
+
+        result = controller.monitor(allow_recovery=True)
+
+        assert result["available"] is False
+        assert result["healthy"] is False
+        assert result["results"] == []
+        assert "cluster apply" in result["message"]
+
+
 def test_fifty_node_heterogeneous_placement_partition_rollout_and_recovery():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

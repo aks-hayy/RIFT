@@ -25,6 +25,7 @@ if (-not (Test-Path (Join-Path $venv "Scripts\python.exe"))) {
 
 $venvPython = Join-Path $venv "Scripts\python.exe"
 & $venvPython -m pip install --upgrade pip
+& $venvPython -m pip install --upgrade setuptools wheel packaging
 & $venvPython -m pip install --no-cache-dir $root
 
 Write-Host "RIFT is ready."

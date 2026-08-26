@@ -45,6 +45,13 @@ ui/.tanstack/
 ui/.wrangler/
 ui/.npm-cache/
 
+# The packaged rich dashboard is a release asset, not a local build cache.
+!/python/rift/web/static/_rich/
+!/python/rift/web/static/_rich/dist/
+!/python/rift/web/static/_rich/dist/**
+!/python/rift/web/static/_rich/scripts/
+!/python/rift/web/static/_rich/scripts/**
+
 # Platform runtime data when an operator points RIFT at the checkout
 .rift-runtime/
 

@@ -45,6 +45,100 @@ class RecommendationStore:
     def list_recommendations(self, *, limit: int = 50) -> JsonDict:
         return self._list(self.recommendation_dir, limit=limit, kind="recommendation")
 
+    def list_pulled_models(self, *, limit: int = 50) -> JsonDict:
+        """Return recommendation winners whose downloaded artifact still exists."""
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        entries: list[JsonDict] = []
+        if not self.recommendation_dir.is_dir():
+            return {"kind": "pulled_model", "count": 0, "models": entries}
+        seen_paths: set[str] = set()
+        paths = sorted(
+            self.recommendation_dir.glob("*.json"),
+            key=lambda item: item.stat().st_mtime_ns,
+            reverse=True,
+        )
+        for path in paths:
+            if len(entries) >= limit:
+                break
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            pulled = payload.get("pull_best")
+            if not isinstance(pulled, dict):
+                continue
+            local_dir = str(pulled.get("local_dir") or pulled.get("output_dir") or "").strip()
+            if not local_dir:
+                continue
+            local_path = Path(local_dir).expanduser()
+            if not local_path.is_absolute():
+                local_path = Path.cwd() / local_path
+            if not local_path.exists():
+                continue
+            normalized_path = str(local_path.resolve())
+            if normalized_path in seen_paths:
+                continue
+            seen_paths.add(normalized_path)
+            recommendations = [
+                item for item in payload.get("recommendations", []) if isinstance(item, dict)
+            ]
+            selected = recommendations[0] if recommendations else {}
+            categories = payload.get("categories") or {}
+            best = categories.get("best_estimated_fit") or categories.get("best_estimated")
+            if isinstance(best, dict):
+                best_repo = str(best.get("repo_id") or "")
+                best_artifact = str(best.get("artifact_id") or "")
+                best_file = str(best.get("selected_file") or "")
+                selected = next(
+                    (
+                        item for item in recommendations
+                        if str(item.get("repo_id") or "") == best_repo
+                        and (
+                            not best_artifact
+                            or str(
+                                (item.get("selected_artifact") or item.get("artifact") or {}).get("artifact_id")
+                                or ""
+                            )
+                            == best_artifact
+                        )
+                        and (not best_file or str(item.get("selected_file") or "") == best_file)
+                    ),
+                    selected,
+                )
+            artifact = selected.get("selected_artifact") or selected.get("artifact") or {}
+            quality = selected.get("quality_evidence") or {}
+            entries.append(
+                {
+                    "recommendation_run_id": payload.get("recommendation_run_id") or path.stem,
+                    "task": payload.get("task") or "chat",
+                    "repo_id": selected.get("repo_id"),
+                    "revision": selected.get("revision") or pulled.get("revision"),
+                    "selected_file": selected.get("selected_file") or pulled.get("selected_file"),
+                    "format": selected.get("format") or artifact.get("format"),
+                    "quantization": selected.get("quantization") or artifact.get("quantization"),
+                    "backend": selected.get("backend") or selected.get("recommended_backend"),
+                    "score": selected.get("final_score") or selected.get("score"),
+                    "size_bytes": (
+                        selected.get("selected_download_bytes")
+                        or artifact.get("total_bytes")
+                        or pulled.get("total_known_bytes")
+                    ),
+                    "evidence": (
+                        "MEASURED_LOCAL" if quality.get("local_records", 0)
+                        else "PUBLISHED" if quality.get("published_records", 0)
+                        else "ESTIMATED"
+                    ),
+                    "reasons": list(selected.get("evidence") or [])[:3],
+                    "local_dir": normalized_path,
+                    "pulled_at": pulled.get("completed_unix_seconds") or pulled.get("downloaded_at"),
+                }
+            )
+        return {"kind": "pulled_model", "count": len(entries), "models": entries}
+
     def save_verification(self, payload: JsonDict) -> str:
         run_id = str(payload.get("verification_run_id") or payload.get("run_id") or "")
         if not run_id:

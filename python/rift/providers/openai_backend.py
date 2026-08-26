@@ -513,15 +513,19 @@ def openai_benchmark(
     max_tokens: int,
     timeout_seconds: float = 60.0,
 ) -> JsonDict:
+    model_id = resolve_openai_model_id(
+        base_url=base_url,
+        timeout_seconds=min(timeout_seconds, 5.0),
+    )
     payload = {
-        "model": "rift-managed",
+        "model": model_id or "rift-managed",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": False,
     }
     data = json.dumps(payload).encode("utf-8")
     request = Request(
-        f"{base_url.rstrip('/')}/v1/chat/completions",
+        _openai_route(base_url, "/v1/chat/completions"),
         data=data,
         headers={"Content-Type": "application/json", "User-Agent": "RIFT/1.0"},
     )
@@ -536,8 +540,48 @@ def openai_benchmark(
         "elapsed_seconds": elapsed,
         "generated_tokens_estimate": generated,
         "tokens_per_second_estimate": generated / elapsed if generated else None,
+        "model_id": model_id or "rift-managed",
+        "model_id_source": "server_catalog" if model_id else "fallback",
         "response_preview": raw[:1000],
     }
+
+
+def resolve_openai_model_id(*, base_url: str, timeout_seconds: float = 5.0) -> str | None:
+    """Read the live model identifier required by an OpenAI-compatible server.
+
+    Backends commonly advertise a filesystem path (for example ``/models``) when
+    launched from a mounted directory. Sending RIFT's internal placeholder or the
+    original Hub repository ID then produces a misleading 404 even though the
+    server is healthy. The catalog endpoint is the portable source of truth.
+    """
+
+    try:
+        request = Request(
+            _openai_route(base_url, "/v1/models"),
+            headers={"Accept": "application/json", "User-Agent": "RIFT/1.0"},
+        )
+        with urlopen(request, timeout=max(float(timeout_seconds), 0.1)) as response:
+            payload = json.loads(response.read(128 * 1024).decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return None
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id:
+            return model_id
+    return None
+
+
+def _openai_route(base_url: str, route: str) -> str:
+    root = str(base_url).rstrip("/")
+    if root.endswith("/v1") and route.startswith("/v1"):
+        return root + route[3:]
+    return root + route
 
 
 def count_generated_tokens(raw: str) -> int:

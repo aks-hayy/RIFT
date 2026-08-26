@@ -56,7 +56,17 @@ class RiftReconciler:
         while not event.is_set() and (
             self.policy.max_iterations == 0 or completed < self.policy.max_iterations
         ):
-            report = self.reconcile_once(service_name=service_name)
+            try:
+                report = self.reconcile_once(service_name=service_name)
+            except Exception as exc:  # keep the long-lived controller loop alive
+                report = {
+                    "rift_product": "RIFT",
+                    "status": "error",
+                    "service": service_name,
+                    "error": str(exc),
+                }
+                if self.on_report is not None:
+                    self.on_report(report)
             completed += 1
             if self.policy.max_iterations and len(reports) < 20:
                 reports.append(report)

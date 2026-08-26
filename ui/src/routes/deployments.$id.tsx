@@ -109,6 +109,7 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmTune, setConfirmTune] = useState(false);
+  const [confirmRecover, setConfirmRecover] = useState(false);
 
   const run = async (action: string, task: () => Promise<unknown>) => {
     setBusy(action);
@@ -129,6 +130,7 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
       setBusy(null);
       setConfirmDelete(false);
       setConfirmTune(false);
+      setConfirmRecover(false);
     }
   };
 
@@ -184,6 +186,26 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
             Tune live
           </button>
         )}
+        {service.status !== "running" &&
+          (confirmRecover ? (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => run("recover", () => rift.recoverService(service.name))}
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-primary text-white text-[12px] font-medium disabled:opacity-50"
+            >
+              <RotateCcw className="size-3.5" /> Confirm recovery
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={busy !== null}
+              onClick={() => setConfirmRecover(true)}
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-primary/40 text-primary text-[12px] hover:bg-primary/10 disabled:opacity-50"
+            >
+              <RotateCcw className="size-3.5" /> Recover service
+            </button>
+          ))}
         {confirmDelete ? (
           <button
             type="button"
@@ -210,7 +232,7 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
           </button>
         )}
       </div>
-      {(message || error || confirmTune || confirmDelete) && (
+      {(message || error || confirmTune || confirmRecover || confirmDelete) && (
         <div
           className="mt-2 rift-mono text-[11px] text-ink-secondary"
           role={error ? "alert" : undefined}
@@ -219,7 +241,9 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
             message ??
             (confirmTune
               ? "Live tuning will restart the backend between candidates."
-              : "Deletion stops the service and removes its RIFT-managed state; model files are retained.")}
+              : confirmRecover
+                ? "Recovery will relaunch the last-known-good backend plan."
+                : "Deletion stops the service and removes its RIFT-managed state; model files are retained.")}
         </div>
       )}
     </section>
@@ -296,12 +320,25 @@ function PlaygroundTab({ s }: { s: Service }) {
     setErr(null);
     setOut("");
     try {
-      const url = `${s.endpoint.scheme}://${s.endpoint.bindAddress}:${s.endpoint.port}${s.endpoint.path}/chat/completions`;
+      const endpoint = `${s.endpoint.scheme}://${s.endpoint.bindAddress}:${s.endpoint.port}${s.endpoint.path}`;
+      let model = s.artifactId;
+      try {
+        const catalog = await fetch(`${endpoint}/models`);
+        if (catalog.ok) {
+          const payload = (await catalog.json()) as {
+            data?: { id?: string }[];
+          };
+          model = payload.data?.find((item) => item.id)?.id ?? model;
+        }
+      } catch {
+        // Keep the artifact identifier as a compatibility fallback for minimal servers.
+      }
+      const url = `${endpoint}/chat/completions`;
       const res = await fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          model: s.artifactId,
+          model,
           messages: [{ role: "user", content: input }],
         }),
       });

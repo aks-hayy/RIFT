@@ -297,7 +297,7 @@ class HfHubClient:
             response = urlopen(request, timeout=60)
         except HTTPError as exc:
             if exc.code == 416 and part_path.exists():
-                part_path.replace(local_path)
+                self._promote_download(part_path, local_path)
                 return local_path.stat().st_size
             raise
         mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
@@ -316,8 +316,43 @@ class HfHubClient:
                 f"downloaded size mismatch for {filename}: expected {expected_size}, got {bytes_written}; "
                 f"partial file retained at {part_path} for repair/resume"
             )
-        part_path.replace(local_path)
+        self._promote_download(part_path, local_path)
         return bytes_written
+
+    @staticmethod
+    def _promote_download(part_path: Path, local_path: Path) -> None:
+        """Promote a complete download despite transient Windows file locks."""
+        last_error: OSError | None = None
+        for attempt in range(12):
+            try:
+                part_path.replace(local_path)
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                if attempt == 11:
+                    break
+                time.sleep(min(2.0, 0.25 * (attempt + 1)))
+        if last_error is not None:
+            # A scanner can keep the source open longer than a rename window.
+            # Copying to a fresh file still lets RIFT publish the exact target
+            # without downloading the artifact again.
+            staged_path = local_path.with_suffix(local_path.suffix + ".promote")
+            try:
+                if staged_path.exists():
+                    staged_path.unlink()
+                shutil.copyfile(part_path, staged_path)
+                staged_path.replace(local_path)
+            except OSError:
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise last_error
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _sha256(path: Path) -> str:

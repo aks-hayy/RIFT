@@ -33,6 +33,37 @@ from .openai_backend import (
 )
 
 
+_MODEL_FILE_SUFFIXES = frozenset(
+    {".safetensors", ".bin", ".gguf", ".pt", ".pth", ".ckpt", ".onnx"}
+)
+WINDOWS_V0_CONTAINER_IMAGE = "vllm/vllm-openai:v0.17.1"
+
+
+def _model_directory_reference(model_path: str) -> str:
+    """Return the directory vLLM must inspect for config, tokenizer, and weights."""
+    raw_path = str(model_path).strip()
+    if not raw_path:
+        raise ValueError("vLLM requires a model directory or model identifier")
+
+    path = Path(raw_path)
+    if path.exists():
+        return str(path.parent if path.is_file() else path)
+
+    filename = path.name.lower()
+    if path.suffix.lower() in _MODEL_FILE_SUFFIXES or filename.endswith(".safetensors.index.json"):
+        parent = str(path.parent)
+        return parent if parent not in ("", ".") else "."
+    return raw_path
+
+
+def _vllm_v1_disabled(runtime_mode: str, tuning: JsonDict) -> bool:
+    """Avoid vLLM V1 UVA initialization where this host path cannot provide UVA."""
+    explicit = tuning.get("vllm_use_v1")
+    if explicit is not None:
+        return str(explicit).strip().lower() not in {"1", "true", "yes", "on"}
+    return os.name == "nt" and runtime_mode in {"native", "container", "wsl2"}
+
+
 class VllmProvider(ProviderLifecycleMixin):
     name = "vllm"
     container_image = "vllm/vllm-openai:latest"
@@ -74,7 +105,9 @@ class VllmProvider(ProviderLifecycleMixin):
         executable = executable_detection(("vllm", "vllm.exe"), ("VLLM_SERVER", "VLLM_BIN"))
         module = module_detection("vllm")
         wsl_install = wsl_install_detection(search_root, "vllm")
-        container = container_image_detection(self.container_image)
+        container_image = self._preferred_container_image()
+        container = container_image_detection(container_image)
+        container["preferred_image"] = container_image
         isolated_cli = bool(isolated.get("available") and not isolated.get("python_only"))
         native_cli = bool(executable.get("available"))
         native_module = bool(module.get("available"))
@@ -193,12 +226,15 @@ class VllmProvider(ProviderLifecycleMixin):
             "recommended": {
                 "linux_cuda": "python -m pip install vllm",
                 "docker": "Use the official vLLM Docker image when Python wheel compatibility is uncertain.",
-                "windows": "Use WSL2/Linux or Docker; RIFT will not silently install vLLM on native Windows.",
+                "windows": (
+                    f"Use {WINDOWS_V0_CONTAINER_IMAGE} for Windows Docker/WSL GPU paths where vLLM V1 UVA is unavailable."
+                ),
             },
             "notes": [
                 "Automatic install runs only after --allow-install.",
                 "RIFT does not bundle vLLM or mutate PATH.",
                 "Large CUDA wheels may take time to download and install.",
+                "vLLM 0.18 and newer no longer provide the V0 engine; the Windows compatibility image is pinned to v0.17.1.",
             ],
         }
 
@@ -215,7 +251,8 @@ class VllmProvider(ProviderLifecycleMixin):
             else:
                 selected_variant = "isolated-python"
         if selected_variant in ("container", "docker", "podman"):
-            result = install_container_image(self.container_image)
+            container_image = self._preferred_container_image()
+            result = install_container_image(container_image)
         elif selected_variant in ("wsl", "wsl2"):
             result = install_python_packages_wsl(
                 ["vllm"],
@@ -239,6 +276,7 @@ class VllmProvider(ProviderLifecycleMixin):
             "changed": bool(result.get("changed", result.get("returncode") == 0)),
             "installer": result,
             "variant": selected_variant,
+            "container_image": container_image if selected_variant in ("container", "docker", "podman") else None,
             "detection": detection,
             "install_plan": self.install_plan(),
         }
@@ -278,6 +316,7 @@ class VllmProvider(ProviderLifecycleMixin):
         tuning: JsonDict | None = None,
     ) -> JsonDict:
         tuning = tuning or {}
+        model_reference = _model_directory_reference(model_path)
         detect = self.detect(search_root=tuning.get("search_root"))
         runtime_mode = str(tuning.get("runtime_mode") or detect.get("runtime_mode") or "native").lower()
         command_style = str(tuning.get("command_style") or detect.get("command_style") or "cli")
@@ -289,24 +328,40 @@ class VllmProvider(ProviderLifecycleMixin):
         gpu_util = float(tuning.get("gpu_memory_utilization", self._default_gpu_util(hardware)))
         max_seqs = int(tuning.get("max_num_seqs", max(1, concurrency)))
         max_batched_tokens = int(tuning.get("max_num_batched_tokens", self._default_batched_tokens(hardware)))
+        disable_v1 = _vllm_v1_disabled(runtime_mode, tuning)
+        process_env = {"VLLM_USE_V1": "0"} if disable_v1 and runtime_mode == "native" else {}
         if runtime_mode == "container":
             runtime = container_runtime_detection()
             if not runtime.get("available"):
                 raise ValueError("container runtime requested but Docker/Podman was not detected")
             model = Path(model_path)
-            args = [str(runtime["executable"]), "run", "--rm", "--gpus", "all", "--ipc=host", "-p", f"{port}:{port}"]
+            container_name = f"rift-vllm-{int(port)}"
+            args = [
+                str(runtime["executable"]),
+                "run",
+                "--rm",
+                "--gpus",
+                "all",
+                "--name",
+                container_name,
+                "--ipc=host",
+                "-p",
+                f"{port}:{port}",
+            ]
+            if disable_v1:
+                args.extend(["--env", "VLLM_USE_V1=0"])
             if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
                 args.extend(["--env", "HF_TOKEN"])
-            container_model = str(model_path)
+            container_model = model_reference
             if model.exists():
                 model = model.resolve()
                 mount_root = model if model.is_dir() else model.parent
-                container_model = "/models" if model.is_dir() else f"/models/{model.name}"
+                container_model = "/models"
                 args.extend(["-v", f"{mount_root}:/models:ro"])
+            container_image = str(tuning.get("container_image") or self._preferred_container_image())
             args.extend(
                 [
-                    str(tuning.get("container_image") or self.container_image),
-                    "--model",
+                    container_image,
                     container_model,
                 ]
             )
@@ -316,23 +371,25 @@ class VllmProvider(ProviderLifecycleMixin):
             if not wsl.get("available"):
                 raise ValueError("WSL2 runtime requested but WSL was not detected")
             linux_model_path = tuning.get("wsl_model_path") or (
-                windows_path_to_wsl(model_path) if Path(model_path).exists() else model_path
+                windows_path_to_wsl(model_reference) if Path(model_reference).exists() else model_reference
             )
             if not linux_model_path:
                 raise ValueError("model path could not be translated for the WSL2 launch path")
             wsl_python = str((detect.get("wsl_install") or {}).get("python") or tuning.get("wsl_python") or "python3")
-            args = [str(wsl["executable"]), "--", wsl_python, "-m", "vllm.entrypoints.openai.api_server", "--model", str(linux_model_path)]
+            args = [str(wsl["executable"]), "--"]
+            if disable_v1:
+                args.extend(["env", "VLLM_USE_V1=0"])
+            args.extend([wsl_python, "-m", "vllm.entrypoints.openai.api_server", str(linux_model_path)])
             command_style = "wsl2"
         elif command_style == "python-module":
             args = [
                 executable,
                 "-m",
                 "vllm.entrypoints.openai.api_server",
-                "--model",
-                str(model_path),
+                model_reference,
             ]
         else:
-            args = [executable, "serve", str(model_path)]
+            args = [executable, "serve", model_reference]
         args.extend(
             [
                 "--host",
@@ -362,7 +419,11 @@ class VllmProvider(ProviderLifecycleMixin):
         return {
             "backend": self.name,
             "model_path": str(model_path),
+            "model_reference": model_reference,
             "command": args,
+            "env": process_env,
+            "container_image": container_image if runtime_mode == "container" else None,
+            "container_name": container_name if runtime_mode == "container" else None,
             "display": quote_command(args),
             "api_base": f"http://{host}:{port}",
             "openai_base": f"http://{host}:{port}/v1",
@@ -379,6 +440,9 @@ class VllmProvider(ProviderLifecycleMixin):
                 "dtype": str(tuning.get("dtype", "auto")),
                 "generation_config": str(tuning.get("generation_config", "vllm")),
                 "tensor_parallel_size": tensor_parallel_size,
+                "vllm_use_v1": not disable_v1,
+                "container_image": container_image if runtime_mode == "container" else None,
+                "container_name": container_name if runtime_mode == "container" else None,
                 "search_root": tuning.get("search_root"),
                 **({"quantization": quantization} if quantization else {}),
             },
@@ -433,6 +497,11 @@ class VllmProvider(ProviderLifecycleMixin):
             candidate["max_num_seqs"] = max_seqs
             candidates.append(candidate)
         return self._unique(candidates)
+
+    def _preferred_container_image(self) -> str:
+        if os.name == "nt":
+            return WINDOWS_V0_CONTAINER_IMAGE
+        return self.container_image
 
     def _unique(self, candidates: list[JsonDict]) -> list[JsonDict]:
         unique: list[JsonDict] = []

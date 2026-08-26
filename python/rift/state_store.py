@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from typing import Any
+import uuid
 
 
 JsonDict = dict[str, Any]
@@ -196,11 +197,34 @@ class StateStore:
                 "database": str(self.path),
                 "revision": revision,
             }
-            temporary = self.legacy_path.with_suffix(self.legacy_path.suffix + ".tmp")
+            # The controller and dashboard can share one RIFT_HOME on Windows.
+            # A fixed temporary filename lets their mirror writes overwrite one
+            # another and can make os.replace fail while the other process is
+            # still holding the target. The mirror is diagnostic compatibility
+            # state, so retry it briefly and never make the SQLite authority
+            # unreadable because this best-effort copy lost a race.
+            temporary = self.legacy_path.with_suffix(
+                f".{uuid.uuid4().hex}.tmp"
+            )
             temporary.write_text(
                 json.dumps(mirror, indent=2, sort_keys=True), encoding="utf-8"
             )
-            temporary.replace(self.legacy_path)
+            try:
+                last_error: OSError | None = None
+                for _ in range(5):
+                    try:
+                        temporary.replace(self.legacy_path)
+                        return
+                    except OSError as exc:
+                        last_error = exc
+                        time.sleep(0.02)
+                if last_error is not None:
+                    return
+            finally:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 __all__ = ["StateConflictError", "StateStore"]

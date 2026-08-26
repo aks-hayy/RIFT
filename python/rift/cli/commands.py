@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from rift.cluster import RiftClusterController, example_emulated_cluster
@@ -161,20 +162,103 @@ def execute(args: Any, console: RiftConsole) -> int:
         return 0 if result.get("recommendations") else 1
 
     if args.command == "plan":
+        if args.plan_action == "list":
+            result = orchestrator.list_plans(limit=args.limit)
+            console.render(result, view="plans", title="Saved deployment plans")
+            return 0
+        if args.plan_action == "clear":
+            if not args.yes:
+                console.warning("No plans were cleared. Explicit confirmation is required.")
+                print("Run `rift plan clear --yes` after reviewing the saved plan list.")
+                return 2
+            result = orchestrator.clear_plans()
+            console.render(result, view="plan_clear", title="Saved plans cleared")
+            return 0
+        if args.recommendation_run and (args.huggingface or args.local_model or args.models_dir):
+            raise ValueError("choose --recommendation-run or a direct model source, not both")
         if args.recommendation_run:
             result = orchestrator.plan_recommendation_run(
                 run_id=args.recommendation_run,
                 selector=args.selector,
                 output=args.materialized_config,
             )
+        elif args.huggingface or args.local_model or args.models_dir:
+            result = _plan_from_model_source(args, console, orchestrator)
         else:
-            result = orchestrator.plan(config_path=args.config)
+            config_path = Path(args.config)
+            if not config_path.is_absolute():
+                config_path = Path.cwd() / config_path
+            explicit_config = config_path.is_file()
+            pulled = orchestrator.recommendation_store.list_pulled_models(limit=50).get("models", [])
+            if pulled and not explicit_config:
+                selected = _choose_plan_candidate(
+                    console,
+                    {"task": "pulled recommendations", "candidates": pulled},
+                    selector=args.select,
+                    no_prompt=args.no_prompt,
+                    confirm_single=True,
+                )
+                run_id = str(selected.get("recommendation_run_id") or "")
+                if not run_id:
+                    raise ValueError("selected pulled model has no recommendation run ID")
+                result = orchestrator.plan_recommendation_run(
+                    run_id=run_id,
+                    selector=str(selected.get("repo_id") or args.selector or "best_estimated"),
+                    output=args.materialized_config,
+                )
+            else:
+                if not config_path.is_file():
+                    latest = orchestrator.recommendation_store.list_recommendations(limit=1).get("runs", [])
+                    latest_id = str((latest[0] if latest else {}).get("run_id") or "").strip()
+                    if latest_id:
+                        raise FileNotFoundError(
+                            f"RIFT config not found: {config_path}. "
+                            "Run `rift init` to create rift.yaml, or plan the latest "
+                            f"recommendation with `rift plan --recommendation-run {latest_id}`."
+                        )
+                    raise FileNotFoundError(
+                        f"RIFT config not found: {config_path}. "
+                        "Run `rift init` to create a starter rift.yaml."
+                    )
+                result = orchestrator.plan(config_path=args.config)
         console.render(result, view="plan")
         return 1 if any(item.get("kind") == "error" for item in result.get("actions", [])) else 0
 
     if args.command == "apply":
+        config_path = args.config
+        if not config_path:
+            inventory = orchestrator.list_plans(limit=args.limit)
+            if inventory.get("plans"):
+                selected_plan = _choose_saved_plan(
+                    console,
+                    inventory,
+                    selector=args.plan,
+                    no_prompt=args.no_prompt,
+                )
+                config_path = str(selected_plan.get("config_path") or "")
+                if not config_path:
+                    raise ValueError(
+                        f"saved plan {selected_plan.get('plan_id')} has no configuration path; rerun `rift plan`"
+                    )
+                config_candidate = Path(config_path).expanduser()
+                if not config_candidate.is_absolute():
+                    config_candidate = Path.cwd() / config_candidate
+                if not config_candidate.is_file():
+                    raise FileNotFoundError(
+                        f"configuration for saved plan {selected_plan.get('plan_id')} was not found: {config_candidate}. "
+                        "Rerun `rift plan --recommendation-run ...` to recreate it."
+                    )
+                config_path = str(config_candidate)
+            else:
+                default_config = Path.cwd() / "rift.yaml"
+                if not default_config.is_file():
+                    raise FileNotFoundError(
+                        "no saved deployment plans were found. Run `rift plan` first, "
+                        "or provide an explicit `rift apply --config PATH`."
+                    )
+                config_path = str(default_config)
         result = orchestrator.apply(
-            config_path=args.config,
+            config_path=config_path,
             permissions=ApplyPermissions(
                 allow_download=args.allow_download,
                 allow_install=args.allow_install,
@@ -183,6 +267,7 @@ def execute(args: Any, console: RiftConsole) -> int:
                 optimize=args.optimize,
                 write_back=args.write_back,
             ),
+            progress_callback=None if console.json_output else console.apply_progress,
         )
         console.render(result, view="apply", title="Deployment")
         return 0 if result.get("applied") else 2 if result.get("blocked_actions") else 1
@@ -273,6 +358,155 @@ def execute(args: Any, console: RiftConsole) -> int:
     if args.command == "system":
         return _system(args, console, orchestrator)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _choose_plan_candidate(
+    console: RiftConsole,
+    payload: dict[str, Any],
+    *,
+    selector: str | None,
+    no_prompt: bool,
+    confirm_single: bool,
+) -> dict[str, Any]:
+    candidates = [item for item in payload.get("candidates", []) if isinstance(item, dict)]
+    if not candidates:
+        raise ValueError("no recognized model candidates were found")
+    console.render(payload, view="plan_candidates")
+
+    def matches(item: dict[str, Any], value: str) -> bool:
+        artifact = item.get("artifact") if isinstance(item.get("artifact"), dict) else {}
+        keys = {
+            str(item.get("path") or ""),
+            str(item.get("name") or ""),
+            str(item.get("repo_id") or ""),
+            str(item.get("selected_file") or ""),
+            str(item.get("recommendation_run_id") or ""),
+            str(artifact.get("artifact_id") or ""),
+        }
+        return value in keys
+
+    if selector:
+        value = str(selector).strip()
+        if value.isdigit() and 1 <= int(value) <= len(candidates):
+            return candidates[int(value) - 1]
+        for item in candidates:
+            if matches(item, value):
+                return item
+        raise ValueError(f"model selection {value!r} was not found")
+
+    interactive = bool(sys.stdin.isatty()) and not no_prompt and not console.json_output
+    if not interactive:
+        if len(candidates) == 1 and confirm_single:
+            raise ValueError("one model is ready; rerun with `--select 1` to start planning")
+        raise ValueError("multiple models are ready; rerun with `--select N` to choose one")
+    if len(candidates) == 1 and confirm_single:
+        answer = input("Start planning this model? [Y/n]: ").strip().lower()
+        if answer not in {"", "y", "yes"}:
+            raise ValueError("planning cancelled; no deployment plan was created")
+        return candidates[0]
+    answer = input("Choose a model number: ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(candidates):
+        raise ValueError("invalid model selection; rerun with `--select N`")
+    return candidates[int(answer) - 1]
+
+
+def _choose_saved_plan(
+    console: RiftConsole,
+    payload: dict[str, Any],
+    *,
+    selector: str | None,
+    no_prompt: bool,
+) -> dict[str, Any]:
+    plans = [item for item in payload.get("plans", []) if isinstance(item, dict)]
+    if not plans:
+        raise ValueError("no saved deployment plans were found")
+    console.render(payload, view="plans")
+
+    def matches(item: dict[str, Any], value: str) -> bool:
+        keys = {
+            str(item.get("plan_id") or ""),
+            str(item.get("plan_path") or ""),
+            str(item.get("config_path") or ""),
+            str(item.get("recommendation_run_id") or ""),
+        }
+        return value in keys or Path(value).stem == Path(str(item.get("plan_path") or "")).stem
+
+    if selector:
+        value = str(selector).strip()
+        if value.isdigit() and 1 <= int(value) <= len(plans):
+            return plans[int(value) - 1]
+        for item in plans:
+            if matches(item, value):
+                return item
+        raise ValueError(f"saved plan selection {value!r} was not found")
+
+    interactive = bool(sys.stdin.isatty()) and not no_prompt and not console.json_output
+    if not interactive:
+        raise ValueError("saved plans require a choice; rerun with `--plan N`")
+    answer = input("Choose a plan number: ").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(plans):
+        raise ValueError("invalid plan selection; rerun with `--plan N`")
+    return plans[int(answer) - 1]
+
+
+def _plan_from_model_source(
+    args: Any,
+    console: RiftConsole,
+    orchestrator: RiftOrchestrator,
+) -> dict[str, Any]:
+    provided = [bool(args.huggingface), bool(args.local_model), bool(args.models_dir)]
+    if sum(provided) != 1:
+        raise ValueError("choose exactly one of --huggingface, --local-model, or --models-dir")
+    if args.config != "rift.yaml":
+        raise ValueError("choose --config or a direct model source, not both")
+
+    if args.huggingface:
+        output = args.materialized_config or str(orchestrator.plan_dir / "plan-hub.yaml")
+        inspection = orchestrator.generate_huggingface_config(
+            repo_or_url=args.huggingface,
+            task=args.task,
+            revision=args.revision,
+            endpoint=args.endpoint,
+            refresh=args.refresh,
+            output=output,
+            write=False,
+        )
+        selected = _choose_plan_candidate(
+            console,
+            {"task": args.task, "candidates": inspection.get("candidates", [])},
+            selector=args.select,
+            no_prompt=args.no_prompt,
+            confirm_single=True,
+        )
+        artifact_selector = str(selected.get("selected_file") or selected.get("format") or "")
+        materialized = orchestrator.generate_huggingface_config(
+            repo_or_url=args.huggingface,
+            task=args.task,
+            revision=args.revision,
+            endpoint=args.endpoint,
+            refresh=args.refresh,
+            output=output,
+            selector=artifact_selector,
+            write=True,
+        )
+    else:
+        source_path = args.local_model or args.models_dir
+        ranking = orchestrator.rank_local_models(source_path, task=args.task)
+        selected = _choose_plan_candidate(
+            console,
+            ranking,
+            selector=args.select,
+            no_prompt=args.no_prompt,
+            confirm_single=True,
+        )
+        output = args.materialized_config or str(orchestrator.plan_dir / "plan-local.yaml")
+        materialized = orchestrator.generate_config(
+            task=args.task,
+            source="local",
+            models_dir=selected["path"],
+            output=output,
+        )
+    return orchestrator.plan(config_path=materialized["path"])
 
 
 def _model(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
