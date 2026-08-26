@@ -424,9 +424,28 @@ class RiftClusterController:
         }
 
     def monitor(self, *, allow_recovery: bool = False) -> JsonDict:
-        state = self._read_state(required=True)
+        state = self._read_state()
+        if not state:
+            return {
+                "available": False,
+                "allow_recovery": allow_recovery,
+                "results": [],
+                "healthy": False,
+                "message": "No cluster deployment state exists; run `rift cluster init`, `rift cluster plan`, and `rift cluster apply` first.",
+            }
         results = []
-        for instance_id, instance in state["instances"].items():
+        instances = state.get("instances", {})
+        if not isinstance(instances, dict):
+            raise ValueError("cluster state has an invalid instances map")
+        if not instances:
+            return {
+                "available": False,
+                "allow_recovery": allow_recovery,
+                "results": [],
+                "healthy": False,
+                "message": "No cluster deployment state exists; run `rift cluster init`, `rift cluster plan`, and `rift cluster apply` first.",
+            }
+        for instance_id, instance in instances.items():
             node = state["nodes"][instance["node"]]
             fault = instance.get("fault")
             healthy = (

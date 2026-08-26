@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -138,6 +139,10 @@ class FakeInstallableProvider:
 
 
 class FakeRecommendationEngine(FakeNativeEngine):
+    def __init__(self):
+        super().__init__()
+        self.pull_calls = 0
+
     def hardware_profile(self):
         return FakeNativeEngine().hardware_profile()
 
@@ -170,6 +175,7 @@ class FakeRecommendationEngine(FakeNativeEngine):
         }
 
     def pull_model_from_hub(self, repo_id, **kwargs):
+        self.pull_calls += 1
         output = Path(kwargs["output_dir"])
         output.mkdir(parents=True, exist_ok=True)
         artifact = output / "model-Q4_K_M.gguf"
@@ -287,14 +293,24 @@ def test_local_generate_plan_apply_gate_and_tune():
         assert blocked["applied"] is False
         assert "allow_launch" in blocked["required_permissions"]
 
+        progress_events = []
         installed = orch.apply(
             config_path="generated.yaml",
             permissions=orchestrator_mod.ApplyPermissions(allow_install=True, allow_launch=True),
+            progress_callback=lambda phase, status, details: progress_events.append(
+                (phase, status, details)
+            ),
         )
         assert installed["applied"] is True
         assert installed["install_results"][0]["installed"] is True
         assert installed["results"][0]["launched"]["pid"] == 1234
         assert Path(fake_provider.last_model_path).is_absolute()
+        assert ("planning", "complete") in {(phase, status) for phase, status, _ in progress_events}
+        assert ("installing", "complete") in {(phase, status) for phase, status, _ in progress_events}
+        assert ("downloading", "skipped") in {(phase, status) for phase, status, _ in progress_events}
+        assert ("launching", "complete") in {(phase, status) for phase, status, _ in progress_events}
+        assert ("persisting", "complete") in {(phase, status) for phase, status, _ in progress_events}
+        assert ("complete", "complete") in {(phase, status) for phase, status, _ in progress_events}
 
         tune = orch.tune_service(service_name="chat", plan=plan)
         assert tune["candidates"]
@@ -390,6 +406,84 @@ def test_hub_exact_artifact_flows_from_generate_to_launch():
         assert state["services"]["chat"]["launch_plan"]["command"][-1].endswith(
             "model-Q4_K_M.gguf"
         )
+
+        reapplied = orch.apply(
+            config_path="generated.yaml",
+            permissions=orchestrator_mod.ApplyPermissions(
+                allow_download=True,
+                allow_launch=True,
+            ),
+        )
+        assert reapplied["applied"] is True
+        assert orch.engine.pull_calls == 1
+
+
+def test_plan_source_helpers_accept_hub_urls_and_local_model_inputs():
+    assert orchestrator_mod.RiftOrchestrator.normalize_huggingface_repo(
+        "https://huggingface.co/org/model/tree/main"
+    ) == "org/model"
+    assert orchestrator_mod.RiftOrchestrator.normalize_huggingface_repo(
+        "https://huggingface.co/api/models/org/model"
+    ) == "org/model"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        models = make_fake_ggufs(root)
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        ranking = orch.rank_local_models(models, task="coding")
+        assert ranking["task"] == "coding"
+        assert ranking["candidates"]
+        assert all(item["evidence"] == "LOCAL_INSPECTION" for item in ranking["candidates"])
+        assert all(item["reasons"] for item in ranking["candidates"])
+
+
+def test_plans_are_saved_in_repository_and_listed_with_concise_metadata():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        orch.init_config(path="rift.yaml")
+        created = orch.plan(config_path="rift.yaml")
+        assert Path(created["plan_path"]).parent == root / "plans"
+        assert Path(created["plan_path"]).is_file()
+        assert (root / "plans" / "latest.json").is_file()
+
+        inventory = orch.list_plans()
+        assert inventory["root"] == str((root / "plans").resolve())
+        assert inventory["count"] == 1
+        summary = inventory["plans"][0]
+        assert summary["plan_id"] == created["plan_id"]
+        assert summary["service_count"] == 1
+        assert summary["config_path"].endswith("rift.yaml")
+
+
+def test_clear_plans_removes_repository_and_runtime_plan_artifacts_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        repository_plans = root / "plans"
+        runtime_plans = root / ".rift" / "plans"
+        repository_plans.mkdir(parents=True)
+        runtime_plans.mkdir(parents=True)
+
+        for path in (
+            repository_plans / "123-riftplan.json",
+            repository_plans / "latest.json",
+            repository_plans / "plan-local.yaml",
+            repository_plans / "recommendation-run-1.yaml",
+            runtime_plans / "456-riftplan.json",
+            runtime_plans / "latest.json",
+        ):
+            path.write_text("generated", encoding="utf-8")
+        preserved = repository_plans / "operator-notes.yaml"
+        preserved.write_text("keep", encoding="utf-8")
+
+        result = orch.clear_plans()
+
+        assert result["removed_count"] == 6
+        assert preserved.is_file()
+        assert not (repository_plans / "123-riftplan.json").exists()
+        assert not (runtime_plans / "456-riftplan.json").exists()
+        assert result["skipped"] == [str(preserved.resolve())]
 
 
 def test_service_supervisor_recovery_backoff_and_degraded_state():
@@ -709,6 +803,53 @@ def test_destroy_removes_service_state_but_retains_model_file():
         assert model_path.read_bytes() == b"model"
 
 
+def test_destroy_stops_named_container_and_removes_service_state(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        orch = orchestrator_mod.RiftOrchestrator(root=root)
+        orch._terminate_pid = lambda pid: {
+            "pid": pid,
+            "stopped": True,
+            "status": "terminated",
+        }
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(orchestrator_mod.subprocess, "run", fake_run)
+        orch.write_state(
+            {
+                "schema_version": 1,
+                "services": {
+                    "chat": {
+                        "status": "healthy",
+                        "desired_state": "running",
+                        "runtime": {"pid": 1234, "container_name": "rift-vllm-11735"},
+                        "launch_plan": {
+                            "command": [
+                                "docker",
+                                "run",
+                                "--rm",
+                                "--name",
+                                "rift-vllm-11735",
+                            ]
+                        },
+                    }
+                },
+            }
+        )
+
+        result = orch.destroy(service_name="chat")
+
+        assert result["stopped"][0]["container_termination"]["stopped"] is True
+        assert calls == [
+            ["docker", "stop", "--time", "10", "rift-vllm-11735"],
+            ["docker", "rm", "-f", "rift-vllm-11735"],
+        ]
+
+
 def test_external_provider_registry_and_launch_plans():
     registry = providers_mod.provider_registry()
     assert {"llama.cpp", "vllm", "sglang", "lmcache_aware"}.issubset(registry)
@@ -924,6 +1065,36 @@ def test_terraform_style_cli_smoke():
                 )
                 == 0
             )
+            assert (
+                cli_mod.main(
+                    [
+                        "plan",
+                        "--models-dir",
+                        str(models),
+                        "--select",
+                        "1",
+                        "--no-prompt",
+                        "--materialized-config",
+                        ".rift/generated/plan-local.yaml",
+                    ]
+                )
+                == 0
+            )
+            assert (
+                cli_mod.main(
+                    [
+                        "plan",
+                        "--local-model",
+                        str(models / "tiny-q4_k_m.gguf"),
+                        "--select",
+                        "1",
+                        "--no-prompt",
+                        "--materialized-config",
+                        ".rift/generated/plan-file.yaml",
+                    ]
+                )
+                == 0
+            )
             assert cli_mod.main(["plan", "--config", ".rift/generated/rift.generated.yaml"]) == 0
             assert cli_mod.main(["apply", "--config", ".rift/generated/rift.generated.yaml"]) == 2
             assert cli_mod.main(["backend", "detect"]) == 0
@@ -939,6 +1110,9 @@ def main():
     test_local_generate_plan_apply_gate_and_tune()
     test_llama_cpp_provider_install_from_fake_release_archive()
     test_hub_exact_artifact_flows_from_generate_to_launch()
+    test_plan_source_helpers_accept_hub_urls_and_local_model_inputs()
+    test_plans_are_saved_in_repository_and_listed_with_concise_metadata()
+    test_clear_plans_removes_repository_and_runtime_plan_artifacts_only()
     test_service_supervisor_recovery_backoff_and_degraded_state()
     test_live_tuning_measures_candidates_and_recovery_rolls_back()
     test_tune_plan_uses_active_state_when_default_config_missing()

@@ -11,15 +11,17 @@ import signal
 import statistics
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
-from .adapters.artifacts import source_from_local
+from .adapters.artifacts import source_from_candidate, source_from_local
 from .adapters.contracts import AdapterManifest
 from .artifacts import ArtifactManifest
 from .adapters.converters import converter_adapter_host
 from .benchmarking import BenchmarkSuite, summarize_samples
 from .evidence import EvidenceEngine
 from .governance import GovernancePolicy, deployment_manifest, write_deployment_manifest
+from .hf_hub import HfHubClient
 from .observability import ObservabilityStore
 from .providers import (
     backend_adapter_host,
@@ -36,6 +38,7 @@ from .runtime_paths import RiftPaths
 
 
 JsonDict = dict[str, Any]
+ApplyProgressCallback = Callable[[str, str, JsonDict], None]
 
 
 @dataclass
@@ -295,7 +298,7 @@ class RiftOrchestrator:
             raise ValueError(f"models_dir does not exist: {root}")
         models: list[JsonDict] = []
         inspected_roots: set[str] = set()
-        candidates = [root, *(item for item in root.iterdir() if item.is_dir())]
+        candidates = [root] if root.is_file() else [root, *(item for item in root.iterdir() if item.is_dir())]
         for candidate in candidates:
             key = str(candidate.resolve())
             if key in inspected_roots:
@@ -309,7 +312,7 @@ class RiftOrchestrator:
             for variant in variants:
                 weight_files = [item for item in variant.files if item.role == "weights"]
                 selected_path = candidate.resolve()
-                if len(weight_files) == 1 and candidate.is_dir():
+                if len(weight_files) == 1 and candidate.is_dir() and variant.format == "gguf":
                     selected_path = (candidate / weight_files[0].path).resolve()
                 models.append(
                     {
@@ -323,6 +326,252 @@ class RiftOrchestrator:
                 )
         models.sort(key=lambda item: (str(item.get("format")), int(item.get("size") or 0), str(item.get("path"))))
         return models
+
+    def rank_local_models(self, models_dir: str | Path, *, task: str = "chat") -> JsonDict:
+        """Inspect and rank local artifacts without creating deployment state."""
+
+        discovery = self.discover(local=True, models_dir=str(models_dir), write=False)
+        hardware = discovery["nodes"][0]["hardware"]
+        ranked: list[JsonDict] = []
+        for item in discovery["nodes"][0].get("models", []):
+            artifact = dict(item.get("artifact") or {})
+            model = {**item, **artifact}
+            decision = self._select_provider_for_model(
+                model=model,
+                hardware=hardware,
+                requested="auto",
+                workload=task,
+            )
+            backend = str(decision.get("backend") or "")
+            winner = next(
+                (
+                    candidate for candidate in decision.get("candidates", [])
+                    if candidate.get("backend") == backend
+                ),
+                None,
+            )
+            fit = bool(winner and winner.get("fits"))
+            score = float(winner.get("score") or 0.0) if winner else 0.0
+            score += self._artifact_local_preference(item) if fit else 0.0
+            reasons = []
+            if backend:
+                reasons.append(f"{backend} is the strongest compatible backend adapter")
+            if winner and winner.get("reason"):
+                reasons.append(str(winner["reason"]))
+            if not fit:
+                reasons.append(str(decision.get("reason") or "No compatible backend accepted this artifact"))
+            ranked.append(
+                {
+                    "path": item.get("path"),
+                    "name": item.get("name") or Path(str(item.get("path") or "model")).name,
+                    "task": task,
+                    "format": item.get("format"),
+                    "quantization": item.get("quantization"),
+                    "size_bytes": item.get("size"),
+                    "backend": backend or None,
+                    "score": round(score, 6),
+                    "fits": fit,
+                    "evidence": "LOCAL_INSPECTION",
+                    "reasons": reasons[:4],
+                    "artifact": artifact,
+                    "provider_decision": decision,
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                not bool(item.get("fits")),
+                -float(item.get("score") or 0.0),
+                int(item.get("size_bytes") or 0),
+                str(item.get("path") or ""),
+            )
+        )
+        return {"task": task, "hardware": hardware, "candidates": ranked}
+
+    @staticmethod
+    def normalize_huggingface_repo(value: str) -> str:
+        """Normalize a Hub repository ID or common Hugging Face URL form."""
+
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("Hugging Face repository or URL is required")
+        if "://" not in raw:
+            repo = raw.strip("/")
+        else:
+            parsed = urlparse(raw)
+            if parsed.netloc.lower() not in {"huggingface.co", "www.huggingface.co"}:
+                raise ValueError("Hugging Face URL must use huggingface.co")
+            parts = [unquote(item) for item in parsed.path.strip("/").split("/") if item]
+            if parts[:2] == ["api", "models"]:
+                parts = parts[2:]
+            for marker in ("tree", "resolve", "blob"):
+                if marker in parts:
+                    parts = parts[:parts.index(marker)]
+                    break
+            repo = "/".join(parts)
+        if len(repo.split("/")) != 2 or any(not part for part in repo.split("/")):
+            raise ValueError("Hugging Face input must look like `owner/model` or a model URL")
+        return repo
+
+    def generate_huggingface_config(
+        self,
+        *,
+        repo_or_url: str,
+        task: str = "chat",
+        revision: str = "main",
+        endpoint: str = "https://huggingface.co",
+        refresh: bool = False,
+        output: str | Path | None = None,
+        selector: str | None = None,
+        write: bool = True,
+    ) -> JsonDict:
+        """Inspect one Hub repository and materialize its best deployable artifact."""
+
+        repo_id = self.normalize_huggingface_repo(repo_or_url)
+        info = HfHubClient(endpoint=endpoint).model_info(
+            repo_id,
+            revision=revision,
+            expand=("siblings", "config", "tags", "safetensors"),
+            refresh=refresh,
+        )
+        info.setdefault("id", repo_id)
+        source = source_from_candidate(info)
+        if not source.get("files"):
+            source["files"] = [
+                {"path": item.path, "size": item.size}
+                for item in HfHubClient(endpoint=endpoint).list_model_files(repo_id, revision=revision, refresh=refresh)
+            ]
+        variants = self.engine.artifact_adapters.resolve(source)
+        if not variants:
+            raise ValueError(f"Hub repository {repo_id} exposes no supported model artifact")
+        discovery = self.discover(local=True, write=False)
+        hardware = discovery["nodes"][0]["hardware"]
+        ranked: list[JsonDict] = []
+        for variant in variants:
+            artifact = variant.to_dict()
+            model = {
+                **artifact,
+                "format": variant.format,
+                "quantization": variant.quantization,
+                "architecture": variant.architecture,
+                "config": source.get("config") or {},
+                "artifact": artifact,
+            }
+            decision = self._select_provider_for_model(
+                model=model,
+                hardware=hardware,
+                requested="auto",
+                workload=task,
+            )
+            backend = str(decision.get("backend") or "")
+            winner = next(
+                (
+                    candidate for candidate in decision.get("candidates", [])
+                    if candidate.get("backend") == backend
+                ),
+                None,
+            )
+            weights = [item for item in variant.files if item.role == "weights"]
+            selected_files = [item.path for item in variant.files]
+            ranked.append(
+                {
+                    "repo_id": repo_id,
+                    "revision": str(info.get("sha") or revision),
+                    "selected_file": weights[0].path if weights else None,
+                    "selected_files": selected_files,
+                    "format": variant.format,
+                    "quantization": variant.quantization,
+                    "architecture": variant.architecture,
+                    "artifact": artifact,
+                    "size_bytes": variant.metadata.get("total_download_bytes") or variant.total_bytes,
+                    "backend": backend or None,
+                    "score": round(float(winner.get("score") or 0.0), 6) if winner else 0.0,
+                    "fits": bool(winner and winner.get("fits")),
+                    "evidence": "HUB_METADATA",
+                    "reasons": [
+                        f"{variant.format.upper()} artifact inspected from {repo_id}",
+                        str(winner.get("reason") if winner else decision.get("reason") or "No compatible backend accepted this artifact"),
+                    ],
+                    "provider_decision": decision,
+                }
+            )
+        ranked.sort(
+            key=lambda item: (
+                not bool(item.get("fits")),
+                -float(item.get("score") or 0.0),
+                int(item.get("size_bytes") or 0),
+                str(item.get("selected_file") or ""),
+            )
+        )
+        selected = ranked[0]
+        if selector:
+            value = str(selector).strip()
+            if value.isdigit() and 1 <= int(value) <= len(ranked):
+                selected = ranked[int(value) - 1]
+            else:
+                selected = next(
+                    (
+                        item for item in ranked
+                        if value in {
+                            str(item.get("selected_file") or ""),
+                            str(item.get("format") or ""),
+                            str((item.get("artifact") or {}).get("artifact_id") or ""),
+                        }
+                    ),
+                    None,
+                )
+                if selected is None:
+                    raise ValueError(f"Hub artifact selector {value!r} was not found")
+        backend = str(selected.get("backend") or "auto")
+        service = self.default_config()["services"]["chat"]
+        service["task"] = task
+        service["model"].update(
+            {
+                "source": "huggingface",
+                "endpoint": endpoint,
+                "id": repo_id,
+                "revision": selected.get("revision") or revision,
+                "selected_file": selected.get("selected_file"),
+                "selected_files": selected.get("selected_files") or [],
+                "format": selected.get("format"),
+                "quantization": selected.get("quantization"),
+                "artifact": selected.get("artifact") or {},
+                "estimated_download_bytes": selected.get("size_bytes") or 0,
+                "decision": {
+                    "reason": selected.get("reasons") or [],
+                    "alternatives": [
+                        {"id": item.get("selected_file"), "reason": "lower hardware-fit score"}
+                        for item in ranked[1:8]
+                    ],
+                },
+            }
+        )
+        service["policy"]["backend"] = backend
+        service["placement"] = {
+            "node": "local",
+            "decision": {
+                "reason": ["local node is the selected execution target", f"{backend} selected for Hub artifact compatibility"],
+                "rejected_nodes": [],
+            },
+        }
+        config = self.default_config()
+        config["project"] = f"rift-{task}-{repo_id.replace('/', '--')}"
+        config["nodes"][0]["hardware_summary"] = self._hardware_summary(hardware)
+        config["services"] = {"chat": service}
+        output_path = self._resolve_path(
+            output or self.rift_dir / "generated" / f"hub-{repo_id.replace('/', '--')}.yaml"
+        )
+        if write:
+            write_yaml(output_path, config)
+        return {
+            "path": str(output_path),
+            "config": config,
+            "task": task,
+            "repo_id": repo_id,
+            "revision": selected.get("revision") or revision,
+            "hardware": hardware,
+            "candidates": ranked,
+            "selected": selected,
+        }
 
     def generate_config(
         self,
@@ -354,6 +603,7 @@ class RiftOrchestrator:
                     model={**item, **dict(item.get("artifact") or {})},
                     hardware=hardware,
                     requested="auto",
+                    workload=task,
                 )
                 winner = next((candidate for candidate in decision.get("candidates", []) if candidate.get("backend") == decision.get("backend")), None)
                 if winner:
@@ -582,7 +832,7 @@ class RiftOrchestrator:
             },
         }
         target = self._resolve_path(
-            output or self.rift_dir / "generated" / f"recommendation-{run_id}.yaml"
+            output or self.plan_dir / f"recommendation-{run_id}.yaml"
         )
         result = {
             "materialized": True,
@@ -616,8 +866,129 @@ class RiftOrchestrator:
         plan["recommendation_run_id"] = run_id
         plan["recommendation_selector"] = selector
         plan["materialized_config"] = materialized["config_path"]
+        if plan.get("plan_path"):
+            self._write_json(Path(str(plan["plan_path"])), plan)
         self._write_json(self.rift_dir / "plans" / "latest.json", plan)
+        self._write_json(self.plan_dir / "latest.json", plan)
         return plan
+
+    def list_plans(self, *, limit: int = 50) -> JsonDict:
+        """List saved deployment plans with concise operator-facing metadata."""
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        sources = [(self.plan_dir, "REPOSITORY")]
+        runtime_plan_dir = self.rift_dir / "plans"
+        if runtime_plan_dir.resolve() != self.plan_dir.resolve():
+            sources.append((runtime_plan_dir, "RUNTIME_LEGACY"))
+
+        discovered: dict[str, tuple[Path, str]] = {}
+        for directory, source in sources:
+            if not directory.is_dir():
+                continue
+            for path in directory.glob("*.json"):
+                if path.name == "latest.json":
+                    continue
+                discovered.setdefault(path.name, (path, source))
+
+        plans: list[JsonDict] = []
+        for path, source in sorted(
+            discovered.values(),
+            key=lambda item: item[0].stat().st_mtime_ns,
+            reverse=True,
+        )[:limit]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            services = payload.get("services") or {}
+            if not isinstance(services, dict):
+                services = {}
+            models: list[str] = []
+            backends: list[str] = []
+            for name, service in services.items():
+                if not isinstance(service, dict):
+                    continue
+                model = service.get("model") or {}
+                if not isinstance(model, dict):
+                    model = {}
+                label = str(model.get("id") or model.get("selected_file") or model.get("local_path") or "")
+                if label:
+                    models.append(f"{name}: {label}")
+                backend = str(service.get("backend") or (service.get("policy") or {}).get("backend") or "")
+                if backend and backend not in backends:
+                    backends.append(backend)
+            actions = payload.get("actions") or []
+            if not isinstance(actions, list):
+                actions = []
+            blockers = [item for item in actions if isinstance(item, dict) and item.get("kind") == "error"]
+            config_path = str(payload.get("materialized_config") or payload.get("config_path") or "")
+            plan_id = str(payload.get("plan_id") or path.stem)
+            plans.append(
+                {
+                    "plan_id": plan_id,
+                    "recommendation_run_id": payload.get("recommendation_run_id"),
+                    "created_unix_seconds": payload.get("created_unix_seconds"),
+                    "source": source,
+                    "plan_path": str(path.resolve()),
+                    "config_path": config_path,
+                    "model": "; ".join(models) or "-",
+                    "backend": ", ".join(backends) or "-",
+                    "service_count": len(services),
+                    "action_count": len(actions),
+                    "blocker_count": len(blockers),
+                    "status": "BLOCKED" if blockers else "READY",
+                }
+            )
+        return {"root": str(self.plan_dir.resolve()), "count": len(plans), "plans": plans}
+
+    def clear_plans(self) -> JsonDict:
+        """Remove generated deployment-plan artifacts without touching runtime state.
+
+        The repository-local plan directory is authoritative for normal CLI use. The
+        runtime directory is also cleaned when it is separate so legacy mirrored plans
+        cannot reappear in a later ``rift apply`` listing.
+        """
+
+        sources = [(self.plan_dir, "REPOSITORY")]
+        runtime_plan_dir = self.rift_dir / "plans"
+        if runtime_plan_dir.resolve() != self.plan_dir.resolve():
+            sources.append((runtime_plan_dir, "RUNTIME_LEGACY"))
+
+        removed: list[JsonDict] = []
+        skipped: list[str] = []
+        for directory, source in sources:
+            if not directory.is_dir():
+                continue
+            for path in sorted(directory.iterdir(), key=lambda item: item.name.lower()):
+                if not path.is_file() or path.is_symlink():
+                    continue
+                if not self._is_saved_plan_artifact(path, source=source):
+                    skipped.append(str(path.resolve()))
+                    continue
+                path.unlink()
+                removed.append({"path": str(path.resolve()), "source": source})
+
+        return {
+            "cleared": True,
+            "plan_directory": str(self.plan_dir.resolve()),
+            "removed_count": len(removed),
+            "removed": removed,
+            "skipped": sorted(skipped),
+        }
+
+    @staticmethod
+    def _is_saved_plan_artifact(path: Path, *, source: str) -> bool:
+        name = path.name.lower()
+        if name == "latest.json" or name.endswith("-riftplan.json"):
+            return True
+        if source != "REPOSITORY":
+            return False
+        if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
+            return False
+        return name.startswith("plan-") or name.startswith("recommendation-")
 
     def verify_recommendation_run(
         self,
@@ -719,6 +1090,7 @@ class RiftOrchestrator:
             result = self._verify_recommendation_candidate(
                 candidate=candidate,
                 hardware=hardware,
+                workload=str(recommendation.get("task") or "chat"),
                 permissions=permissions,
                 prompt=prompt,
                 max_tokens=max_tokens,
@@ -815,6 +1187,7 @@ class RiftOrchestrator:
         *,
         candidate: JsonDict,
         hardware: JsonDict,
+        workload: str,
         permissions: ApplyPermissions,
         prompt: str,
         max_tokens: int,
@@ -832,6 +1205,7 @@ class RiftOrchestrator:
             "steps": [],
         }
         runtime: JsonDict | None = None
+        launch_plan: JsonDict = {}
         try:
             detection = self._provider_probe(provider, backend)
             if not detection.get("available"):
@@ -877,7 +1251,7 @@ class RiftOrchestrator:
                     "estimated_download_bytes": candidate.get("estimated_download_bytes"),
                 },
                 hardware=hardware,
-                workload="chat",
+                workload=workload,
             )
             if not fit.get("fits"):
                 raise RuntimeError(str(fit.get("reason") or f"{backend} rejected the artifact"))
@@ -925,6 +1299,7 @@ class RiftOrchestrator:
                     result["teardown"] = provider.stop(pid=int(pid_value))
                 except Exception as exc:
                     result["teardown"] = {"stopped": False, "error": str(exc)}
+            result["container_teardown"] = self._stop_container(launch_plan, runtime)
         return result
 
     def _candidate_cached_model_path(
@@ -1015,6 +1390,7 @@ class RiftOrchestrator:
                 model=model,
                 hardware=hardware,
                 requested=str(policy.get("backend") or "auto"),
+                workload=str(service.get("task") or "chat"),
             )
             backend = str(backend_decision.get("backend") or "")
             if not backend:
@@ -1129,8 +1505,20 @@ class RiftOrchestrator:
             "drift": self._drift(config, services),
         }
         if write:
-            target = self._timestamped("plans", "riftplan")
-            self._write_json(target, plan)
+            self.plan_dir.mkdir(parents=True, exist_ok=True)
+            plan_id = f"{int(time.time())}-riftplan"
+            candidate = self.plan_dir / f"{plan_id}.json"
+            suffix = 1
+            while candidate.exists():
+                candidate = self.plan_dir / f"{plan_id}-{suffix}.json"
+                suffix += 1
+            runtime_target = self._timestamped("plans", "riftplan")
+            plan["plan_id"] = candidate.stem
+            plan["plan_path"] = str(candidate.resolve())
+            plan["runtime_plan_path"] = str(runtime_target.resolve())
+            self._write_json(candidate, plan)
+            self._write_json(runtime_target, plan)
+            self._write_json(self.plan_dir / "latest.json", plan)
             self._write_json(self.rift_dir / "plans" / "latest.json", plan)
         return plan
 
@@ -1140,6 +1528,7 @@ class RiftOrchestrator:
         model: JsonDict,
         hardware: JsonDict,
         requested: str,
+        workload: str = "chat",
     ) -> JsonDict:
         fmt = str(model.get("format") or "unknown").lower()
         quantization = str(model.get("quantization") or "").lower()
@@ -1183,7 +1572,7 @@ class RiftOrchestrator:
                 )
             try:
                 if callable(getattr(provider, "evaluate_fit", None)):
-                    fit = provider.evaluate_fit(artifact=model, hardware=hardware, workload="chat")
+                    fit = provider.evaluate_fit(artifact=model, hardware=hardware, workload=workload)
                 else:
                     fit = provider.model_fit(model=model, hardware=hardware)
             except Exception as exc:
@@ -1199,7 +1588,7 @@ class RiftOrchestrator:
                 + (0.15 if platform_supported else 0.0)
                 + (0.18 if fit.get("fits") else 0.0)
                 + (0.07 if detection.get("available") else 0.0)
-                + self.backend_host._workload_bonus(name, "chat")
+                + self.backend_host._workload_bonus(name, workload)
             )
             reasons = [str(fit.get("reason") or "No fit explanation was returned.")]
             if not format_supported:
@@ -1259,11 +1648,40 @@ class RiftOrchestrator:
         *,
         config_path: str | Path = "rift.yaml",
         permissions: ApplyPermissions | None = None,
+        progress_callback: ApplyProgressCallback | None = None,
     ) -> JsonDict:
         permissions = permissions or ApplyPermissions()
-        plan = self.plan(config_path=config_path, write=True)
+
+        def report(
+            phase: str,
+            status: str,
+            details: JsonDict | None = None,
+            **extra: Any,
+        ) -> None:
+            if progress_callback is None:
+                return
+            payload = dict(details or {})
+            payload.update(extra)
+            try:
+                progress_callback(phase, status, payload)
+            except Exception:
+                # Progress output must never change deployment behavior.
+                return
+
+        report("planning", "running", config_path=str(config_path))
+        try:
+            plan = self.plan(config_path=config_path, write=True)
+        except Exception as exc:
+            report("planning", "failed", error=str(exc))
+            raise
+        report(
+            "planning",
+            "complete",
+            action_count=len(plan.get("actions") or []),
+        )
         error_actions = [action for action in plan["actions"] if action.get("kind") == "error"]
         if error_actions:
+            report("complete", "failed", reason="plan contains unsupported actions")
             return {
                 "applied": False,
                 "reason": "plan contains unsupported actions",
@@ -1277,6 +1695,11 @@ class RiftOrchestrator:
             and not getattr(permissions, str(action["permission"]), False)
         ]
         if blocked:
+            report(
+                "complete",
+                "blocked",
+                required_permissions=sorted({action["permission"] for action in blocked}),
+            )
             return {
                 "applied": False,
                 "reason": "permissions required",
@@ -1288,20 +1711,55 @@ class RiftOrchestrator:
         install_results = []
         install_actions = [action for action in plan["actions"] if action.get("kind") == "install"]
         if install_actions:
-            for action in install_actions:
+            report("installing", "running", completed=0, total=len(install_actions))
+            for index, action in enumerate(install_actions, 1):
                 service = plan["services"].get(str(action["service"]))
                 if not service:
                     continue
                 backend = str(service["backend"])
                 provider = self.providers[backend]
-                result = provider.install(
-                    target_dir=str(self.rift_dir / "backends" / backend),
-                    variant=str(action.get("variant") or "auto"),
+                report(
+                    "installing",
+                    "item_start",
+                    service=str(action["service"]),
+                    backend=backend,
+                    completed=index - 1,
+                    total=len(install_actions),
                 )
+                try:
+                    result = provider.install(
+                        target_dir=str(self.rift_dir / "backends" / backend),
+                        variant=str(action.get("variant") or "auto"),
+                    )
+                except Exception as exc:
+                    report(
+                        "installing",
+                        "failed",
+                        service=str(action["service"]),
+                        backend=backend,
+                        error=str(exc),
+                        completed=index - 1,
+                        total=len(install_actions),
+                    )
+                    raise
                 install_results.append({"service": action["service"], "backend": backend, **result})
+                report(
+                    "installing",
+                    "item_complete",
+                    service=str(action["service"]),
+                    backend=backend,
+                    completed=index,
+                    total=len(install_actions),
+                )
+            report("installing", "complete", completed=len(install_actions), total=len(install_actions))
             plan = self.plan(config_path=config_path, write=True)
             remaining_installs = [action for action in plan["actions"] if action.get("kind") == "install"]
             if remaining_installs:
+                report(
+                    "installing",
+                    "failed",
+                    reason="backend installation did not make every required backend available",
+                )
                 return {
                     "applied": False,
                     "reason": "backend installation did not make every required backend available",
@@ -1309,14 +1767,41 @@ class RiftOrchestrator:
                     "remaining_install_actions": remaining_installs,
                     "plan": plan,
                 }
+        else:
+            report("installing", "skipped", reason="backend already available")
 
-        download_results = self._download_models(plan) if permissions.allow_download else []
+        download_actions = [action for action in plan["actions"] if action.get("kind") == "download"]
+        if permissions.allow_download and download_actions:
+            report("downloading", "running", completed=0, total=len(download_actions))
+            try:
+                download_results = self._download_models(plan, progress_callback=report)
+            except Exception as exc:
+                report("downloading", "failed", error=str(exc))
+                raise
+            report("downloading", "complete", completed=len(download_actions), total=len(download_actions))
+        else:
+            download_results = []
+            report(
+                "downloading",
+                "skipped",
+                reason="no permission required or all model artifacts are already local",
+            )
         state = self.read_state()
         config = self.load_config(config_path)
         state["config_fingerprint"] = self._fingerprint(config)
         results = []
-        for service_name, service in plan["services"].items():
+        services = list(plan["services"].items())
+        report("launching", "running", completed=0, total=len(services))
+        for index, (service_name, service) in enumerate(services, 1):
             provider = self.providers[service["backend"]]
+            report(
+                "launching",
+                "item_start",
+                service=service_name,
+                backend=str(service["backend"]),
+                completed=index - 1,
+                total=len(services),
+            )
             launch_plan = dict(service["launch_plan"])
             downloaded = next(
                 (item for item in download_results if item.get("service") == service_name),
@@ -1365,10 +1850,22 @@ class RiftOrchestrator:
                     hardware=plan["nodes"][0]["hardware"],
                     tuning=winning_tuning,
                 )
-            launched = provider.launch(
-                launch_plan,
-                log_path=str(self.rift_dir / "logs" / f"{service_name}.log"),
-            )
+            try:
+                launched = provider.launch(
+                    launch_plan,
+                    log_path=str(self.rift_dir / "logs" / f"{service_name}.log"),
+                )
+            except Exception as exc:
+                report(
+                    "launching",
+                    "failed",
+                    service=service_name,
+                    backend=str(service["backend"]),
+                    error=str(exc),
+                    completed=index - 1,
+                    total=len(services),
+                )
+                raise
             state.setdefault("services", {})[service_name] = {
                 **service,
                 "runtime": launched,
@@ -1387,7 +1884,19 @@ class RiftOrchestrator:
                 "updated_unix_seconds": int(time.time()),
             }
             results.append({"service": service_name, "launched": launched})
+            report(
+                "launching",
+                "item_complete",
+                service=service_name,
+                backend=str(service["backend"]),
+                completed=index,
+                total=len(services),
+            )
+        report("launching", "complete", completed=len(services), total=len(services))
+        report("persisting", "running")
         self.write_state(state)
+        report("persisting", "complete")
+        report("complete", "complete", service_count=len(results))
         return {
             "applied": True,
             "plan": plan,
@@ -1396,8 +1905,15 @@ class RiftOrchestrator:
             "state_path": str(self.state_path),
         }
 
-    def _download_models(self, plan: JsonDict) -> list[JsonDict]:
+    def _download_models(
+        self,
+        plan: JsonDict,
+        *,
+        progress_callback: ApplyProgressCallback | None = None,
+    ) -> list[JsonDict]:
         downloads = []
+        download_actions = [action for action in plan["actions"] if action.get("kind") == "download"]
+        completed = 0
         for service_name, service in plan["services"].items():
             model = service.get("model") or {}
             if model.get("source") not in ("huggingface", "private") or model.get("local_path"):
@@ -1419,21 +1935,31 @@ class RiftOrchestrator:
             output_dir = self.rift_dir / "models" / repo_id.replace("/", "--")
             max_download_gb = float(model.get("max_download_gb") or 0)
             max_bytes = int(max_download_gb * 1024**3) if max_download_gb > 0 else None
-            result = self.engine.pull_model_from_hub(
-                repo_id,
-                revision=str(model.get("revision") or "main"),
-                output_dir=str(output_dir),
-                allow_patterns=allow_patterns,
-                endpoint=str(model.get("endpoint") or "https://huggingface.co"),
-                inspect_after=False,
-                max_bytes=max_bytes,
+            revision = str(model.get("revision") or "main")
+            existing = self._existing_download_result(
+                model=model,
+                repo_id=repo_id,
+                revision=revision,
+                output_dir=output_dir,
             )
+            if existing is not None:
+                result = existing
+            else:
+                result = self.engine.pull_model_from_hub(
+                    repo_id,
+                    revision=revision,
+                    output_dir=str(output_dir),
+                    allow_patterns=allow_patterns,
+                    endpoint=str(model.get("endpoint") or "https://huggingface.co"),
+                    inspect_after=False,
+                    max_bytes=max_bytes,
+                )
             local_dir = str(result.get("local_dir") or output_dir)
             manifest = self.artifacts.build(
                 local_dir,
                 source=str(model.get("source") or "huggingface"),
                 repo_id=repo_id,
-                revision=str(model.get("revision") or "main"),
+                revision=revision,
                 license_name=model.get("license"),
                 gated=model.get("gated"),
                 hash_mode="model",
@@ -1442,7 +1968,81 @@ class RiftOrchestrator:
             result["artifact_manifest"] = manifest
             result["artifact_manifest_path"] = self.artifacts.write(manifest, manifest_path)
             downloads.append({"service": service_name, **result})
+            completed += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        "downloading",
+                        "item_complete",
+                        {
+                            "service": service_name,
+                            "repo_id": repo_id,
+                            "completed": completed,
+                            "total": len(download_actions),
+                            "local_dir": local_dir,
+                            "reused": bool(result.get("reused")),
+                        },
+                    )
+                except Exception:
+                    pass
         return downloads
+
+    def _existing_download_result(
+        self,
+        *,
+        model: JsonDict,
+        repo_id: str,
+        revision: str,
+        output_dir: Path,
+    ) -> JsonDict | None:
+        """Reuse a complete local Hub artifact instead of downloading it again."""
+        selected_files = [
+            str(item) for item in model.get("selected_files", []) if str(item).strip()
+        ]
+        selected_file = str(model.get("selected_file") or "").strip()
+        if not selected_files and selected_file:
+            selected_files = [selected_file]
+        if not selected_files or not output_dir.is_dir():
+            return None
+
+        size_by_path: dict[str, int] = {}
+        artifact = model.get("artifact") or model.get("selected_artifact") or {}
+        for item in artifact.get("files") or []:
+            if isinstance(item, dict) and item.get("path") and item.get("size") is not None:
+                try:
+                    size_by_path[str(item["path"])] = int(item["size"])
+                except (TypeError, ValueError):
+                    continue
+
+        downloaded: list[JsonDict] = []
+        total_bytes = 0
+        root = output_dir.resolve()
+        for relative_name in selected_files:
+            candidate = (output_dir / Path(relative_name)).resolve()
+            if root not in candidate.parents or not candidate.is_file():
+                return None
+            size = candidate.stat().st_size
+            expected = size_by_path.get(relative_name)
+            if expected is not None and size != expected:
+                return None
+            total_bytes += size
+            downloaded.append(
+                {
+                    "path": relative_name,
+                    "local_path": str(candidate),
+                    "bytes": size,
+                    "integrity": "size_validated_existing",
+                }
+            )
+        return {
+            "repo_id": repo_id,
+            "revision": revision,
+            "local_dir": str(output_dir),
+            "reused": True,
+            "downloaded": downloaded,
+            "downloaded_bytes": 0,
+            "total_known_bytes": total_bytes,
+        }
 
     def _downloaded_model_path(self, downloaded: JsonDict, model: JsonDict) -> str:
         selected_file = str(model.get("selected_file") or "")
@@ -1889,8 +2489,36 @@ class RiftOrchestrator:
             )
             return {"action": "restart_failed", "reason": reason}
 
+        # Container launch plans intentionally use a backend-relative model
+        # reference during the initial apply. Reconstruct the host-backed plan
+        # from the persisted download before recovery so a restart never passes
+        # that relative placeholder (for example, ".") to the backend.
+        try:
+            recovery_plan = self._rebuild_launch_plan(
+                provider=provider,
+                service=service,
+                launch_plan=recovery_plan,
+                hardware=self.engine.hardware_profile(),
+                tuning=dict(recovery_plan.get("tuning") or {}),
+            )
+        except Exception as exc:
+            service["status"] = "degraded"
+            self._record_incident(
+                state,
+                service_name=name,
+                reason="could not rebuild backend launch plan for recovery",
+                action="restart_failed",
+                observation=observation,
+                service=service,
+                details={"error": str(exc)},
+            )
+            return {"action": "restart_failed", "reason": str(exc)}
+
         old_pid_value = (service.get("runtime") or {}).get("pid")
         old_pid = int(old_pid_value) if old_pid_value not in (None, "") else None
+        old_runtime = dict(service.get("runtime") or {})
+        old_launch_plan = dict(service.get("launch_plan") or {})
+        old_container_termination = self._stop_container(old_launch_plan, old_runtime)
         termination = {"status": "not_running", "pid": old_pid}
         if old_pid is not None and self._process_alive(old_pid):
             termination = self._terminate_pid(old_pid)
@@ -1903,12 +2531,16 @@ class RiftOrchestrator:
                     action="restart_failed",
                     observation=observation,
                     service=service,
-                    details={"termination": termination},
+                    details={
+                        "termination": termination,
+                        "container_termination": old_container_termination,
+                    },
                 )
                 return {
                     "action": "restart_failed",
                     "reason": "existing process is still alive",
                     "termination": termination,
+                    "container_termination": old_container_termination,
                 }
         try:
             launched = provider.launch(
@@ -1924,9 +2556,18 @@ class RiftOrchestrator:
                 action="restart_failed",
                 observation=observation,
                 service=service,
-                details={"error": str(exc), "termination": termination},
+                details={
+                    "error": str(exc),
+                    "termination": termination,
+                    "container_termination": old_container_termination,
+                },
             )
-            return {"action": "restart_failed", "error": str(exc), "termination": termination}
+            return {
+                "action": "restart_failed",
+                "error": str(exc),
+                "termination": termination,
+                "container_termination": old_container_termination,
+            }
 
         policy = {**self._default_recovery_policy(), **dict(service.get("recovery") or {})}
         supervisor = service.setdefault("supervisor", self._default_supervisor_state())
@@ -1971,6 +2612,7 @@ class RiftOrchestrator:
             "restart_count": restart_count,
             "next_retry_unix_seconds": now + backoff,
             "termination": termination,
+            "container_termination": old_container_termination,
             "incident": incident,
         }
 
@@ -2129,6 +2771,108 @@ class RiftOrchestrator:
             time.sleep(0.1)
         return {"pid": pid, "stopped": False, "status": "termination_timeout"}
 
+    @staticmethod
+    def _container_name(launch_plan: JsonDict, runtime: JsonDict | None = None) -> str | None:
+        runtime = runtime or {}
+        explicit = str(runtime.get("container_name") or launch_plan.get("container_name") or "").strip()
+        if explicit:
+            return explicit
+        command = [str(item) for item in launch_plan.get("command") or []]
+        if "--name" not in command:
+            return None
+        index = command.index("--name") + 1
+        return command[index].strip() if index < len(command) and command[index].strip() else None
+
+    @staticmethod
+    def _stop_container(
+        launch_plan: JsonDict,
+        runtime: JsonDict | None = None,
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> JsonDict:
+        """Stop daemon-owned containers that outlive the Docker client process."""
+        name = RiftOrchestrator._container_name(launch_plan, runtime)
+        if not name:
+            return {"container": None, "stopped": True, "status": "not_a_container"}
+        command = [str(item) for item in launch_plan.get("command") or []]
+        executable = str(command[0]) if command else "docker"
+        stop = subprocess.run(
+            [executable, "stop", "--time", "10", name],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_seconds),
+            check=False,
+        )
+        remove = subprocess.run(
+            [executable, "rm", "-f", name],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_seconds),
+            check=False,
+        )
+        already_gone = "no such container" in (stop.stderr + remove.stderr).lower()
+        stopped = stop.returncode == 0 or remove.returncode == 0 or already_gone
+        return {
+            "container": name,
+            "stopped": stopped,
+            "status": "stopped" if stop.returncode == 0 else ("already_stopped" if already_gone else "stop_failed"),
+            "stop_returncode": stop.returncode,
+            "remove_returncode": remove.returncode,
+            "stdout": (stop.stdout + remove.stdout)[-500:],
+            "stderr": (stop.stderr + remove.stderr)[-500:],
+        }
+
+    @staticmethod
+    def _container_name(launch_plan: JsonDict, runtime: JsonDict | None = None) -> str | None:
+        runtime = runtime or {}
+        explicit = str(runtime.get("container_name") or launch_plan.get("container_name") or "").strip()
+        if explicit:
+            return explicit
+        command = [str(item) for item in launch_plan.get("command") or []]
+        if "--name" not in command:
+            return None
+        index = command.index("--name") + 1
+        return command[index].strip() if index < len(command) and command[index].strip() else None
+
+    @staticmethod
+    def _stop_container(
+        launch_plan: JsonDict,
+        runtime: JsonDict | None = None,
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> JsonDict:
+        """Stop daemon-owned containers that outlive the Docker client process."""
+        name = RiftOrchestrator._container_name(launch_plan, runtime)
+        if not name:
+            return {"container": None, "stopped": True, "status": "not_a_container"}
+        command = [str(item) for item in launch_plan.get("command") or []]
+        executable = str(command[0]) if command else "docker"
+        stop = subprocess.run(
+            [executable, "stop", "--time", "10", name],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_seconds),
+            check=False,
+        )
+        remove = subprocess.run(
+            [executable, "rm", "-f", name],
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout_seconds),
+            check=False,
+        )
+        already_gone = "no such container" in (stop.stderr + remove.stderr).lower()
+        stopped = stop.returncode == 0 or remove.returncode == 0 or already_gone
+        return {
+            "container": name,
+            "stopped": stopped,
+            "status": "stopped" if stop.returncode == 0 else ("already_stopped" if already_gone else "stop_failed"),
+            "stop_returncode": stop.returncode,
+            "remove_returncode": remove.returncode,
+            "stdout": (stop.stdout + remove.stdout)[-500:],
+            "stderr": (stop.stderr + remove.stderr)[-500:],
+        }
+
     def _default_monitoring_policy(self) -> JsonDict:
         return {
             "enabled": True,
@@ -2163,8 +2907,10 @@ class RiftOrchestrator:
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"available": False}
 
     def latest_plan(self) -> JsonDict:
-        path = self.rift_dir / "plans" / "latest.json"
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"available": False}
+        for path in (self.plan_dir / "latest.json", self.rift_dir / "plans" / "latest.json"):
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+        return {"available": False}
 
     def generated_config(self, path: str | Path = ".rift/generated/rift.generated.yaml") -> JsonDict:
         target = self._resolve_path(path)
@@ -2539,6 +3285,27 @@ class RiftOrchestrator:
                         "nodes": [{"hardware": self.engine.hardware_profile()}],
                     }
         service = plan.get("services", {}).get(service_name)
+        if not service:
+            # UI-managed deployments can originate from a saved recommendation
+            # plan rather than the starter rift.yaml. If that source config is
+            # present but does not describe the active service, tune the
+            # materialized service snapshot instead of failing with a misleading
+            # "service not found in plan" error.
+            active_state = self.read_state()
+            active_service = active_state.get("services", {}).get(service_name)
+            active_backend = str((active_service or {}).get("backend") or "")
+            active_launch_plan = dict((active_service or {}).get("launch_plan") or {})
+            if active_backend and active_launch_plan:
+                plan = {
+                    "services": {
+                        service_name: {
+                            "backend": active_backend,
+                            "launch_plan": active_launch_plan,
+                        }
+                    },
+                    "nodes": [{"hardware": self.engine.hardware_profile()}],
+                }
+                service = plan["services"][service_name]
         if not service:
             raise ValueError(f"service not found in plan: {service_name}")
         provider = self.providers[str(service["backend"])]
@@ -3002,6 +3769,9 @@ class RiftOrchestrator:
     ) -> JsonDict:
         old_pid_value = (service.get("runtime") or {}).get("pid")
         old_pid = int(old_pid_value) if old_pid_value not in (None, "") else None
+        old_runtime = dict(service.get("runtime") or {})
+        old_launch_plan = dict(service.get("launch_plan") or {})
+        old_container_termination = self._stop_container(old_launch_plan, old_runtime)
         termination = {"pid": old_pid, "stopped": True, "status": "not_running"}
         if old_pid is not None and self._process_alive(old_pid):
             termination = self._terminate_pid(old_pid)
@@ -3010,6 +3780,7 @@ class RiftOrchestrator:
                     "ready": False,
                     "reason": "existing service process could not be stopped",
                     "termination": termination,
+                    "container_termination": old_container_termination,
                 }
         try:
             launched = provider.launch(
@@ -3043,8 +3814,14 @@ class RiftOrchestrator:
                 readiness["failed_process_termination"] = self._terminate_pid(
                     int(new_pid_value)
                 )
+            readiness["failed_container_termination"] = self._stop_container(launch_plan, launched)
         self.write_state(state)
-        return {**readiness, "runtime": launched, "termination": termination}
+        return {
+            **readiness,
+            "runtime": launched,
+            "termination": termination,
+            "container_termination": old_container_termination,
+        }
 
     def _wait_for_readiness(
         self,
@@ -3097,10 +3874,21 @@ class RiftOrchestrator:
             service = services.get(name)
             if not service:
                 continue
-            pid = (service.get("runtime") or {}).get("pid")
+            runtime = dict(service.get("runtime") or {})
+            launch_plan = dict(service.get("launch_plan") or {})
+            container_termination = self._stop_container(launch_plan, runtime)
+            pid = runtime.get("pid")
             if pid:
                 termination = self._terminate_pid(int(pid))
-                stopped.append({"service": name, **termination})
+                stopped.append(
+                    {
+                        "service": name,
+                        **termination,
+                        "container_termination": container_termination,
+                    }
+                )
+            else:
+                stopped.append({"service": name, "container_termination": container_termination})
             services.pop(name, None)
             removed.append(name)
         self.write_state(state)
@@ -3137,6 +3925,12 @@ class RiftOrchestrator:
 
     def _timestamped(self, folder: str, stem: str) -> Path:
         return self.rift_dir / folder / f"{int(time.time())}-{stem}.json"
+
+    @property
+    def plan_dir(self) -> Path:
+        """Repository-local reviewed deployment intent and plan history."""
+
+        return self.root / "plans"
 
     def _write_json(self, path: Path, payload: JsonDict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

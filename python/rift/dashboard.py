@@ -62,34 +62,46 @@ def bundled_dashboard_root() -> Path:
     return Path(__file__).resolve().parent / "web" / "static"
 
 
+def bundled_rich_dashboard_root() -> Path:
+    """Return the optional server-rendered dashboard bundle shipped in the wheel."""
+
+    return bundled_dashboard_root() / "_rich"
+
+
 def rich_dashboard_plan(
     dashboard_root: str | Path | None = None,
     *,
     port: int = 8765,
     control_port: int = 8777,
 ) -> dict[str, str] | None:
-    """Return the optional contributor UI build when it is available locally."""
+    """Return a local or packaged server-rendered UI when it is available."""
 
-    root = Path(dashboard_root).resolve() if dashboard_root else find_dashboard_root()
-    if root is None:
-        return None
-    server_script = root / "scripts" / "serve-dist.mjs"
-    server_bundle = root / "dist" / "server" / "server.js"
-    client_root = root / "dist" / "client"
-    if not server_script.is_file() or not server_bundle.is_file() or not client_root.is_dir():
-        return None
+    requested = Path(dashboard_root).resolve() if dashboard_root else find_dashboard_root()
+    candidates: list[Path] = []
+    if requested is not None:
+        candidates.append(requested)
+    packaged = bundled_rich_dashboard_root()
+    if packaged not in candidates:
+        candidates.append(packaged)
     node = shutil.which("node")
     if not node:
         return None
-    return {
-        "node": node,
-        "root": str(root),
-        "server_script": str(server_script),
-        "server_bundle": str(server_bundle),
-        "client_root": str(client_root),
-        "port": str(int(port)),
-        "control_api": f"http://127.0.0.1:{int(control_port)}",
-    }
+    for root in candidates:
+        server_script = root / "scripts" / "serve-dist.mjs"
+        server_bundle = root / "dist" / "server" / "server.js"
+        client_root = root / "dist" / "client"
+        if not server_script.is_file() or not server_bundle.is_file() or not client_root.is_dir():
+            continue
+        return {
+            "node": node,
+            "root": str(root),
+            "server_script": str(server_script),
+            "server_bundle": str(server_bundle),
+            "client_root": str(client_root),
+            "port": str(int(port)),
+            "control_api": f"http://127.0.0.1:{int(control_port)}",
+        }
+    return None
 
 
 def _launch_rich_dashboard(plan: dict[str, str]) -> subprocess.Popen[bytes]:
@@ -284,6 +296,18 @@ def launch_dashboard_detached(
     logs.mkdir(parents=True, exist_ok=True)
     stdout_path = logs / "dashboard.out.log"
     stderr_path = logs / "dashboard.err.log"
+    requested_root = (
+        Path(dashboard_root).resolve()
+        if dashboard_root
+        else find_dashboard_root(Path.cwd())
+    )
+    child_root = plan.dashboard_root
+    if requested_root is not None and rich_dashboard_plan(
+        requested_root,
+        port=port,
+        control_port=control_port,
+    ) is not None:
+        child_root = str(requested_root)
     command = [
         sys.executable,
         "-m",
@@ -296,7 +320,7 @@ def launch_dashboard_detached(
         "--control-port",
         str(int(control_port)),
         "--root",
-        plan.dashboard_root,
+        child_root,
         "--no-browser",
     ]
     environment = {
