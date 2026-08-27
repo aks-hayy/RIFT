@@ -82,25 +82,25 @@ function NodeDetail() {
       </div>
 
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
-        {unavailable && <Unavailable endpoint={`/v1/nodes/${id}`} resource="RiftNode" />}
+        {unavailable && <Unavailable endpoint="/hardware" resource="RIFT node hardware" />}
         {node && tab === "hardware" && <HardwareTab n={node} />}
         {tab === "assignments" && (
           <Unavailable
-            endpoint={`/v1/nodes/${id}/assignments`}
+            endpoint="/services"
             resource="Assignment[] { serviceId, gpuIndices, reservedVramBytes }"
           />
         )}
         {node && tab === "backends" && <BackendsTab n={node} />}
         {tab === "cache" && (
           <Unavailable
-            endpoint={`/v1/nodes/${id}/artifacts`}
+            endpoint="/artifacts"
             resource="CachedArtifact[] { artifactId, sizeBytes, sha256, lastUsedAt }"
           />
         )}
         {node && tab === "health" && <HealthTab n={node} />}
         {tab === "diagnostics" && (
           <Unavailable
-            endpoint={`/v1/nodes/${id}/diagnostics`}
+            endpoint="/diagnostics"
             method="POST"
             resource="DiagnosticsBundle { url, expiresAt }"
             hint="Bundle should include driver info, kernel, dmesg tail, backend logs."

@@ -47,6 +47,8 @@ ui/.npm-cache/
 
 # Platform runtime data when an operator points RIFT at the checkout
 .rift-runtime/
+plans/
+tmp/
 
 # Editor and operating-system files
 .idea/

@@ -169,6 +169,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     apply.add_argument("--config", default="rift.yaml")
+    apply.add_argument(
+        "--plan",
+        help="Saved plan number or plan ID to apply; omit to choose from the saved plan list",
+    )
+    apply.add_argument(
+        "--plan-hash",
+        help="Reviewed SHA-256 plan hash; defaults to the selected immutable plan hash",
+    )
     apply.add_argument("--allow-download", action="store_true")
     apply.add_argument("--allow-install", action="store_true")
     apply.add_argument("--allow-launch", action="store_true")

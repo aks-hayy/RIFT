@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 from rift.cluster import RiftClusterController, example_emulated_cluster
@@ -173,8 +174,19 @@ def execute(args: Any, console: RiftConsole) -> int:
         return 1 if any(item.get("kind") == "error" for item in result.get("actions", [])) else 0
 
     if args.command == "apply":
+        selected_plan = _select_apply_plan(orchestrator, console, getattr(args, "plan", None))
+        if selected_plan is False:
+            return 2
+        plan_id = str(selected_plan.get("plan_id")) if selected_plan else None
+        reviewed_hash = str(
+            getattr(args, "plan_hash", None)
+            or (selected_plan or {}).get("plan_hash")
+            or ""
+        ) or None
         result = orchestrator.apply(
-            config_path=args.config,
+            config_path=(selected_plan or {}).get("config_path") or args.config,
+            plan_id=plan_id,
+            plan_hash=reviewed_hash,
             permissions=ApplyPermissions(
                 allow_download=args.allow_download,
                 allow_install=args.allow_install,
@@ -273,6 +285,70 @@ def execute(args: Any, console: RiftConsole) -> int:
     if args.command == "system":
         return _system(args, console, orchestrator)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _select_apply_plan(
+    orchestrator: RiftOrchestrator,
+    console: RiftConsole,
+    requested: str | None,
+) -> dict[str, Any] | bool | None:
+    """Choose an immutable saved plan without falling back to an unrelated latest plan."""
+
+    plans = orchestrator.list_plans()
+    if not plans and not requested:
+        return None
+    if requested:
+        value = str(requested).strip()
+        if value.isdigit():
+            index = int(value)
+            if 1 <= index <= len(plans):
+                return plans[index - 1]
+            console.error(f"Unknown plan number: {value}", hint="Run `rift plan` to create a plan.")
+            return False
+        try:
+            return orchestrator.load_plan_by_id(value)
+        except (KeyError, ValueError) as exc:
+            console.error(str(exc), hint="Run `rift apply --plan NUMBER` to choose a saved plan.")
+            return False
+
+    if not sys.stdin.isatty():
+        console.error(
+            "Saved deployment plans require an explicit selection in noninteractive mode.",
+            hint="Use `rift apply --plan PLAN_ID --plan-hash HASH ...`.",
+        )
+        return False
+
+    console._heading("Saved deployment plans")
+    rows = []
+    for index, plan in enumerate(plans, 1):
+        services = plan.get("services") or {}
+        names = ", ".join(str(name) for name in services) or "-"
+        model = "-"
+        if services:
+            first = next(iter(services.values())) or {}
+            model_data = first.get("model") or {}
+            model = str(model_data.get("id") or model_data.get("selected_file") or "-")
+        blockers = sum(1 for item in plan.get("actions", []) if item.get("kind") == "error")
+        rows.append(
+            [
+                index,
+                str(plan.get("plan_id") or "-")[:24],
+                model[:42],
+                names[:20],
+                blockers,
+                str(plan.get("plan_hash") or "")[:12],
+            ]
+        )
+    console._table(["#", "PLAN", "MODEL", "SERVICES", "BLOCKERS", "HASH"], rows)
+    try:
+        answer = input("Choose a plan number or ID (blank to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = ""
+    if not answer:
+        console.warning("No deployment plan selected. Nothing was applied.")
+        return False
+    return _select_apply_plan(orchestrator, console, answer)
 
 
 def _model(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:

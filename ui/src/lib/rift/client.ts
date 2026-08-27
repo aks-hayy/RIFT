@@ -1,14 +1,16 @@
 // Typed facade over the current RIFT controller API.
 //
-// RIFT's shipped controller still exposes the legacy `/api/rift` resources.
-// This adapter normalizes those live responses into the UI resource model. The
-// future v1 controller can replace this adapter without changing route code.
+// RIFT's shipped controller exposes legacy `/api/rift` resources alongside
+// versioned V2 operations. This adapter normalizes those live responses into
+// the UI resource model without coupling route components to wire details.
 
 import type {
   ApplyProgress,
   Backend,
   Benchmark,
+  DeploymentRecord,
   DeploymentRevision,
+  EvaluationRun,
   EnrollmentToken,
   FleetHealth,
   Incident,
@@ -23,7 +25,10 @@ import type {
   MeshTopology,
   ManagedEnrollment,
   ManagedEnrollmentWindow,
+  OperationRecord,
+  PlanAction,
   Plan,
+  SettingsSnapshot,
   RiftEvent,
   RiftNode,
   Service,
@@ -36,6 +41,7 @@ import {
   recommendationSelector,
 } from "./action-contract";
 import { mapBenchmarkReport } from "./report-mapping";
+import { deriveOperationDisplay } from "./operation-state";
 
 export class RiftUnavailable extends Error {
   constructor(
@@ -56,7 +62,18 @@ export class RiftApiError extends Error {
     public readonly endpoint: string,
     public readonly body: unknown,
   ) {
-    super(`RIFT ${endpoint} failed: ${status}`);
+    const detail =
+      typeof body === "string"
+        ? body
+        : body && typeof body === "object"
+          ? String(
+              (body as Record<string, unknown>).detail ??
+                (body as Record<string, unknown>).error ??
+                (body as Record<string, unknown>).message ??
+                "",
+            )
+          : "";
+    super(`RIFT ${endpoint} failed: ${status}${detail ? ` - ${detail}` : ""}`);
     this.name = "RiftApiError";
   }
 }
@@ -72,7 +89,11 @@ function configuredRoot(): string {
       env: Record<string, string | undefined>;
     }
   ).env;
-  const configured = env.VITE_RIFT_CONTROLLER_URL?.trim();
+  const runtimeConfigured =
+    typeof window !== "undefined"
+      ? (window as Window & { RIFT_CONTROL_API?: string }).RIFT_CONTROL_API?.trim()
+      : undefined;
+  const configured = runtimeConfigured || env.VITE_RIFT_CONTROLLER_URL?.trim();
   if (!configured) return "/api/rift";
   const root = configured.replace(/\/+$/, "");
   if (root.endsWith("/api/rift")) return root;
@@ -315,6 +336,8 @@ function mapService(name: string, value: unknown): Service {
   const raw = object(value);
   const runtime = object(raw.runtime);
   const launch = object(raw.launch_plan);
+  const providerDetection = object(raw.provider_detection);
+  const backend = object(raw.backend);
   const serving = object(raw.serving);
   const model = object(raw.model);
   const placement = object(raw.placement);
@@ -370,8 +393,70 @@ function mapService(name: string, value: unknown): Service {
       pid: numeric(runtime.pid) || undefined,
       restartCount: numeric(object(raw.supervisor).restart_count),
       command: text(launch.display),
+      backendVersion:
+        text(
+          runtime.version,
+          text(launch.version, text(providerDetection.version, text(backend.version))),
+        ) || undefined,
+      exposure: text(raw.exposure, "local"),
+      model,
+      serving,
+      gateway: object(raw.gateway),
+      launchPlan: launch,
     },
   };
+}
+
+function mapDeploymentRecord(value: unknown): DeploymentRecord {
+  const raw = object(value);
+  const status = text(raw.status, "deleted").toLowerCase();
+  return {
+    deploymentId: text(raw.deployment_id, text(raw.deploymentId, "unknown")),
+    serviceName: text(raw.service_name, text(raw.serviceName, "unknown")),
+    displayName: text(raw.display_name, text(raw.service_name, "Saved deployment")),
+    status: status === "ready" || status === "stopped" || status === "failed" ? status : "deleted",
+    model: object(raw.model),
+    backend: {
+      kind: backendKind(object(raw.backend).kind),
+      version: text(object(raw.backend).version) || undefined,
+      executable: text(object(raw.backend).executable) || undefined,
+    },
+    node: Object.keys(object(raw.node)).length ? object(raw.node) : undefined,
+    endpoint: {
+      apiBase: text(object(raw.endpoint).api_base, text(object(raw.endpoint).apiBase)) || undefined,
+      openaiBase:
+        text(object(raw.endpoint).openai_base, text(object(raw.endpoint).openaiBase)) || undefined,
+      host: text(object(raw.endpoint).host) || undefined,
+      port: numeric(object(raw.endpoint).port) || undefined,
+      path: text(object(raw.endpoint).path, "/v1"),
+    },
+    serving: object(raw.serving),
+    gateway: object(raw.gateway),
+    launch: object(raw.launch),
+    lastKnownGood: object(raw.last_known_good),
+    plan: {
+      id: text(object(raw.plan).id) || undefined,
+      hash: text(object(raw.plan).hash) || undefined,
+      configPath:
+        text(object(raw.plan).config_path, text(object(raw.plan).configPath)) || undefined,
+    },
+    configSnapshotPath: text(raw.config_snapshot_path) || undefined,
+    relaunchCount: numeric(raw.relaunch_count),
+    createdAt: iso(raw.created_unix_seconds),
+    updatedAt: iso(
+      raw.updated_unix_seconds,
+      numeric(raw.created_unix_seconds, Date.now() / 1000) * 1000,
+    ),
+    lastStartedAt: raw.last_started_unix_seconds ? iso(raw.last_started_unix_seconds) : undefined,
+    stoppedAt: raw.stopped_unix_seconds ? iso(raw.stopped_unix_seconds) : undefined,
+    deletedAt: raw.deleted_unix_seconds ? iso(raw.deleted_unix_seconds) : undefined,
+    provenance: "live",
+  };
+}
+
+async function listDeploymentRecords(signal?: AbortSignal): Promise<DeploymentRecord[]> {
+  const payload = await req<JsonObject>("GET", "/v2/deployment-records", undefined, signal);
+  return list(payload.records).map(mapDeploymentRecord);
 }
 
 function mapServices(payload: unknown): Service[] {
@@ -554,23 +639,35 @@ function mapRecommendation(value: unknown, index: number, runId?: string): Model
   const scores = object(raw.scores);
   const repo = text(raw.repo_id, `candidate-${index + 1}`);
   const format = text(raw.format, "gguf") as ModelArtifact["format"];
-  const estimatedBytes = numeric(
-    raw.selected_download_bytes,
-    numeric(raw.estimated_download_bytes),
+  const artifactSelection = object(raw.artifact_selection);
+  const artifactMetadata = object(artifactSelection.metadata);
+  const artifactId = text(
+    artifactSelection.artifact_id,
+    text(raw.artifact_id, text(raw.selected_artifact_id, repo)),
   );
+  const selectedBytes = numeric(raw.selected_download_bytes);
+  const estimatedBytes =
+    selectedBytes > 0
+      ? selectedBytes
+      : Math.max(
+          numeric(raw.estimated_download_bytes),
+          numeric(artifactSelection.total_bytes),
+          numeric(artifactMetadata.total_download_bytes),
+        );
+  const source = text(raw.source, "huggingface") as ModelArtifact["source"];
   const backend = backendKind(raw.backend);
   return {
     id: `recommendation-${index + 1}-${repo.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
     recommendationRunId: runId || text(raw.recommendation_run_id) || undefined,
     priority: index === 0 ? "recommended" : index === 1 ? "quality" : "speed",
     artifact: {
-      id: repo,
+      id: artifactId,
       displayName: basename(repo),
       family: text(raw.model_type, basename(repo)),
       parameters: numeric(raw.parameters_b)
         ? `${numeric(raw.parameters_b).toFixed(1)}B`
         : "unknown",
-      source: "huggingface",
+      source,
       repo,
       format,
       quantization:
@@ -659,7 +756,18 @@ async function recommendDetailed(input: {
   source: ModelArtifact["source"];
   localPath?: string;
   endpointUrl?: string;
+  modelRef?: string;
 }): Promise<RecommendationSearchResult> {
+  if (input.source === "local") {
+    const payload = await req<JsonObject>("POST", "/recommend", {
+      task: input.useCase === "coding" ? "coding" : "chat",
+      source: "local",
+      local_path: input.localPath,
+      models_dir: input.localPath,
+      top: 10,
+    });
+    return mapRecommendationSearchResult(payload, input.useCase === "coding" ? "coding" : "chat");
+  }
   if (input.source !== "huggingface" && input.source !== "catalog") {
     throw new RiftUnavailable(
       "/recommend",
@@ -675,8 +783,16 @@ async function recommendDetailed(input: {
     max_download_gb: 12,
     formats: ["gguf", "gptq", "awq", "safetensors"],
     include_gated: false,
+    model_ref: input.modelRef,
+    endpoint: input.endpointUrl,
   });
-  const task = input.useCase === "coding" ? "coding" : "chat";
+  return mapRecommendationSearchResult(payload, input.useCase === "coding" ? "coding" : "chat");
+}
+
+async function mapRecommendationSearchResult(
+  payload: JsonObject,
+  task: string,
+): Promise<RecommendationSearchResult> {
   const runId = text(payload.recommendation_run_id, text(payload.run_id));
   const deployableRaw = list(payload.recommendations).filter(isDeployableRecommendation);
   const liveRecommendations = deployableRaw.map((value, index) =>
@@ -811,7 +927,9 @@ function mapControllerPlan(raw: JsonObject): Plan {
             }
           : undefined,
       ports: numeric(actionLaunch.port) ? [numeric(actionLaunch.port)] : undefined,
-      risk: kind === "error" || group === "launch" || group === "install" ? "medium" : "low",
+      risk: (kind === "error" || group === "launch" || group === "install"
+        ? "medium"
+        : "low") as PlanAction["risk"],
       reversible: group !== "download",
     };
   });
@@ -823,8 +941,8 @@ function mapControllerPlan(raw: JsonObject): Plan {
     .map((node) => text(object(node).name, text(object(node).host)))
     .filter(Boolean);
   return {
-    id: `plan-${text(raw.recommendation_run_id, "latest")}`,
-    hash,
+    id: text(raw.plan_id, `plan-${text(raw.recommendation_run_id, "latest")}`),
+    hash: text(raw.plan_hash, hash),
     serviceId,
     actions,
     affectedNodes: affectedNodes.length
@@ -842,6 +960,208 @@ function mapControllerPlan(raw: JsonObject): Plan {
     provenance: "derived-live",
     previewOnly: false,
   };
+}
+
+function mapOperation(raw: JsonObject, planId: string, planHash: string): ApplyProgress {
+  const result = object(raw.result);
+  const resultPlan = object(result.plan);
+  const status = text(raw.status, "RUNNING").toUpperCase() as ApplyProgress["status"];
+  const stage = text(raw.stage, "queued");
+  const phase = [
+    "queued",
+    "preparing",
+    "executing",
+    "installing",
+    "downloading",
+    "configuring",
+    "placing",
+    "launching",
+    "exposing",
+    "benchmarking",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "rolled_back",
+  ].includes(stage)
+    ? (stage as ApplyProgress["phase"])
+    : status === "SUCCEEDED"
+      ? "succeeded"
+      : status === "FAILED"
+        ? "failed"
+        : status === "CANCELLED"
+          ? "cancelled"
+          : status === "INTERRUPTED"
+            ? "interrupted"
+            : "executing";
+  return {
+    planId: text(resultPlan.plan_id, planId),
+    planHash: text(resultPlan.plan_hash, planHash),
+    operationId: text(raw.operation_id),
+    status,
+    phase,
+    percent: raw.percent === null ? null : numeric(raw.percent, 0),
+    message: text(raw.message, text(raw.error, "Operation in progress")),
+    startedAt: iso(raw.created_unix_seconds),
+    updatedAt: iso(
+      raw.updated_unix_seconds,
+      numeric(raw.created_unix_seconds, Date.now() / 1000) * 1000,
+    ),
+    error: text(raw.error) || undefined,
+    result: Object.keys(result).length ? result : undefined,
+  };
+}
+
+function mapEvaluationCase(value: unknown): EvaluationRun["cases"][number] {
+  const raw = object(value);
+  const status = text(raw.status, "error").toLowerCase();
+  return {
+    caseId: text(raw.case_id, "unknown"),
+    status:
+      status === "pass" || status === "fail" || status === "not_assessed" || status === "error"
+        ? status
+        : "error",
+    criteria: text(raw.criteria, "explicit deterministic criterion"),
+    detail: text(raw.detail, "No detail was provided."),
+    elapsedSeconds:
+      raw.elapsed_seconds === null || raw.elapsed_seconds === undefined
+        ? undefined
+        : numeric(raw.elapsed_seconds),
+    response: typeof raw.response === "string" ? raw.response : undefined,
+    judge: Object.keys(object(raw.judge)).length
+      ? {
+          status:
+            text(object(raw.judge).status, "not_assessed") === "assessed" ||
+            text(object(raw.judge).status) === "error"
+              ? (text(object(raw.judge).status) as "assessed" | "error")
+              : "not_assessed",
+          score:
+            object(raw.judge).score === null || object(raw.judge).score === undefined
+              ? null
+              : numeric(object(raw.judge).score),
+          detail: text(object(raw.judge).detail) || null,
+        }
+      : undefined,
+  };
+}
+
+function mapEvaluation(value: unknown): EvaluationRun {
+  const raw = object(value);
+  const suite = object(raw.suite);
+  const status = text(raw.status, "not_run").toLowerCase();
+  return {
+    runId: text(raw.run_id, "unknown"),
+    service: text(raw.service, "unknown"),
+    status:
+      status === "running" ||
+      status === "completed" ||
+      status === "deadline" ||
+      status === "not_run"
+        ? status
+        : "not_run",
+    suite: {
+      id: text(suite.id, "unknown"),
+      version: text(suite.version, "unknown"),
+      cases: list(suite.cases),
+    },
+    summary: Object.fromEntries(
+      Object.entries(object(raw.summary)).map(([key, entry]) => [key, numeric(entry)]),
+    ),
+    cases: list(raw.cases).map(mapEvaluationCase),
+    available: bool(raw.available, true),
+    required: bool(raw.required, false),
+    reportPath: text(raw.report_path) || undefined,
+    modelRevision: object(raw.model_revision),
+    configuration: object(raw.configuration),
+    assessment: text(raw.assessment) || undefined,
+    provenance: "live",
+  };
+}
+
+function mapOperationRecord(value: unknown): OperationRecord {
+  const raw = object(value);
+  const rawStatus = text(raw.status, "RUNNING").toUpperCase();
+  const status = ["RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "INTERRUPTED"].includes(rawStatus)
+    ? (rawStatus as OperationRecord["status"])
+    : "FAILED";
+  const result = object(raw.result);
+  const display = deriveOperationDisplay({
+    status,
+    stage: text(raw.stage) || undefined,
+    percent:
+      raw.percent === null
+        ? null
+        : raw.percent === undefined
+          ? undefined
+          : numeric(raw.percent, Number.NaN),
+    message: text(raw.message) || undefined,
+    error: text(raw.error) || undefined,
+  });
+  return {
+    operationId: text(raw.operation_id, "unknown"),
+    requestId: text(raw.request_id, "unknown"),
+    action: text(raw.action, "unknown"),
+    status,
+    stage: display.stage,
+    message: display.message,
+    percent: display.percent,
+    createdAt: iso(raw.created_unix_seconds),
+    updatedAt: iso(
+      raw.updated_unix_seconds,
+      numeric(raw.created_unix_seconds, Date.now() / 1000) * 1000,
+    ),
+    completedAt: raw.completed_unix_seconds ? iso(raw.completed_unix_seconds) : undefined,
+    error: text(raw.error) || undefined,
+    details: Object.keys(object(raw.details)).length ? object(raw.details) : undefined,
+    result: Object.keys(result).length ? result : undefined,
+  };
+}
+
+async function waitForOperation(operationId: string): Promise<JsonObject> {
+  const deadline = Date.now() + 15 * 60_000;
+  while (Date.now() < deadline) {
+    const payload = await req<JsonObject>(
+      "GET",
+      `/v2/operations/${encodeURIComponent(operationId)}`,
+    );
+    const status = text(payload.status, "RUNNING").toUpperCase();
+    if (status !== "RUNNING") {
+      if (status !== "SUCCEEDED") {
+        throw new RiftApiError(409, `/v2/operations/${encodeURIComponent(operationId)}`, payload);
+      }
+      return object(payload.result);
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+  }
+  throw new RiftUnavailable(
+    `/v2/operations/${encodeURIComponent(operationId)}`,
+    "GET",
+    "timeout",
+    "operation did not finish within 15 minutes",
+  );
+}
+
+async function resolveOperation(payload: JsonObject): Promise<JsonObject> {
+  const operationId = text(payload.operation_id);
+  return operationId ? waitForOperation(operationId) : payload;
+}
+
+async function resolveDeploymentAction(
+  payload: JsonObject,
+  service: string,
+): Promise<ApplyProgress> {
+  const resolved = await resolveOperation(payload);
+  return mapOperation(
+    {
+      status: "SUCCEEDED",
+      stage: "succeeded",
+      percent: 100,
+      message: text(resolved.reason, "Deployment action completed."),
+      result: resolved,
+    },
+    service,
+    text(payload.plan_hash, "unknown"),
+  );
 }
 
 async function currentPlan(signal?: AbortSignal): Promise<Plan> {
@@ -995,6 +1315,7 @@ export const rift = {
     ),
 
   listServices,
+  listDeploymentRecords,
   getService: async (id: string, signal?: AbortSignal) => {
     const services = await listServices(signal);
     const service = services.find((item) => item.id === id);
@@ -1030,11 +1351,26 @@ export const rift = {
         planRequest(
           input.recommendationRunId,
           input.selector ?? recommendationSelector("recommended"),
+          {
+            artifactId: input.artifactId,
+            backendKind: input.backendKind,
+            targetNodeId: input.targetNodeId,
+            serviceName: input.serviceName,
+            exposure: input.exposure,
+          },
         ),
       ),
     );
   },
-  getPlan: async (_id: string, signal?: AbortSignal) => currentPlan(signal),
+  getPlan: async (id: string, signal?: AbortSignal) => {
+    const raw = await req<JsonObject>(
+      "GET",
+      `/v2/plans/${encodeURIComponent(id)}`,
+      undefined,
+      signal,
+    );
+    return mapControllerPlan(raw);
+  },
   applyPlan: async (
     id: string,
     planHash: string,
@@ -1043,31 +1379,120 @@ export const rift = {
       allowDownload: boolean;
       allowInstall: boolean;
       allowLaunch: boolean;
+      allowRemote?: boolean;
       optimize?: boolean;
+      writeBack?: boolean;
     },
   ): Promise<ApplyProgress> => {
     const payload = await req<JsonObject>(
       "POST",
-      "/apply",
-      applyRequest(options.configPath, options),
+      `/v2/plans/${encodeURIComponent(id)}/apply`,
+      applyRequest(options.configPath, options, { id, hash: planHash }),
       undefined,
-      15 * 60 * 1000,
+      30_000,
     );
-    if (payload.applied === false) {
-      throw new RiftApiError(409, "/apply", payload);
+    if (payload.applied === false && !payload.operation_id) {
+      throw new RiftApiError(409, `/v2/plans/${encodeURIComponent(id)}/apply`, payload);
     }
-    return {
-      planId: id,
-      planHash,
-      phase: "succeeded",
-      percent: 100,
-      message: "Plan applied and the service launch was recorded.",
-      startedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+    return mapOperation(payload, id, planHash);
   },
-  rollback: async (): Promise<ApplyProgress> => {
-    throw new RiftUnavailable("/deployments/actions", "POST", "not-implemented");
+  getOperation: async (
+    operationId: string,
+    planId: string,
+    planHash: string,
+    signal?: AbortSignal,
+  ): Promise<ApplyProgress> => {
+    const payload = await req<JsonObject>(
+      "GET",
+      `/v2/operations/${encodeURIComponent(operationId)}`,
+      undefined,
+      signal,
+    );
+    return mapOperation(payload, planId, planHash);
+  },
+  listOperations: async (signal?: AbortSignal): Promise<OperationRecord[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/operations", undefined, signal);
+    return list(payload.operations).map(mapOperationRecord);
+  },
+  listEvaluations: async (service?: string, signal?: AbortSignal): Promise<EvaluationRun[]> => {
+    const query = service ? `?service=${encodeURIComponent(service)}` : "";
+    const payload = await req<JsonObject>("GET", `/v2/evaluations${query}`, undefined, signal);
+    return list(payload.evaluations).map(mapEvaluation);
+  },
+  getEvaluation: async (runId: string, signal?: AbortSignal): Promise<EvaluationRun> =>
+    mapEvaluation(
+      await req<JsonObject>(
+        "GET",
+        `/v2/evaluations/${encodeURIComponent(runId)}`,
+        undefined,
+        signal,
+      ),
+    ),
+  evaluateService: async (
+    service: string,
+    options: {
+      suite?: Record<string, unknown>;
+      maxTokens?: number;
+      deadlineSeconds?: number;
+      retainResponses?: boolean;
+      required?: boolean;
+      judge?: {
+        endpoint: string;
+        model: string;
+        allowed_hosts: string[];
+        credential_ref: "none" | `env:${string}`;
+        external_data_consent: boolean;
+        timeout_seconds?: number;
+        max_tokens?: number;
+      };
+    } = {},
+  ): Promise<EvaluationRun> => {
+    const payload = await req<JsonObject>("POST", "/v2/evaluations", {
+      service,
+      suite: options.suite,
+      max_tokens: options.maxTokens ?? 128,
+      deadline_seconds: options.deadlineSeconds ?? 60,
+      retain_responses: options.retainResponses ?? false,
+      required: options.required ?? false,
+      judge: options.judge,
+    });
+    return mapEvaluation(await resolveOperation(payload));
+  },
+  cancelOperation: async (operationId: string, reason = "Cancelled from dashboard") =>
+    mapOperation(
+      await req<JsonObject>("POST", `/v2/operations/${encodeURIComponent(operationId)}/cancel`, {
+        reason,
+      }),
+      "unknown",
+      "unknown",
+    ),
+  restartService: async (service: string): Promise<ApplyProgress> => {
+    const payload = await req<JsonObject>(
+      "POST",
+      `/v2/deployments/${encodeURIComponent(service)}/actions`,
+      { service, action: "restart", allow_launch: true },
+    );
+    return resolveDeploymentAction(payload, service);
+  },
+  recoverService: async (service: string): Promise<ApplyProgress> => {
+    const payload = await req<JsonObject>(
+      "POST",
+      `/v2/deployments/${encodeURIComponent(service)}/actions`,
+      { service, action: "recover", allow_launch: true },
+    );
+    return resolveDeploymentAction(payload, service);
+  },
+  rollback: async (service: string): Promise<ApplyProgress> => {
+    const payload = await req<JsonObject>(
+      "POST",
+      `/v2/deployments/${encodeURIComponent(service)}/actions`,
+      {
+        service,
+        action: "rollback",
+        allow_launch: true,
+      },
+    );
+    return resolveDeploymentAction(payload, service);
   },
   listIncidents,
   acknowledgeIncident: async (): Promise<void> => {
@@ -1076,37 +1501,103 @@ export const rift = {
   resolveIncident: async (): Promise<void> => {
     throw new RiftUnavailable("/incidents/actions", "POST", "not-implemented");
   },
-  planYaml: async (): Promise<string> => {
-    const generated = await req<JsonObject>("GET", "/generated-config");
+  planYaml: async (planId?: string): Promise<string> => {
+    const generated = planId
+      ? await req<JsonObject>("GET", `/v2/plans/${encodeURIComponent(planId)}`)
+      : await req<JsonObject>("GET", "/generated-config");
     return JSON.stringify(generated, null, 2);
   },
   timeline: (signal?: AbortSignal) => req<JsonObject>("GET", "/timeline", undefined, signal),
-  logs: (signal?: AbortSignal) => req<JsonObject>("GET", "/logs", undefined, signal),
+  logs: (signal?: AbortSignal, service?: string) =>
+    req<JsonObject>(
+      "GET",
+      `/logs?service=${encodeURIComponent(service || "chat")}`,
+      undefined,
+      signal,
+    ),
   backends: (signal?: AbortSignal) => req<JsonObject>("GET", "/backends", undefined, signal),
   reports: (signal?: AbortSignal) => req<JsonObject>("GET", "/reports", undefined, signal),
+  settings: async (signal?: AbortSignal): Promise<SettingsSnapshot> => {
+    const payload = await req<JsonObject>("GET", "/v2/settings", undefined, signal);
+    return {
+      apiVersion: text(payload.api_version, "2"),
+      available: bool(payload.available, true),
+      configPath: text(payload.config_path) || undefined,
+      configError: text(payload.config_error) || undefined,
+      modelSources: object(payload.model_sources),
+      gateway: object(payload.gateway),
+      services: Object.fromEntries(
+        Object.entries(object(payload.services)).map(([key, value]) => [key, object(value)]),
+      ),
+      policies: object(payload.policies),
+      mesh: object(payload.mesh),
+    };
+  },
   currentPlan,
   benchmarkService: async (
     service: string,
     prompt = "Explain what RIFT does in one sentence.",
     maxTokens = 32,
-  ) => req<JsonObject>("POST", "/benchmark", { service, prompt, max_tokens: maxTokens }),
-  benchmarkSuite: async (service: string, warmups = 1, repetitions = 3) =>
-    req<JsonObject>("POST", "/benchmark-suite", {
-      service,
-      warmups,
-      repetitions,
-    }),
+  ) =>
+    resolveOperation(
+      await req<JsonObject>("POST", "/benchmark", { service, prompt, max_tokens: maxTokens }),
+    ),
+  benchmarkSuite: async (
+    service: string,
+    options: {
+      prompt?: string;
+      maxTokens?: number;
+      warmups?: number;
+      repetitions?: number;
+      concurrency?: number;
+    } = {},
+  ) =>
+    resolveOperation(
+      await req<JsonObject>("POST", "/benchmark-suite", {
+        service,
+        prompt: options.prompt,
+        max_tokens: options.maxTokens ?? 48,
+        warmups: options.warmups ?? 1,
+        repetitions: options.repetitions ?? 3,
+        concurrency: options.concurrency ?? 1,
+      }),
+    ),
   tuneService: async (
     service: string,
     options: { live?: boolean; allowRestart?: boolean; candidateLimit?: number } = {},
   ) =>
-    req<JsonObject>("POST", "/tune", {
-      service,
-      live: options.live ?? false,
-      allow_restart: options.allowRestart ?? false,
-      candidate_limit: options.candidateLimit ?? 4,
-    }),
+    resolveOperation(
+      await req<JsonObject>("POST", "/tune", {
+        service,
+        live: options.live ?? false,
+        allow_restart: options.allowRestart ?? false,
+        candidate_limit: options.candidateLimit ?? 4,
+      }),
+    ),
   destroyService: async (service: string) => req<JsonObject>("POST", "/destroy", { service }),
+  relaunchDeployment: async (
+    deploymentId: string,
+    options: {
+      allowDownload?: boolean;
+      allowInstall?: boolean;
+      allowLaunch?: boolean;
+      allowRemote?: boolean;
+      optimize?: boolean;
+    } = {},
+  ): Promise<JsonObject> =>
+    resolveOperation(
+      await req<JsonObject>(
+        "POST",
+        `/v2/deployment-records/${encodeURIComponent(deploymentId)}/launch`,
+        {
+          allow_download: options.allowDownload ?? false,
+          allow_install: options.allowInstall ?? false,
+          allow_launch: options.allowLaunch ?? false,
+          allow_remote: options.allowRemote ?? false,
+          optimize: options.optimize ?? false,
+        },
+      ),
+    ),
 
   subscribe(onEvent: (event: RiftEvent) => void, onStale: (stale: boolean) => void): () => void {
     let closed = false;

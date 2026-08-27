@@ -97,9 +97,9 @@ function HealthPanel() {
   if (unavailable)
     return (
       <Unavailable
-        endpoint="/v1/health"
+        endpoint="/hardware"
         resource="FleetHealth { nodesReady, servicesRunning, incidentsOpen, capacity }"
-        hint="Emit `health` events on /v1/events to keep this panel live."
+        hint="The controller exposes live hardware and service health through the configured control API."
       />
     );
   if (isLoading || !data)
@@ -181,7 +181,7 @@ function ServicesPanel() {
   if (unavailable)
     return (
       <Unavailable
-        endpoint="/v1/services"
+        endpoint="/services"
         resource="Service[] { id, name, status, artifactId, endpoint, assignments }"
       />
     );
@@ -276,7 +276,7 @@ function IncidentsPanel() {
   if (unavailable)
     return (
       <Unavailable
-        endpoint="/v1/incidents"
+        endpoint="/incidents"
         resource="Incident[] { severity, status, title, nodeId?, serviceId? }"
       />
     );
@@ -326,7 +326,7 @@ function NodesPanel() {
   if (unavailable)
     return (
       <Unavailable
-        endpoint="/v1/nodes"
+        endpoint="/hardware"
         resource="RiftNode[] { hostname, status, accelerators[] }"
       />
     );

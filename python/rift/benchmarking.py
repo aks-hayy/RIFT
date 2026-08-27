@@ -6,6 +6,7 @@ import math
 import platform
 import statistics
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 
@@ -45,34 +46,42 @@ class BenchmarkSuite:
         warmups: int = 1,
         repetitions: int = 3,
         cold_cache: bool = False,
+        concurrency: int = 1,
         metadata: JsonDict | None = None,
     ) -> JsonDict:
         if warmups < 0 or repetitions <= 0:
             raise ValueError("warmups cannot be negative and repetitions must be positive")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be positive")
         started = time.time()
         results = []
         for case in self.suite:
-            warmup_results = [
-                benchmark(
-                    base_url=base_url,
-                    prompt=case["prompt"],
-                    max_tokens=int(case["max_tokens"]),
-                )
-                for _ in range(warmups)
-            ]
-            samples = [
-                benchmark(
-                    base_url=base_url,
-                    prompt=case["prompt"],
-                    max_tokens=int(case["max_tokens"]),
-                )
-                for _ in range(repetitions)
-            ]
+            def call(_: int) -> JsonDict:
+                try:
+                    return benchmark(
+                        base_url=base_url,
+                        prompt=case["prompt"],
+                        max_tokens=int(case["max_tokens"]),
+                    )
+                except Exception as exc:
+                    return {"available": False, "error": str(exc)[:500]}
+
+            def run_calls(count: int) -> list[JsonDict]:
+                if count <= 0:
+                    return []
+                if concurrency == 1:
+                    return [call(index) for index in range(count)]
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    return list(executor.map(call, range(count)))
+
+            warmup_results = run_calls(warmups)
+            samples = run_calls(repetitions)
             summary = summarize_samples(samples)
             results.append(
                 {
                     "case": case,
                     "warmup_count": len(warmup_results),
+                    "warmup_failures": sum(not bool(item.get("available", True)) for item in warmup_results),
                     "samples": samples,
                     "summary": summary,
                 }
@@ -94,6 +103,7 @@ class BenchmarkSuite:
             "cache_state": "cold_requested" if cold_cache else "warm_or_unspecified",
             "warmups": warmups,
             "repetitions": repetitions,
+            "concurrency": concurrency,
             "host": {
                 "platform": platform.platform(),
                 "python": platform.python_version(),
@@ -109,6 +119,11 @@ class BenchmarkSuite:
                 if aggregate_latency
                 else None,
                 "case_count": len(results),
+                "sample_count": sum(int(result["summary"].get("sample_count") or 0) for result in results),
+                "failure_count": sum(
+                    sum(not bool(sample.get("available", True)) for sample in result["samples"])
+                    for result in results
+                ),
             },
         }
 

@@ -174,7 +174,46 @@ export interface Service {
     pid?: number;
     restartCount?: number;
     command?: string;
+    backendVersion?: string;
+    exposure?: string;
+    model?: Record<string, unknown>;
+    serving?: Record<string, unknown>;
+    gateway?: Record<string, unknown>;
+    launchPlan?: Record<string, unknown>;
   };
+}
+
+export type DeploymentRecordStatus = "ready" | "stopped" | "deleted" | "failed";
+
+/** Durable successful deployment history, independent from active service state. */
+export interface DeploymentRecord {
+  deploymentId: string;
+  serviceName: string;
+  displayName: string;
+  status: DeploymentRecordStatus;
+  model: Record<string, unknown>;
+  backend: { kind: BackendKind; version?: string; executable?: string };
+  node?: { node?: string; [key: string]: unknown };
+  endpoint: {
+    apiBase?: string;
+    openaiBase?: string;
+    host?: string;
+    port?: number;
+    path?: string;
+  };
+  serving: Record<string, unknown>;
+  gateway: Record<string, unknown>;
+  launch: Record<string, unknown>;
+  lastKnownGood: Record<string, unknown>;
+  plan: { id?: string; hash?: string; configPath?: string };
+  configSnapshotPath?: string;
+  relaunchCount: number;
+  createdAt: string;
+  updatedAt: string;
+  lastStartedAt?: string;
+  stoppedAt?: string;
+  deletedAt?: string;
+  provenance?: DataProvenance;
 }
 
 export interface Assignment {
@@ -220,6 +259,8 @@ export interface Plan {
 
 export type ApplyPhase =
   | "queued"
+  | "preparing"
+  | "executing"
   | "installing"
   | "downloading"
   | "configuring"
@@ -229,15 +270,19 @@ export type ApplyPhase =
   | "benchmarking"
   | "succeeded"
   | "failed"
+  | "cancelled"
+  | "interrupted"
   | "rolled_back";
 
 export interface ApplyProgress {
   planId: PlanId;
   planHash: string;
+  operationId?: string;
+  status?: "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "INTERRUPTED";
   phase: ApplyPhase;
   actionId?: string;
   nodeId?: NodeId;
-  percent: number; // 0-100
+  percent: number | null; // 0-100; null means indeterminate
   message: string;
   startedAt: string;
   updatedAt: string;
@@ -247,6 +292,68 @@ export interface ApplyProgress {
     reason: string;
     recoverable: boolean;
   };
+  error?: string;
+  result?: Record<string, unknown>;
+}
+
+export interface OperationRecord {
+  operationId: string;
+  requestId: string;
+  action: string;
+  status: "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "INTERRUPTED";
+  stage: string;
+  message: string;
+  percent: number | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: string;
+  details?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+}
+
+export type EvaluationCaseStatus = "pass" | "fail" | "not_assessed" | "error";
+
+export interface EvaluationCaseResult {
+  caseId: string;
+  status: EvaluationCaseStatus;
+  criteria: string;
+  detail: string;
+  elapsedSeconds?: number;
+  response?: string;
+  judge?: {
+    status: "not_assessed" | "assessed" | "error";
+    score?: number | null;
+    detail?: string | null;
+  };
+}
+
+export interface EvaluationRun {
+  runId: string;
+  service: string;
+  status: "running" | "completed" | "deadline" | "not_run";
+  suite: { id: string; version: string; cases?: unknown[] };
+  summary: Record<string, number>;
+  cases: EvaluationCaseResult[];
+  available: boolean;
+  required: boolean;
+  reportPath?: string;
+  modelRevision?: Record<string, unknown>;
+  configuration?: Record<string, unknown>;
+  assessment?: string;
+  provenance?: DataProvenance;
+}
+
+export interface SettingsSnapshot {
+  apiVersion: string;
+  available: boolean;
+  configPath?: string;
+  configError?: string;
+  modelSources: Record<string, unknown>;
+  gateway: Record<string, unknown>;
+  services: Record<string, Record<string, unknown>>;
+  policies: Record<string, unknown>;
+  mesh: Record<string, unknown>;
 }
 
 export interface DeploymentRevision {

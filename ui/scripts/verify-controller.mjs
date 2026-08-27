@@ -13,17 +13,21 @@ const server = await createServer({
 
 try {
     const { rift } = await server.ssrLoadModule("/src/lib/rift/client.ts");
-    const [health, nodes, services, incidents, timeline, backends, benchmarks, plan] =
-        await Promise.all([
-            rift.health(),
-            rift.listNodes(),
-            rift.listServices(),
-            rift.listIncidents(),
-            rift.timeline(),
-            rift.backends(),
-            rift.listBenchmarks("chat"),
-            rift.currentPlan(),
-        ]);
+    const [health, nodes, services, incidents, timeline, backends, benchmarks] = await Promise.all([
+        rift.health(),
+        rift.listNodes(),
+        rift.listServices(),
+        rift.listIncidents(),
+        rift.timeline(),
+        rift.backends(),
+        rift.listBenchmarks("chat"),
+    ]);
+    let plan = null;
+    try {
+        plan = await rift.currentPlan();
+    } catch (error) {
+        if (error?.reason !== "not-implemented") throw error;
+    }
     if (nodes.length === 0) throw new Error("controller returned no hardware nodes");
     if (health.servicesTotal !== services.length) {
         throw new Error(
@@ -56,9 +60,9 @@ try {
             latestTokensPerSecond: benchmarks[0]?.tokensPerSec ?? null,
         },
         plan: {
-            actions: plan.actions.length,
-            provenance: plan.provenance,
-            previewOnly: plan.previewOnly,
+            actions: plan?.actions.length ?? 0,
+            provenance: plan?.provenance ?? "none",
+            previewOnly: plan?.previewOnly ?? false,
         },
     };
     console.log(JSON.stringify(summary, null, 2));

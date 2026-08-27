@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+import os
 from pathlib import Path
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any
@@ -196,11 +198,24 @@ class StateStore:
                 "database": str(self.path),
                 "revision": revision,
             }
-            temporary = self.legacy_path.with_suffix(self.legacy_path.suffix + ".tmp")
-            temporary.write_text(
-                json.dumps(mirror, indent=2, sort_keys=True), encoding="utf-8"
-            )
-            temporary.replace(self.legacy_path)
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.legacy_path.parent,
+                    prefix=f".{self.legacy_path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temporary:
+                    temporary_path = Path(temporary.name)
+                    temporary.write(json.dumps(mirror, indent=2, sort_keys=True))
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                temporary_path.replace(self.legacy_path)
+            finally:
+                if temporary_path is not None:
+                    temporary_path.unlink(missing_ok=True)
 
 
 __all__ = ["StateConflictError", "StateStore"]

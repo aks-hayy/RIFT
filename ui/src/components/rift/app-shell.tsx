@@ -86,7 +86,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span className="text-ink-secondary font-normal">controller</span>
           </Link>
 
-          <nav className="hidden md:flex items-center gap-0.5 ml-4" aria-label="Primary">
+          <nav className="hidden lg:flex items-center gap-0.5 ml-4" aria-label="Primary">
             {NAV.map((item) => {
               const Icon = item.icon;
               const active = item.exact
@@ -121,7 +121,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             </button>
             <button
               type="button"
-              className="md:hidden inline-flex size-9 items-center justify-center rounded-[4px] border border-border text-ink-secondary hover:bg-muted hover:text-ink"
+              className="lg:hidden inline-flex size-9 items-center justify-center rounded-[4px] border border-border text-ink-secondary hover:bg-muted hover:text-ink"
               aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
               aria-expanded={mobileOpen}
               onClick={() => setMobileOpen((open) => !open)}
@@ -132,7 +132,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         {mobileOpen && (
           <nav
-            className="md:hidden border-t border-border px-3 py-2 grid grid-cols-2 gap-1"
+            className="lg:hidden border-t border-border px-3 py-2 grid grid-cols-2 gap-1"
             aria-label="Mobile primary"
           >
             {NAV.map((item) => {
@@ -175,13 +175,13 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </div>
 
-      <main className="flex-1" role="main">
+      <main className="flex-1 min-w-0" role="main">
         {children}
       </main>
 
       <footer className="border-t border-border bg-raised">
         <div className="max-w-[1400px] mx-auto px-4 h-9 flex items-center justify-between text-[11px] rift-mono text-ink-secondary">
-          <span>RIFT · seismic operator console</span>
+          <span>RIFT · operator console</span>
           <span>Controller binds locally by default</span>
         </div>
       </footer>

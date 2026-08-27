@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+from pathlib import Path
 import threading
 import time
 import uuid
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .cluster import RiftClusterController
 from .mesh.controller import MeshController
@@ -45,13 +46,177 @@ class RiftServerRuntime:
     operation_store: OperationStore | None = field(default=None, repr=False)
     bootstrap_host: str = "0.0.0.0"
     bootstrap_port: int = 11748
+    cors_origins: tuple[str, ...] = ()
     _bootstrap_server: Any = field(default=None, init=False, repr=False)
     _bootstrap_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _bootstrap_advertiser: Any = field(default=None, init=False, repr=False)
+    _operation_threads: dict[str, threading.Thread] = field(default_factory=dict, init=False, repr=False)
+    _operation_cancel_events: dict[str, threading.Event] = field(default_factory=dict, init=False, repr=False)
+    _background_locks: dict[str, threading.Lock] = field(default_factory=dict, init=False, repr=False)
+    _background_locks_guard: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.operation_store is None:
-            self.operation_store = OperationStore(RiftPaths.from_environment().operations)
+            runtime_root = None
+            try:
+                configured_orchestrator = self.orchestrator_factory()
+                runtime_root = getattr(configured_orchestrator, "rift_dir", None)
+            except Exception:
+                runtime_root = None
+            operations_root = (
+                Path(runtime_root) / "operations"
+                if runtime_root is not None
+                else RiftPaths.from_environment().operations
+            )
+            self.operation_store = OperationStore(operations_root)
+        self.operation_store.mark_running_interrupted()
+
+    @staticmethod
+    def is_background_operation(path: str) -> bool:
+        return (
+            path.startswith("/api/rift/v2/plans/")
+            and path.endswith("/apply")
+        ) or path in {
+            "/api/rift/benchmark",
+            "/api/rift/benchmark-suite",
+            "/api/rift/tune",
+            "/api/rift/v2/evaluations",
+        } or (
+            path.startswith("/api/rift/v2/deployments/")
+            and path.endswith("/actions")
+        ) or (
+            path.startswith("/api/rift/v2/deployment-records/")
+            and path.endswith("/launch")
+        )
+
+    def start_background_operation(
+        self,
+        path: str,
+        payload: JsonDict,
+        *,
+        request_id: str,
+        operation: JsonDict,
+        authorization: str | None,
+    ) -> JsonDict:
+        """Start a durable operation and return before backend work completes."""
+
+        assert self.operation_store is not None
+        operation_id = str(operation["operation_id"])
+        cancel_event = threading.Event()
+        self._operation_cancel_events[operation_id] = cancel_event
+        resource_key = self.background_resource_key(path, payload)
+        resource_lock = self.background_resource_lock(resource_key)
+
+        def worker() -> None:
+            try:
+                class OperationCancelled(Exception):
+                    """Internal signal for a safe cancellation checkpoint."""
+
+                def progress(
+                    stage: str,
+                    message: str,
+                    percent: float | None,
+                    details: JsonDict | None = None,
+                ) -> None:
+                    if cancel_event.is_set():
+                        raise OperationCancelled()
+                    self.operation_store.update(
+                        request_id,
+                        stage=stage,
+                        message=message,
+                        percent=percent,
+                        details=details,
+                    )
+
+                self.operation_store.update(
+                    request_id,
+                    stage="preparing",
+                    message="Preparing the reviewed deployment operation",
+                    percent=5.0,
+                )
+                if cancel_event.is_set():
+                    return
+                while not resource_lock.acquire(timeout=0.2):
+                    if cancel_event.is_set():
+                        return
+                    self.operation_store.update(
+                        request_id,
+                        stage="queued",
+                        message=f"Waiting for the {resource_key} execution slot",
+                        percent=None,
+                        details={"resource_key": resource_key},
+                    )
+                try:
+                    if cancel_event.is_set():
+                        return
+                    self.operation_store.update(
+                        request_id,
+                        stage="executing",
+                        message="Executing the reviewed operation",
+                        percent=None,
+                        details={"resource_key": resource_key},
+                    )
+                    result = self.control_post(
+                        path,
+                        payload,
+                        authorization=authorization,
+                        progress=progress,
+                    )
+                finally:
+                    resource_lock.release()
+                if cancel_event.is_set():
+                    return
+                result = {
+                    **result,
+                    "request_id": request_id,
+                    "operation_id": operation_id,
+                }
+                self.operation_store.complete(request_id, result=result)
+            except OperationCancelled:
+                # The cancel endpoint already records CANCELLED. If the
+                # request raced with that endpoint, preserve its terminal
+                # status rather than converting it into a generic failure.
+                return
+            except Exception as exc:  # pragma: no cover - exercised through HTTP integration
+                self.operation_store.fail(request_id, error=str(exc))
+            finally:
+                self._operation_cancel_events.pop(operation_id, None)
+                self._operation_threads.pop(operation_id, None)
+
+        thread = threading.Thread(
+            target=worker,
+            name=f"rift-operation-{operation_id}",
+            daemon=True,
+        )
+        self._operation_threads[operation_id] = thread
+        thread.start()
+        return {
+            "request_id": request_id,
+            "operation_id": operation_id,
+            "status": "RUNNING",
+            "stage": operation.get("stage", "queued"),
+            "message": operation.get("message", "Operation accepted"),
+            "percent": operation.get("percent"),
+        }
+
+    @staticmethod
+    def background_resource_key(path: str, payload: JsonDict) -> str:
+        """Return the smallest resource scope that must serialize work."""
+
+        service = str(payload.get("service") or "").strip()
+        if service:
+            return f"service:{service}"
+        if path.startswith("/api/rift/v2/plans/") and path.endswith("/apply"):
+            return "node:local"
+        return "node:local"
+
+    def background_resource_lock(self, resource_key: str) -> threading.Lock:
+        with self._background_locks_guard:
+            lock = self._background_locks.get(resource_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._background_locks[resource_key] = lock
+            return lock
 
     @staticmethod
     def request_id(supplied: str | None) -> str:
@@ -225,7 +390,7 @@ class RiftServerRuntime:
             "kv_plan": plan.get("kv_plan", {}),
         }
 
-    def control_get(self, path: str) -> JsonDict:
+    def control_get(self, path: str, query: dict[str, list[str]] | None = None) -> JsonDict:
         if path == "/api/rift/v2/mesh/enrollment-window":
             return self.mesh_controller().enrollment_window_status()
         if path == "/api/rift/v2/mesh/enrollments":
@@ -237,6 +402,42 @@ class RiftServerRuntime:
         if path == "/api/rift/v2/mesh/topology":
             return self.mesh_controller().topology()
         orchestrator = self.orchestrator_factory()
+        if path == "/api/rift/v2/plans":
+            return {"api_version": "2", "plans": orchestrator.list_plans()}
+        if path.startswith("/api/rift/v2/plans/"):
+            plan_id = path.rsplit("/", 1)[-1]
+            return orchestrator.load_plan_by_id(plan_id)
+        if path == "/api/rift/v2/operations":
+            assert self.operation_store is not None
+            return {"operations": self.operation_store.list_operations()}
+        if path.startswith("/api/rift/v2/operations/"):
+            operation_id = path.rsplit("/", 1)[-1]
+            assert self.operation_store is not None
+            operation = self.operation_store.load_operation(operation_id)
+            if operation is None:
+                raise KeyError(path)
+            return operation
+        if path == "/api/rift/v2/deployment-records":
+            return {
+                "api_version": "2",
+                "records": orchestrator.list_deployment_records(),
+            }
+        if path.startswith("/api/rift/v2/deployment-records/") and not path.endswith("/launch"):
+            record_id = path.rsplit("/", 1)[-1]
+            return {
+                "api_version": "2",
+                "record": orchestrator.load_deployment_record(record_id),
+            }
+        if path == "/api/rift/v2/evaluations":
+            return orchestrator.evaluations(
+                service_name=((query or {}).get("service") or [None])[0],
+                limit=int(((query or {}).get("limit") or [50])[0] or 50),
+            )
+        if path.startswith("/api/rift/v2/evaluations/"):
+            run_id = path.rsplit("/", 1)[-1]
+            return orchestrator.load_evaluation(run_id)
+        if path in ("/api/rift/settings", "/api/rift/v2/settings"):
+            return orchestrator.settings_snapshot()
         if path == "/api/rift/v2/adapters":
             return {
                 "api_version": "2",
@@ -360,6 +561,8 @@ class RiftServerRuntime:
             return orchestrator.latest_discovery()
         if path == "/api/rift/generated-config":
             return orchestrator.generated_config()
+        if path == "/api/rift/model-sources" or path == "/api/rift/v2/model-sources":
+            return orchestrator.model_sources()
         if path == "/api/rift/backends":
             return orchestrator.backend_status()
         if path == "/api/rift/hardware":
@@ -381,7 +584,9 @@ class RiftServerRuntime:
         if path == "/api/rift/timeline":
             return orchestrator.observability_store.timeline(limit=500)
         if path == "/api/rift/logs":
-            return orchestrator.logs(service_name="chat", tail=500)
+            service_name = (query or {}).get("service", ["chat"])[0] or "chat"
+            tail = int((query or {}).get("tail", [500])[0] or 500)
+            return orchestrator.logs(service_name=service_name, tail=tail)
         if path == "/api/rift/provider-gates":
             return {
                 "providers": {
@@ -400,7 +605,14 @@ class RiftServerRuntime:
             return latest
         raise KeyError(path)
 
-    def control_post(self, path: str, payload: JsonDict, *, authorization: str | None = None) -> JsonDict:
+    def control_post(
+        self,
+        path: str,
+        payload: JsonDict,
+        *,
+        authorization: str | None = None,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
+    ) -> JsonDict:
         if path == "/api/rift/v2/mesh/enrollment-window":
             result = self.mesh_controller().open_enrollment_window(
                 ttl_seconds=int(payload.get("ttl_seconds") or 600)
@@ -456,6 +668,19 @@ class RiftServerRuntime:
             return self.mesh_controller().record_link(payload)
         if path == "/api/rift/v2/mesh/routes/resolve":
             return self.mesh_controller().resolve_route(payload)
+        if path.startswith("/api/rift/v2/operations/") and path.endswith("/cancel"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 6:
+                raise KeyError(path)
+            assert self.operation_store is not None
+            operation_id = parts[-2]
+            event = self._operation_cancel_events.get(operation_id)
+            if event is not None:
+                event.set()
+            return self.operation_store.cancel(
+                operation_id,
+                reason=str(payload.get("reason") or "Operation cancelled by operator"),
+            )
         orchestrator = self.orchestrator_factory()
         if path == "/api/rift/v2/recommendations":
             return orchestrator.engine.recommend_models(
@@ -475,6 +700,7 @@ class RiftServerRuntime:
                 endpoint=str(payload.get("endpoint") or "https://huggingface.co"),
                 token=payload.get("token"),
                 run_store_root=str(orchestrator.rift_dir),
+                model_ref=str(payload.get("model_ref") or "") or None,
             )
         if path == "/api/rift/v2/compatibility":
             artifact = payload.get("artifact")
@@ -496,6 +722,60 @@ class RiftServerRuntime:
                 "artifact": artifact,
                 "results": [item.to_dict() for item in results],
             }
+        if path.startswith("/api/rift/v2/deployments/") and path.endswith("/actions"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 6:
+                raise KeyError(path)
+            service_name = parts[-2]
+            action = str(payload.get("action") or "").strip().lower()
+            if action == "stop":
+                return orchestrator.stop_service(service_name=service_name)
+            if action in {"restart", "start"}:
+                return orchestrator.recover(
+                    service_name=service_name,
+                    allow_launch=bool(payload.get("allow_launch", False)),
+                    force=True,
+                )
+            if action == "recover":
+                return orchestrator.recover(
+                    service_name=service_name,
+                    allow_launch=bool(payload.get("allow_launch", False)),
+                    force=bool(payload.get("force", False)),
+                )
+            if action == "rollback":
+                return orchestrator.rollback_service(
+                    service_name=service_name,
+                    allow_launch=bool(payload.get("allow_launch", False)),
+                )
+            if action == "benchmark":
+                return orchestrator.benchmark(
+                    service_name=service_name,
+                    prompt=str(payload.get("prompt") or "Explain what RIFT does in one sentence."),
+                    max_tokens=min(128, int(payload.get("max_tokens") or 32)),
+                )
+            if action == "tune":
+                return orchestrator.tune_service(
+                    service_name=service_name,
+                    live=bool(payload.get("live", False)),
+                    allow_restart=bool(payload.get("allow_restart", False)),
+                    candidate_limit=int(payload.get("candidate_limit") or 2),
+                    warmup_runs=int(payload.get("warmup_runs") or 1),
+                    repeats=int(payload.get("repeats") or 3),
+                )
+            raise ValueError("unsupported deployment action")
+        if path.startswith("/api/rift/v2/deployment-records/") and path.endswith("/launch"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 6:
+                raise KeyError(path)
+            return orchestrator.relaunch_deployment(
+                record_id=parts[-2],
+                allow_download=bool(payload.get("allow_download", False)),
+                allow_install=bool(payload.get("allow_install", False)),
+                allow_launch=bool(payload.get("allow_launch", False)),
+                allow_remote=bool(payload.get("allow_remote", False)),
+                optimize=bool(payload.get("optimize", False)),
+                progress=progress,
+            )
         if path == "/api/rift/v2/artifacts/inspect":
             model_path = str(payload.get("model_path") or "")
             if not model_path:
@@ -503,6 +783,20 @@ class RiftServerRuntime:
             return orchestrator.artifact_manifest(
                 model_path=model_path,
                 hash_mode=str(payload.get("hash_mode") or "model"),
+            )
+        if path == "/api/rift/v2/evaluations":
+            suite = payload.get("suite")
+            if suite is not None and not isinstance(suite, dict):
+                raise ValueError("suite must be an object")
+            return orchestrator.evaluate_service(
+                service_name=str(payload.get("service") or "chat"),
+                suite=suite,
+                max_tokens=min(128, int(payload.get("max_tokens") or 128)),
+                total_deadline_seconds=float(payload.get("deadline_seconds") or 60.0),
+                retain_responses=bool(payload.get("retain_responses", False)),
+                required=bool(payload.get("required", False)),
+                write=True,
+                judge=payload.get("judge") if isinstance(payload.get("judge"), dict) else None,
             )
         if path == "/api/rift/v2/plans":
             run_id = str(payload.get("recommendation_run_id") or "")
@@ -512,6 +806,28 @@ class RiftServerRuntime:
                 run_id=run_id,
                 selector=str(payload.get("selector") or "best_estimated"),
                 output=payload.get("output"),
+                artifact_id=payload.get("artifact_id"),
+                backend_kind=payload.get("backend_kind"),
+                target_node_id=payload.get("target_node_id"),
+                service_name=str(payload.get("service_name") or "chat"),
+                exposure=str(payload.get("exposure") or "local"),
+            )
+        if path.startswith("/api/rift/v2/plans/") and path.endswith("/apply"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 6:
+                raise KeyError(path)
+            return orchestrator.apply(
+                plan_id=parts[-2],
+                plan_hash=str(payload.get("plan_hash") or ""),
+                progress=progress,
+                permissions=ApplyPermissions(
+                    allow_download=bool(payload.get("allow_download", False)),
+                    allow_install=bool(payload.get("allow_install", False)),
+                    allow_launch=bool(payload.get("allow_launch", False)),
+                    allow_remote=bool(payload.get("allow_remote", False)),
+                    optimize=bool(payload.get("optimize", False)),
+                    write_back=bool(payload.get("write_back", False)),
+                ),
             )
         if path == "/api/rift/v2/verification-runs":
             run_id = str(payload.get("recommendation_run_id") or "")
@@ -535,6 +851,16 @@ class RiftServerRuntime:
                 token=payload.get("token"),
             )
         if path == "/api/rift/recommend":
+            source = str(payload.get("source") or "huggingface").lower()
+            if source == "local":
+                models_dir = str(payload.get("models_dir") or payload.get("local_path") or "")
+                if not models_dir:
+                    raise ValueError("local source requires models_dir or local_path")
+                return orchestrator.recommend_local_models(
+                    task=str(payload.get("task") or "chat"),
+                    models_dir=models_dir,
+                    top=int(payload.get("top") or 10),
+                )
             return orchestrator.engine.recommend_models(
                 task=str(payload.get("task") or "chat"),
                 top=int(payload.get("top") or 10),
@@ -550,6 +876,7 @@ class RiftServerRuntime:
                 download_root=payload.get("download_root"),
                 disk_reserve_gb=float(payload.get("disk_reserve_gb") or 2.0),
                 run_store_root=str(orchestrator.rift_dir),
+                model_ref=str(payload.get("model_ref") or "") or None,
             )
         if path == "/api/rift/calibrate":
             return orchestrator.calibrate_hardware(
@@ -584,6 +911,8 @@ class RiftServerRuntime:
         if path == "/api/rift/apply":
             return orchestrator.apply(
                 config_path=str(payload.get("config") or "rift.yaml"),
+                plan_id=payload.get("plan_id"),
+                plan_hash=payload.get("plan_hash"),
                 permissions=ApplyPermissions(
                     allow_download=bool(payload.get("allow_download", False)),
                     allow_install=bool(payload.get("allow_install", False)),
@@ -604,6 +933,9 @@ class RiftServerRuntime:
                 service_name=str(payload.get("service") or "chat"),
                 warmups=int(payload.get("warmups") or 1),
                 repetitions=int(payload.get("repetitions") or 3),
+                prompt=str(payload.get("prompt") or "") or None,
+                max_tokens=min(128, int(payload.get("max_tokens") or 48)),
+                concurrency=int(payload.get("concurrency") or 1),
             )
         if path == "/api/rift/tune":
             return orchestrator.tune_service(
@@ -768,7 +1100,10 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             try:
-                self._send_json(HTTPStatus.OK, self.runtime.control_get(parsed.path))
+                self._send_json(
+                    HTTPStatus.OK,
+                    self.runtime.control_get(parsed.path, parse_qs(parsed.query)),
+                )
             except KeyError:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
             return
@@ -790,42 +1125,55 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         payload = self._read_json_body()
         request_id: str | None = None
+        operation_claimed = False
         try:
             if parsed.path.startswith("/api/rift/"):
                 request_id = self.runtime.request_id(
                     self.headers.get("X-Request-ID") or payload.get("request_id")
                 )
                 assert self.runtime.operation_store is not None
-                prior = self.runtime.operation_store.load(request_id)
-                if prior is not None:
-                    if prior.get("status") == "RUNNING":
-                        self._send_json(
-                            HTTPStatus.CONFLICT,
-                            {
-                                "error": "operation with this request_id is already running",
-                                "request_id": request_id,
-                                "operation_id": prior.get("operation_id"),
-                            },
-                        )
-                        return
-                    self._send_json(
-                        HTTPStatus.OK if prior.get("status") == "SUCCEEDED" else HTTPStatus.INTERNAL_SERVER_ERROR,
-                        {
-                            **(prior.get("result") or {}),
-                            "request_id": request_id,
-                            "operation_id": prior.get("operation_id"),
-                            "replayed": True,
-                        },
-                    )
-                    return
-                operation = self.runtime.operation_store.begin(
+                operation, operation_claimed = self.runtime.operation_store.begin_claim(
                     request_id,
                     action=parsed.path,
                     actor=self.runtime.identity(
                         self.headers.get("Authorization"),
                         self.client_address[0],
                     ),
+                    payload=payload,
                 )
+                if not operation_claimed:
+                    if operation.get("status") == "RUNNING":
+                        self._send_json(
+                            HTTPStatus.CONFLICT,
+                            {
+                                "error": "operation with this request_id is already running",
+                                "request_id": request_id,
+                                "operation_id": operation.get("operation_id"),
+                            },
+                        )
+                        return
+                    replay_status = HTTPStatus.OK if operation.get("status") == "SUCCEEDED" else HTTPStatus.CONFLICT
+                    self._send_json(
+                        replay_status,
+                        {
+                            **(operation.get("result") or {}),
+                            "request_id": request_id,
+                            "operation_id": operation.get("operation_id"),
+                            "replayed": True,
+                            "operation_status": operation.get("status"),
+                        },
+                    )
+                    return
+                if self.runtime.is_background_operation(parsed.path):
+                    result = self.runtime.start_background_operation(
+                        parsed.path,
+                        payload,
+                        request_id=request_id,
+                        operation=operation,
+                        authorization=self.headers.get("Authorization"),
+                    )
+                    self._send_json(HTTPStatus.ACCEPTED, result)
+                    return
                 result = self.runtime.control_post(
                     parsed.path,
                     payload,
@@ -856,7 +1204,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self._chat_response(result))
                 return
         except PermissionError as exc:
-            if request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
+            if operation_claimed and request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
                 self.runtime.operation_store.fail(request_id, error=str(exc))
             self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
             return
@@ -864,18 +1212,18 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.GONE, {"error": str(exc)})
             return
         except (ValueError, KeyError) as exc:
-            if request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
+            if operation_claimed and request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
                 self.runtime.operation_store.fail(request_id, error=str(exc))
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         except RuntimeError as exc:
-            if request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
+            if operation_claimed and request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
                 self.runtime.operation_store.fail(request_id, error=str(exc))
             status = HTTPStatus.TOO_MANY_REQUESTS if "busy" in str(exc).lower() else HTTPStatus.INTERNAL_SERVER_ERROR
             self._send_json(status, {"error": str(exc)})
             return
         except Exception as exc:  # pragma: no cover - HTTP boundary
-            if request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
+            if operation_claimed and request_id and parsed.path.startswith("/api/rift/") and self.runtime.operation_store is not None:
                 self.runtime.operation_store.fail(request_id, error=str(exc))
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
@@ -889,14 +1237,17 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
         request_id = self.runtime.request_id(self.headers.get("X-Request-ID"))
         assert self.runtime.operation_store is not None
         try:
-            prior = self.runtime.operation_store.load(request_id)
-            if prior is not None:
+            operation, operation_claimed = self.runtime.operation_store.begin_claim(
+                request_id,
+                action=parsed.path,
+                actor=self.runtime.identity(self.headers.get("Authorization"), self.client_address[0]),
+            )
+            if not operation_claimed:
                 self._send_json(
-                    HTTPStatus.OK if prior.get("status") == "SUCCEEDED" else HTTPStatus.INTERNAL_SERVER_ERROR,
-                    {**(prior.get("result") or {}), "request_id": request_id, "operation_id": prior.get("operation_id"), "replayed": True},
+                    HTTPStatus.OK if operation.get("status") == "SUCCEEDED" else HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {**(operation.get("result") or {}), "request_id": request_id, "operation_id": operation.get("operation_id"), "replayed": True},
                 )
                 return
-            operation = self.runtime.operation_store.begin(request_id, action=parsed.path, actor=self.runtime.identity(self.headers.get("Authorization"), self.client_address[0]))
             result = {**self.runtime.control_delete(parsed.path), "request_id": request_id, "operation_id": operation["operation_id"]}
             self.runtime.operation_store.complete(request_id, result=result)
             self._send_json(HTTPStatus.OK, result)
@@ -1027,7 +1378,9 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             "RIFT_CONTROL_CORS_ORIGINS",
             "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8765,http://127.0.0.1:8765",
         )
-        return {item.strip() for item in raw.split(",") if item.strip()}
+        allowed = {item.strip() for item in raw.split(",") if item.strip()}
+        allowed.update(item.strip() for item in self.runtime.cors_origins if item.strip())
+        return allowed
 
     def _cors_allowed(self, origin: str | None) -> bool:
         return not origin or origin in self._allowed_origins()
@@ -1036,6 +1389,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin and self._cors_allowed(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Vary", "Origin")
 
 

@@ -43,7 +43,7 @@ export function Panel({
   children: ReactNode;
 }) {
   return (
-    <section className={cn("rift-panel", className)}>
+    <section className={cn("rift-panel min-w-0 max-w-full", className)}>
       {title && (
         <header className="flex items-center justify-between px-4 h-10 border-b border-border">
           <h2 className="rift-label">{title}</h2>
