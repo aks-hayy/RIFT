@@ -8,6 +8,9 @@ const controllerTarget = process.env.RIFT_CONTROL_API ?? "http://127.0.0.1:8777"
 
 export default defineConfig({
   plugins: [tanstackStart(), react(), tailwindcss(), tsconfigPaths()],
+  ssr: {
+    noExternal: true,
+  },
   server: {
     proxy: {
       "/api/rift": {

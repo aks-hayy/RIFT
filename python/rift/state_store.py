@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from typing import Any
+import uuid
 
 
 JsonDict = dict[str, Any]
@@ -198,24 +199,30 @@ class StateStore:
                 "database": str(self.path),
                 "revision": revision,
             }
-            temporary_path: Path | None = None
+            # The controller and dashboard can share one RIFT_HOME on Windows.
+            # Use a unique temporary file, flush it durably, and retry the
+            # diagnostic mirror briefly when another process is replacing it.
+            temporary = self.legacy_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=self.legacy_path.parent,
-                    prefix=f".{self.legacy_path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as temporary:
-                    temporary_path = Path(temporary.name)
-                    temporary.write(json.dumps(mirror, indent=2, sort_keys=True))
-                    temporary.flush()
-                    os.fsync(temporary.fileno())
-                temporary_path.replace(self.legacy_path)
+                with temporary.open("w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(mirror, indent=2, sort_keys=True))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                last_error: OSError | None = None
+                for _ in range(5):
+                    try:
+                        temporary.replace(self.legacy_path)
+                        return
+                    except OSError as exc:
+                        last_error = exc
+                        time.sleep(0.02)
+                if last_error is not None:
+                    return
             finally:
-                if temporary_path is not None:
-                    temporary_path.unlink(missing_ok=True)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 __all__ = ["StateConflictError", "StateStore"]

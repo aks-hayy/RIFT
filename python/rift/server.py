@@ -403,7 +403,7 @@ class RiftServerRuntime:
             return self.mesh_controller().topology()
         orchestrator = self.orchestrator_factory()
         if path == "/api/rift/v2/plans":
-            return {"api_version": "2", "plans": orchestrator.list_plans()}
+            return {"api_version": "2", **orchestrator.list_plans()}
         if path.startswith("/api/rift/v2/plans/"):
             plan_id = path.rsplit("/", 1)[-1]
             return orchestrator.load_plan_by_id(plan_id)

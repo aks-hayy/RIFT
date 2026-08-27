@@ -65,6 +65,8 @@ def test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mo
     with tempfile.TemporaryDirectory() as tmp:
         model = Path(tmp) / "model"
         model.mkdir()
+        weights = model / "model.safetensors"
+        weights.write_bytes(b"fixture")
         old_vllm_runtime = vllm_mod.container_runtime_detection
         old_sglang_runtime = sglang_mod.container_runtime_detection
         runtime = lambda: {"available": True, "executable": "docker", "runtime": "docker"}
@@ -77,7 +79,7 @@ def test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mo
                 "runtime_mode": "container",
             }
             vllm_plan = vllm.plan_launch(
-                model_path=str(model),
+                model_path=str(weights),
                 host="127.0.0.1",
                 port=18001,
                 context_length=2048,
@@ -85,8 +87,16 @@ def test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mo
                 hardware=CUDA_HARDWARE,
             )
             assert vllm_plan["command"][:5] == ["docker", "run", "--rm", "--gpus", "all"]
-            assert vllm.container_image in vllm_plan["command"]
+            assert vllm_plan["container_image"] == vllm_mod.WINDOWS_V0_CONTAINER_IMAGE
+            assert vllm_plan["container_image"] in vllm_plan["command"]
             assert any(value.endswith(":/models:ro") for value in vllm_plan["command"])
+            image_index = vllm_plan["command"].index(vllm_plan["container_image"])
+            assert vllm_plan["command"][image_index + 1] == "/models"
+            assert "--model" not in vllm_plan["command"]
+            assert ["--env", "VLLM_USE_V1=0"] == vllm_plan["command"][
+                vllm_plan["command"].index("--env") : vllm_plan["command"].index("--env") + 2
+            ]
+            assert vllm_plan["tuning"]["vllm_use_v1"] is False
 
             sglang = sglang_mod.SglangProvider()
             sglang.detect = lambda search_root=None: {
@@ -94,7 +104,7 @@ def test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mo
                 "runtime_mode": "container",
             }
             sglang_plan = sglang.plan_launch(
-                model_path=str(model),
+                model_path=str(weights),
                 host="127.0.0.1",
                 port=18002,
                 context_length=4096,
@@ -132,7 +142,7 @@ def test_vllm_and_sglang_wsl_launch_paths_are_explicit():
             concurrency=1,
             hardware=CUDA_HARDWARE,
         )
-        assert plan["command"][:4] == ["wsl.exe", "--", "/rift/vllm/python", "-m"]
+        assert plan["command"][:6] == ["wsl.exe", "--", "env", "VLLM_USE_V1=0", "/rift/vllm/python", "-m"]
         assert "0.0.0.0" in plan["command"]
 
         sglang = sglang_mod.SglangProvider()
@@ -218,7 +228,10 @@ def test_llama_install_falls_back_when_latest_release_has_only_marker_assets():
 
 class OpenAIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b'{"status":"ok"}'
+        if self.path.endswith("/v1/models"):
+            body = b'{"data":[{"id":"fixture-model"}]}'
+        else:
+            body = b'{"status":"ok"}'
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -226,7 +239,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
-        json.loads(self.rfile.read(length))
+        payload = json.loads(self.rfile.read(length))
+        OpenAIHandler.last_model = payload.get("model")
         body = json.dumps(
             {
                 "choices": [{"message": {"content": "one two three four"}}],
@@ -241,6 +255,8 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         return
+
+    last_model = None
 
 
 def test_openai_health_and_benchmark_contract_for_all_new_adapters():
@@ -260,6 +276,8 @@ def test_openai_health_and_benchmark_contract_for_all_new_adapters():
             )
             assert result["generated_tokens_estimate"] == 4
             assert result["tokens_per_second_estimate"] > 0
+            assert result["model_id"] == "fixture-model"
+            assert OpenAIHandler.last_model == "fixture-model"
     finally:
         server.shutdown()
         server.server_close()

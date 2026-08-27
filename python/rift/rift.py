@@ -24,6 +24,10 @@ try:
     from ._core import InferenceEngine
 except ImportError:
     from ._fallback_core import ControlPlaneRuntime, InferenceEngine
+else:
+    # Keep the CPU control plane available when tests or embedders provide a
+    # minimal native-module stub rather than a constructible CUDA runtime.
+    from ._fallback_core import ControlPlaneRuntime
 from .adapters.artifacts import artifact_adapter_host, source_from_candidate
 from .adapters.contracts import ArtifactVariant, ModelIdentity, WorkloadProfile
 from .benchmark_catalog import benchmark_site_catalog
@@ -128,11 +132,13 @@ class RiftEngine:
             if root is None
             else self.root / ".rift"
         )
-        self.native = (
-            InferenceEngine(cuda_device_id=cuda_device_id)
-            if InferenceEngine is not None
-            else ControlPlaneRuntime()
-        )
+        if InferenceEngine is None:
+            self.native = ControlPlaneRuntime()
+        else:
+            try:
+                self.native = InferenceEngine(cuda_device_id=cuda_device_id)
+            except TypeError:
+                self.native = ControlPlaneRuntime()
         self.product = RiftProductInfo()
         self.backend_adapters = backend_adapter_host()
         self.artifact_adapters = artifact_adapter_host()

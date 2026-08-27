@@ -43,22 +43,42 @@ def test_bundled_dashboard_has_rift_favicon():
 
 def test_rich_dashboard_build_plan_is_detected():
     plan = dashboard.rich_dashboard_plan(ROOT / "ui", port=8766, control_port=8778)
-    # The contributor UI build is optional and is intentionally not committed.
-    # A clean checkout therefore falls back to the packaged dashboard.
     if plan is None:
-        assert not (
+        packaged = dashboard.bundled_rich_dashboard_root()
+        assert shutil.which("node") is None or not (
             (ROOT / "ui" / "scripts" / "serve-dist.mjs").is_file()
             and (ROOT / "ui" / "dist" / "server" / "server.js").is_file()
             and (ROOT / "ui" / "dist" / "client").is_dir()
-            and shutil.which("node")
+        ) or not (
+            (packaged / "scripts" / "serve-dist.mjs").is_file()
+            and (packaged / "dist" / "server" / "server.js").is_file()
+            and (packaged / "dist" / "client").is_dir()
         )
         return
-    assert plan["server_script"].endswith("ui\\scripts\\serve-dist.mjs") or plan[
-        "server_script"
-    ].endswith("ui/scripts/serve-dist.mjs")
-    assert plan["client_root"].endswith("ui\\dist\\client") or plan["client_root"].endswith(
-        "ui/dist/client"
+    assert plan is not None
+    assert plan["server_script"].endswith(
+        (
+            "ui\\scripts\\serve-dist.mjs",
+            "ui/scripts/serve-dist.mjs",
+            "static\\_rich\\scripts\\serve-dist.mjs",
+            "static/_rich/scripts/serve-dist.mjs",
+        )
     )
+    assert plan["client_root"].endswith(
+        (
+            "ui\\dist\\client",
+            "ui/dist/client",
+            "static\\_rich\\dist\\client",
+            "static/_rich/dist/client",
+        )
+    )
+
+
+def test_packaged_rich_dashboard_bundle_is_complete():
+    bundled = dashboard.bundled_rich_dashboard_root()
+    assert (bundled / "scripts" / "serve-dist.mjs").is_file()
+    assert (bundled / "dist" / "server" / "server.js").is_file()
+    assert (bundled / "dist" / "client").is_dir()
 
 
 def test_dashboard_root_environment_override():
@@ -138,6 +158,7 @@ def main():
     test_dashboard_source_discovery_and_launch_plan()
     test_bundled_dashboard_has_rift_favicon()
     test_rich_dashboard_build_plan_is_detected()
+    test_packaged_rich_dashboard_bundle_is_complete()
     test_dashboard_root_environment_override()
     test_dashboard_validation_errors_are_actionable()
     test_bundled_dashboard_proxies_controller_api_requests()

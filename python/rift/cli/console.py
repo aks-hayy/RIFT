@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from typing import Any, Iterable, Sequence
 
 
@@ -39,9 +40,18 @@ def _enable_terminal_color(*, disabled: bool) -> bool:
 class RiftConsole:
     """Render operator-friendly output while preserving a stable JSON mode."""
 
+    _APPLY_PHASES = (
+        ("planning", "Plan deployment"),
+        ("installing", "Prepare backend"),
+        ("downloading", "Materialize model"),
+        ("launching", "Launch service"),
+        ("persisting", "Persist state"),
+    )
+
     def __init__(self, *, json_output: bool = False, no_color: bool = False) -> None:
         self.json_output = bool(json_output)
         self.color = _enable_terminal_color(disabled=no_color)
+        self._progress_line_active = False
 
     def banner(self, command: str) -> None:
         if self.json_output or os.environ.get("RIFT_NO_BANNER") == "1":
@@ -77,6 +87,67 @@ class RiftConsole:
 
     def success(self, message: str) -> None:
         print(f"{self._paint('[ OK ]', '38;5;84;1')} {message}")
+
+    def apply_progress(
+        self,
+        phase: str,
+        status: str,
+        details: JsonDict | None = None,
+    ) -> None:
+        """Render one apply update without affecting structured/JSON output."""
+        if self.json_output:
+            return
+
+        details = details or {}
+        phase_index = next(
+            (index for index, item in enumerate(self._APPLY_PHASES) if item[0] == phase),
+            len(self._APPLY_PHASES) - 1,
+        )
+        phase_label = next(
+            (item[1] for item in self._APPLY_PHASES if item[0] == phase),
+            phase.replace("_", " ").title(),
+        )
+        terminal_statuses = {"complete", "item_complete", "skipped"}
+        if status in terminal_statuses:
+            within_phase = 1.0
+        elif status in {"failed", "blocked"}:
+            within_phase = 1.0
+        else:
+            try:
+                completed = float(details.get("completed") or 0)
+                total = float(details.get("total") or 0)
+                within_phase = completed / total if total > 0 else 0.35
+            except (TypeError, ValueError):
+                within_phase = 0.35
+            within_phase = min(max(within_phase, 0.0), 0.95)
+        fraction = (phase_index + within_phase) / len(self._APPLY_PHASES)
+        percent = int(round(min(max(fraction, 0.0), 1.0) * 100))
+        width = 24
+        filled = int(round(width * percent / 100))
+        bar = self._paint("=" * filled, "38;5;51;1") + self._paint("." * (width - filled), "38;5;27")
+        marker = {
+            "complete": "OK",
+            "item_complete": "OK",
+            "skipped": "SKIP",
+            "failed": "FAIL",
+            "blocked": "BLOCK",
+        }.get(status, "RUN")
+        marker_color = "38;5;203;1" if marker in {"FAIL", "BLOCK"} else "38;5;84;1" if marker == "OK" else "38;5;220;1" if marker == "SKIP" else "38;5;51;1"
+        detail = str(details.get("service") or details.get("backend") or details.get("reason") or "").strip()
+        if details.get("reused"):
+            detail = f"{detail} (cached)" if detail else "cached artifact"
+        line = f"  {self._paint('[' + marker + ']', marker_color)} [{bar}] {percent:3d}% {phase_label}"
+        if detail:
+            line += f"  {self._dim(detail)}"
+        interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if interactive:
+            print("\r" + line, end="", flush=True)
+            self._progress_line_active = True
+            if status in terminal_statuses or status in {"failed", "blocked"} or phase == "complete":
+                print()
+                self._progress_line_active = False
+        else:
+            print(line)
 
     def _render_result(self, payload: Any, *, title: str | None = None) -> None:
         if title:
@@ -208,6 +279,11 @@ class RiftConsole:
                         ("Destination", str(pulled.get("local_dir") or pulled.get("output_dir") or "RIFT model cache")),
                     ]
                 )
+        run_id = str(payload.get("recommendation_run_id") or "").strip()
+        if run_id:
+            print()
+            print(self._dim(f"Recommendation run: {run_id}"))
+            print(self._dim(f"Next: rift plan --recommendation-run {run_id}"))
 
     @staticmethod
     def _evidence_label(item: JsonDict) -> str:
@@ -241,6 +317,85 @@ class RiftConsole:
             self.warning("The plan contains blockers and cannot be applied safely.")
         else:
             self.success("Plan is read-only. Review it before running `rift apply`.")
+
+    def _render_plans(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "Saved deployment plans")
+        plans = payload.get("plans") or []
+        rows = []
+        for index, item in enumerate(plans, 1):
+            created = item.get("created_unix_seconds")
+            try:
+                created_label = time.strftime("%Y-%m-%d %H:%M", time.localtime(float(created)))
+            except (TypeError, ValueError, OverflowError, OSError):
+                created_label = "unknown"
+            rows.append(
+                [
+                    index,
+                    item.get("plan_id") or "unknown",
+                    self._short_model(item.get("model")),
+                    item.get("backend") or "-",
+                    item.get("service_count") or 0,
+                    item.get("blocker_count") or 0,
+                    self._state(item.get("status") or "unknown"),
+                    created_label,
+                ]
+            )
+        self._table(
+            ["#", "PLAN", "MODEL", "BACKEND", "SERVICES", "BLOCKERS", "STATUS", "CREATED"],
+            rows,
+        )
+        if not plans:
+            print(self._dim("No saved plans. Run `rift plan` to create one."))
+        else:
+            print(self._dim("Use `rift apply --plan N` to select a plan without prompting."))
+        if payload.get("root"):
+            print(self._dim(f"Plan directory: {payload['root']}"))
+
+    def _render_plan_clear(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "Saved plans cleared")
+        removed = payload.get("removed") or []
+        skipped = payload.get("skipped") or []
+        self.success(f"Removed {payload.get('removed_count', len(removed))} generated plan artifact(s).")
+        if payload.get("plan_directory"):
+            print(self._dim(f"Plan directory: {payload['plan_directory']}"))
+        if removed:
+            rows = [[item.get("source", "-"), item.get("path", "-")] for item in removed]
+            self._table(["SOURCE", "REMOVED"], rows)
+        if skipped:
+            print()
+            self._bullets("Preserved unrecognized files", skipped)
+            print(self._dim("Models, services, runtime state, logs, and backend installations were not changed."))
+
+    def _render_plan_candidates(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "Choose a model to plan")
+        rows = []
+        candidates = payload.get("candidates") or []
+        for index, item in enumerate(candidates, 1):
+            rows.append(
+                [
+                    index,
+                    item.get("repo_id") or item.get("name") or item.get("path") or "unknown",
+                    item.get("task") or payload.get("task") or "chat",
+                    item.get("format") or "unknown",
+                    item.get("quantization") or "-",
+                    item.get("backend") or "none",
+                    self._bytes(item.get("size_bytes") or item.get("size")),
+                    f"{float(item.get('score') or item.get('final_score') or 0.0):.2f}",
+                    "FIT" if item.get("fits", True) else "BLOCKED",
+                    item.get("evidence") or "ESTIMATED",
+                ]
+            )
+        self._table(
+            ["#", "MODEL", "TASK", "FORMAT", "QUANT", "BACKEND", "SIZE", "SCORE", "FIT", "EVIDENCE"],
+            rows,
+        )
+        for index, item in enumerate(candidates, 1):
+            reasons = [str(reason) for reason in item.get("reasons") or [] if str(reason).strip()]
+            if reasons:
+                print(self._dim(f"{index}. " + " | ".join(reasons[:3])))
+        if candidates:
+            print()
+            print(self._dim("Choose a number, path, repository ID, or artifact ID with --select to skip prompting."))
 
     def _render_apply(self, payload: JsonDict, *, title: str | None = None) -> None:
         self._heading(title or "Apply result")

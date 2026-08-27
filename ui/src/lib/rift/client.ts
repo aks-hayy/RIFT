@@ -1389,7 +1389,7 @@ export const rift = {
       `/v2/plans/${encodeURIComponent(id)}/apply`,
       applyRequest(options.configPath, options, { id, hash: planHash }),
       undefined,
-      30_000,
+      30 * 60 * 1000,
     );
     if (payload.applied === false && !payload.operation_id) {
       throw new RiftApiError(409, `/v2/plans/${encodeURIComponent(id)}/apply`, payload);

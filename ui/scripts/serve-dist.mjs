@@ -1,4 +1,5 @@
 import http from "node:http";
+import https from "node:https";
 import { readFile, stat } from "node:fs/promises";
 import { extname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,13 +67,41 @@ async function proxyController(request, response) {
     const target = new URL(request.url, controlApi);
     const method = request.method || "GET";
     const body = method === "GET" || method === "HEAD" ? undefined : await bodyBuffer(request);
-    const upstream = await fetch(target, {
-        method,
-        headers: requestHeaders(request),
-        body,
-        redirect: "manual",
+    const transport = target.protocol === "https:" ? https : http;
+    const headers = requestHeaders(request);
+    await new Promise((resolvePromise, rejectPromise) => {
+        const upstream = transport.request(
+            {
+                protocol: target.protocol,
+                hostname: target.hostname,
+                port: target.port || undefined,
+                path: `${target.pathname}${target.search}`,
+                method,
+                headers,
+                timeout: 30 * 60 * 1000,
+            },
+            (upstreamResponse) => {
+                response.statusCode = upstreamResponse.statusCode || 502;
+                for (const [name, value] of Object.entries(upstreamResponse.headers)) {
+                    if (
+                        value !== undefined &&
+                        !["transfer-encoding", "connection"].includes(name.toLowerCase())
+                    ) {
+                        response.setHeader(name, value);
+                    }
+                }
+                upstreamResponse.on("error", rejectPromise);
+                upstreamResponse.on("end", resolvePromise);
+                upstreamResponse.pipe(response);
+            },
+        );
+        upstream.on("timeout", () => {
+            upstream.destroy(new Error("RIFT controller request timed out after 30 minutes"));
+        });
+        upstream.on("error", rejectPromise);
+        if (body && body.length > 0) upstream.write(body);
+        upstream.end();
     });
-    await writeResponse(upstream, response);
 }
 
 async function serveAsset(requestPath, response) {
@@ -126,6 +155,8 @@ server.listen(port, host, () => {
     console.log(`RIFT rich dashboard listening on http://${host}:${port}`);
     console.log(`RIFT controller proxy ${controlApi}`);
 });
+server.requestTimeout = 30 * 60 * 1000;
+server.headersTimeout = 30 * 60 * 1000;
 
 function close() {
     server.close(() => process.exit(0));

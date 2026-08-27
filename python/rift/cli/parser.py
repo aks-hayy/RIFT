@@ -140,9 +140,64 @@ def build_parser() -> argparse.ArgumentParser:
         commands,
         "plan",
         "Preview every deployment action without side effects",
-        epilog="Example: rift plan --config rift.yaml",
+        epilog=(
+            "Examples:\n"
+            "  rift plan\n"
+            "  rift plan --huggingface Qwen/Qwen2.5-Coder-7B-Instruct-GGUF\n"
+            "  rift plan --local-model D:\\models\\coder\\model-Q4_K_M.gguf\n"
+            "  rift plan --models-dir D:\\models\n"
+            "  rift plan list\n"
+            "  rift plan clear --yes"
+        ),
+    )
+    plan.add_argument(
+        "plan_action",
+        nargs="?",
+        choices=["list", "clear"],
+        help="List saved plans or clear generated plan artifacts",
     )
     plan.add_argument("--config", default="rift.yaml")
+    plan.add_argument("--task", default="chat", help="Workload used to rank model candidates")
+    plan.add_argument(
+        "--huggingface",
+        "--hf",
+        "--model",
+        dest="huggingface",
+        help="Hugging Face repository ID or https://huggingface.co/... URL",
+    )
+    plan.add_argument(
+        "--local-model",
+        "--local",
+        dest="local_model",
+        help="Path to one local model file or model directory",
+    )
+    plan.add_argument(
+        "--models-dir",
+        "--models",
+        dest="models_dir",
+        help="Directory containing one or more local model artifacts",
+    )
+    plan.add_argument(
+        "--select",
+        help="Candidate number, path, repository ID, or artifact ID; skips the prompt",
+    )
+    plan.add_argument("--revision", default="main", help="Hub revision used with --huggingface")
+    plan.add_argument("--refresh", action="store_true", help="Refresh Hub metadata before planning")
+    plan.add_argument(
+        "--endpoint",
+        default="https://huggingface.co",
+        help="Hugging Face-compatible endpoint used with --huggingface",
+    )
+    plan.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Fail with a selection command instead of reading interactive input",
+    )
+    plan.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm `rift plan clear`; required for destructive plan cleanup",
+    )
     plan.add_argument(
         "--recommendation-run",
         help="Materialize and plan a persisted recommendation run instead of --config",
@@ -156,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--materialized-config",
         help="Optional path for YAML generated from --recommendation-run",
     )
+    plan.add_argument("--limit", type=int, default=50, help="Maximum plans to show with `rift plan list`")
 
     apply = _parser(
         commands,
@@ -163,20 +219,26 @@ def build_parser() -> argparse.ArgumentParser:
         "Apply reviewed intent with explicit permissions",
         epilog=(
             "Examples:\n"
+            "  rift apply\n"
+            "  rift apply --plan 1\n"
             "  rift apply --config rift.yaml\n"
             "  rift apply --allow-download --allow-install --allow-launch\n\n"
-            "Without permission flags RIFT returns blocked actions and changes nothing."
+            "Without permission flags RIFT returns blocked actions and changes nothing. "
+            "Use --config to bypass the saved-plan selector."
         ),
     )
-    apply.add_argument("--config", default="rift.yaml")
-    apply.add_argument(
-        "--plan",
-        help="Saved plan number or plan ID to apply; omit to choose from the saved plan list",
-    )
+    apply.add_argument("--config", help="Explicit YAML config; bypasses saved-plan selection")
+    apply.add_argument("--plan", help="Saved plan number, plan ID, or plan path")
     apply.add_argument(
         "--plan-hash",
         help="Reviewed SHA-256 plan hash; defaults to the selected immutable plan hash",
     )
+    apply.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Require --plan instead of reading interactive input",
+    )
+    apply.add_argument("--limit", type=int, default=50, help="Maximum saved plans to show")
     apply.add_argument("--allow-download", action="store_true")
     apply.add_argument("--allow-install", action="store_true")
     apply.add_argument("--allow-launch", action="store_true")

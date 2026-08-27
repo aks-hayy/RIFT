@@ -386,6 +386,49 @@ def test_recommendation_store_rejects_path_traversal_ids():
             raise AssertionError("path traversal run id was accepted")
 
 
+def test_recommendation_store_lists_existing_pulled_models_with_metrics():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        pulled = root / "models" / "org--model"
+        pulled.mkdir(parents=True)
+        (pulled / "model.gguf").write_bytes(b"fixture")
+        store = recommendations_mod.RecommendationStore(root / ".rift")
+        store.save_recommendation(
+            {
+                "recommendation_run_id": "pulled-run",
+                "task": "coding",
+                "categories": {"best_estimated_fit": {"repo_id": "org/model"}},
+                "recommendations": [
+                    {
+                        "repo_id": "org/model",
+                        "selected_file": "model.gguf",
+                        "format": "gguf",
+                        "quantization": "Q4_K_M",
+                        "backend": "llama.cpp",
+                        "final_score": 0.87,
+                        "evidence": ["fits local VRAM", "published benchmark evidence"],
+                    }
+                ],
+                "pull_best": {
+                    "local_dir": str(pulled.relative_to(Path.cwd()))
+                    if pulled.is_relative_to(Path.cwd())
+                    else str(pulled),
+                    "completed_unix_seconds": 123,
+                },
+            }
+        )
+
+        listed = store.list_pulled_models()
+        assert listed["count"] == 1
+        model = listed["models"][0]
+        assert model["task"] == "coding"
+        assert model["repo_id"] == "org/model"
+        assert model["backend"] == "llama.cpp"
+        assert model["score"] == 0.87
+        assert model["evidence"] == "ESTIMATED"
+        assert Path(model["local_dir"]).resolve() == pulled.resolve()
+
+
 def test_verification_tournament_is_permission_gated_and_records_real_measurement():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -498,6 +541,7 @@ def main():
     test_artifact_adapter_reports_missing_index_shard()
     test_recommendation_runs_are_atomic_and_materialize_deployment_intent()
     test_recommendation_store_rejects_path_traversal_ids()
+    test_recommendation_store_lists_existing_pulled_models_with_metrics()
     test_verification_tournament_is_permission_gated_and_records_real_measurement()
     test_api_v2_exposes_dynamic_adapters_runs_and_compatibility()
     print("RIFT adapter host tests passed")

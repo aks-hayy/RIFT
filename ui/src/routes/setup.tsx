@@ -1689,6 +1689,20 @@ function StepApply({
   const [allowDownload, setAllowDownload] = useState(false);
   const [allowInstall, setAllowInstall] = useState(false);
   const [allowLaunch, setAllowLaunch] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  useEffect(() => {
+    if (!confirming) {
+      setElapsedSeconds(0);
+      return undefined;
+    }
+    const started = Date.now();
+    const timer = window.setInterval(
+      () => setElapsedSeconds(Math.floor((Date.now() - started) / 1000)),
+      1000,
+    );
+    return () => window.clearInterval(timer);
+  }, [confirming]);
 
   const needs = (group: Plan["actions"][number]["group"]) =>
     Boolean(plan?.actions.some((action) => action.group === group));
@@ -1781,9 +1795,21 @@ function StepApply({
             Apply plan
           </button>
           <span className="rift-mono text-[11.5px] text-ink-secondary">
-            You can restrict future applies with a policy in Settings → Policies.
+            {confirming
+              ? `Controller is applying the plan… ${elapsedSeconds}s elapsed. Large model downloads may take several minutes.`
+              : "You can restrict future applies with a policy in Settings → Policies."}
           </span>
         </div>
+        {confirming && (
+          <div className="mt-4" role="status" aria-live="polite">
+            <div className="h-1.5 overflow-hidden rounded-[2px] bg-muted">
+              <div className="h-full w-1/3 animate-pulse bg-primary" />
+            </div>
+            <p className="mt-2 rift-mono text-[11px] text-ink-secondary">
+              Download, backend setup, launch, and health checks run in the controller.
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );
