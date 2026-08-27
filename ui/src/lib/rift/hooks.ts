@@ -7,6 +7,7 @@ import type {
   Incident,
   Plan,
   DeploymentRevision,
+  DeploymentRecord,
   Benchmark,
   ModelRecommendation,
   UseCase,
@@ -14,6 +15,9 @@ import type {
   MeshNode,
   MeshSighting,
   MeshTopology,
+  OperationRecord,
+  SettingsSnapshot,
+  EvaluationRun,
 } from "./types";
 
 export const keys = {
@@ -24,16 +28,20 @@ export const keys = {
   meshNodes: ["rift", "mesh", "nodes"] as const,
   meshTopology: ["rift", "mesh", "topology"] as const,
   services: ["rift", "services"] as const,
+  deploymentRecords: ["rift", "deployment-records"] as const,
   service: (id: string) => ["rift", "service", id] as const,
   revisions: (id: string) => ["rift", "revisions", id] as const,
   benchmarks: (id: string) => ["rift", "benchmarks", id] as const,
   incidents: ["rift", "incidents"] as const,
   timeline: ["rift", "timeline"] as const,
-  logs: ["rift", "logs"] as const,
+  logs: (service = "chat") => ["rift", "logs", service] as const,
   backends: ["rift", "backends"] as const,
   reports: ["rift", "reports"] as const,
   latestPlan: ["rift", "latest-plan"] as const,
   plan: (id: string) => ["rift", "plan", id] as const,
+  settings: ["rift", "settings"] as const,
+  evaluations: (id: string) => ["rift", "evaluations", id] as const,
+  operations: ["rift", "operations"] as const,
 };
 
 /** Wrap a Query hook so callers can render `unavailable` states cleanly. */
@@ -130,6 +138,18 @@ export function useMeshTopology() {
 export function useServices() {
   return shape(useQuery(servicesOptions));
 }
+
+export function useDeploymentRecords() {
+  return shape(
+    useQuery<DeploymentRecord[]>({
+      queryKey: keys.deploymentRecords,
+      queryFn: ({ signal }) => rift.listDeploymentRecords(signal),
+      staleTime: 2_000,
+      refetchInterval: 5_000,
+      retry: false,
+    }),
+  );
+}
 export function useIncidents() {
   return shape(useQuery(incidentsOptions));
 }
@@ -146,11 +166,11 @@ export function useTimeline() {
   );
 }
 
-export function useLogs() {
+export function useLogs(service = "chat") {
   return shape(
     useQuery({
-      queryKey: keys.logs,
-      queryFn: ({ signal }) => rift.logs(signal),
+      queryKey: keys.logs(service),
+      queryFn: ({ signal }) => rift.logs(signal, service),
       staleTime: 3_000,
       refetchInterval: 10_000,
       retry: false,
@@ -170,12 +190,25 @@ export function useBackends() {
   );
 }
 
+export function useSettings() {
+  return shape(
+    useQuery<SettingsSnapshot>({
+      queryKey: keys.settings,
+      queryFn: ({ signal }) => rift.settings(signal),
+      staleTime: 10_000,
+      refetchInterval: 30_000,
+      retry: false,
+    }),
+  );
+}
+
 export function useReports() {
   return shape(
     useQuery({
       queryKey: keys.reports,
       queryFn: ({ signal }) => rift.reports(signal),
-      staleTime: 15_000,
+      staleTime: 5_000,
+      refetchInterval: 5_000,
       retry: false,
     }),
   );
@@ -236,11 +269,37 @@ export function useBenchmarks(serviceId: string | undefined) {
   );
 }
 
+export function useEvaluations(serviceId: string | undefined) {
+  return shape(
+    useQuery<EvaluationRun[]>({
+      queryKey: serviceId ? keys.evaluations(serviceId) : ["rift", "evaluations", "none"],
+      queryFn: () => rift.listEvaluations(serviceId),
+      enabled: !!serviceId,
+      staleTime: 5_000,
+      refetchInterval: 15_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useOperations() {
+  return shape(
+    useQuery<OperationRecord[]>({
+      queryKey: keys.operations,
+      queryFn: ({ signal }) => rift.listOperations(signal),
+      staleTime: 500,
+      refetchInterval: 1_000,
+      retry: false,
+    }),
+  );
+}
+
 export type RecommendInput = {
   useCase: UseCase;
   source: ModelArtifact["source"];
   localPath?: string;
   endpointUrl?: string;
+  modelRef?: string;
 };
 
 export function recommendationKey(input: RecommendInput) {

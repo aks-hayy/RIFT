@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+import os
 from pathlib import Path
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any
@@ -198,18 +200,14 @@ class StateStore:
                 "revision": revision,
             }
             # The controller and dashboard can share one RIFT_HOME on Windows.
-            # A fixed temporary filename lets their mirror writes overwrite one
-            # another and can make os.replace fail while the other process is
-            # still holding the target. The mirror is diagnostic compatibility
-            # state, so retry it briefly and never make the SQLite authority
-            # unreadable because this best-effort copy lost a race.
-            temporary = self.legacy_path.with_suffix(
-                f".{uuid.uuid4().hex}.tmp"
-            )
-            temporary.write_text(
-                json.dumps(mirror, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            # Use a unique temporary file, flush it durably, and retry the
+            # diagnostic mirror briefly when another process is replacing it.
+            temporary = self.legacy_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             try:
+                with temporary.open("w", encoding="utf-8") as handle:
+                    handle.write(json.dumps(mirror, indent=2, sort_keys=True))
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 last_error: OSError | None = None
                 for _ in range(5):
                     try:

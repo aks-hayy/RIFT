@@ -24,6 +24,10 @@ try:
     from ._core import InferenceEngine
 except ImportError:
     from ._fallback_core import ControlPlaneRuntime, InferenceEngine
+else:
+    # Keep the CPU control plane available when tests or embedders provide a
+    # minimal native-module stub rather than a constructible CUDA runtime.
+    from ._fallback_core import ControlPlaneRuntime
 from .adapters.artifacts import artifact_adapter_host, source_from_candidate
 from .adapters.contracts import ArtifactVariant, ModelIdentity, WorkloadProfile
 from .benchmark_catalog import benchmark_site_catalog
@@ -128,11 +132,13 @@ class RiftEngine:
             if root is None
             else self.root / ".rift"
         )
-        self.native = (
-            InferenceEngine(cuda_device_id=cuda_device_id)
-            if InferenceEngine is not None
-            else ControlPlaneRuntime()
-        )
+        if InferenceEngine is None:
+            self.native = ControlPlaneRuntime()
+        else:
+            try:
+                self.native = InferenceEngine(cuda_device_id=cuda_device_id)
+            except TypeError:
+                self.native = ControlPlaneRuntime()
         self.product = RiftProductInfo()
         self.backend_adapters = backend_adapter_host()
         self.artifact_adapters = artifact_adapter_host()
@@ -427,9 +433,94 @@ class RiftEngine:
         }
 
     def inspect_model(self, model_path: str, **kwargs: Any) -> dict[str, Any]:
-        report = dict(self.native.inspect_model(model_path=model_path, **kwargs))
+        native_inspect = getattr(self.native, "inspect_model", None)
+        if callable(native_inspect):
+            report = dict(native_inspect(model_path=model_path, **kwargs))
+        else:
+            # Test doubles and older optional native builds may expose the
+            # module-level inspection function without attaching it to the
+            # runtime object. Prefer that ABI before using the portable
+            # control-plane inspection path.
+            report = None
+            try:
+                native_module = importlib.import_module(f"{__package__}._core")
+
+                module_inspect = getattr(native_module, "inspect_model", None)
+                if callable(module_inspect):
+                    try:
+                        report = dict(module_inspect(model_path=model_path, **kwargs))
+                    except (AttributeError, RuntimeError, NotImplementedError):
+                        report = None
+            except ImportError:
+                report = None
+            if report is None:
+                report = self._portable_inspection_report(model_path)
         self._annotate_inspection(report)
         return report
+
+    def _portable_inspection_report(self, model_path: str) -> dict[str, Any]:
+        """Inspect an artifact without requiring the optional native module."""
+
+        model_dir = Path(model_path).expanduser().resolve()
+        advice = self.compatibility_advice(str(model_dir))
+        files = (
+            [model_dir]
+            if model_dir.is_file()
+            else [item for item in model_dir.rglob("*") if item.is_file()]
+        )
+        model_files = [
+            item
+            for item in files
+            if item.suffix.lower() in {".gguf", ".safetensors", ".bin", ".pt", ".pth"}
+        ]
+        config: dict[str, Any] = {}
+        config_path = model_dir.parent / "config.json" if model_dir.is_file() else model_dir / "config.json"
+        if config_path.is_file():
+            try:
+                loaded = json.loads(config_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    config = loaded
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                config = {}
+        config.update(
+            {
+                "model_type": advice.get("model_type") or config.get("model_type", "unknown"),
+                "family": advice.get("family", "UNKNOWN"),
+                "quantization": advice.get("quant_method", "unknown"),
+            }
+        )
+        model_bytes = sum(int(item.stat().st_size) for item in model_files)
+        max_file_bytes = max(
+            (int(item.stat().st_size) for item in model_files),
+            default=0,
+        )
+        return {
+            "model_path": str(model_dir),
+            "config": config,
+            "topology": {
+                "total_model_bytes": model_bytes,
+                "w_max_bytes": max_file_bytes,
+                "source": "portable_file_inventory",
+            },
+            "profile": {
+                "supported": True,
+                "source": "portable_control_plane",
+                "hardware": self.hardware_profile(),
+            },
+            "execution_policy": {
+                "supported": advice.get("support_level") != "UNSUPPORTED",
+                "mode": "external_backend",
+                "source": "backend_adapter_contract",
+            },
+            "generation_readiness": {
+                "ready": False,
+                "issues": [
+                    "optional native model execution is unavailable; use a serving backend adapter"
+                ],
+                "output_head_mode": "EXTERNAL_BACKEND_REQUIRED",
+            },
+            "compatibility_advice": advice,
+        }
 
     def load_model(self, model_path: str, **kwargs: Any) -> dict[str, Any]:
         report = dict(self.native.load_model(model_path=model_path, **kwargs))
@@ -1041,6 +1132,7 @@ class RiftEngine:
         persist_run: bool = True,
         simulated_hardware: str | dict[str, Any] | None = None,
         benchmark_snapshots: Optional[Iterable[str | Path]] = None,
+        model_ref: Optional[str] = None,
     ) -> dict[str, Any]:
         if top <= 0:
             raise ValueError("top must be positive")
@@ -1093,7 +1185,24 @@ class RiftEngine:
             50,
             max(10, math.ceil(candidate_limit / max(1, len(arms))) * 2),
         )
-        for arm in arms:
+        if model_ref:
+            reference = str(model_ref).strip().strip("/")
+            reference = re.sub(r"^https?://[^/]+/", "", reference, flags=re.IGNORECASE)
+            reference = reference.split("?", 1)[0].split("#", 1)[0].strip("/")
+            if not reference or "/" not in reference or " " in reference:
+                raise ValueError("model_ref must be a Hugging Face repository id such as org/model")
+            try:
+                model = client.model_info(
+                    reference,
+                    refresh=refresh,
+                    expand=("siblings", "config", "tags", "cardData", "downloads", "likes", "lastModified"),
+                )
+            except Exception as exc:
+                raise ValueError(f"Hugging Face repository could not be inspected: {exc}") from exc
+            repo_id = self._hub_repo_id(model) or reference
+            raw_candidates[repo_id] = {**model, "id": repo_id, "modelId": repo_id}
+
+        for arm in ([] if model_ref else arms):
             try:
                 models = client.search_models(
                     search=arm.get("search"),

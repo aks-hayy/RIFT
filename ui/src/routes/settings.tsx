@@ -5,11 +5,11 @@ import { PageHeader, Panel, KV, SourceBadge, StatDot } from "@/components/rift/p
 import { Unavailable } from "@/components/rift/unavailable";
 import { cn } from "@/lib/utils";
 import { rift } from "@/lib/rift/client";
-import { useBackends } from "@/lib/rift/hooks";
+import { useBackends, useHealth, useSettings } from "@/lib/rift/hooks";
 
 const searchSchema = z.object({
   tab: z
-    .enum(["controller", "sources", "security", "policies", "users", "integrations"])
+    .enum(["controller", "sources", "security", "policies", "integrations"])
     .catch("controller"),
 });
 
@@ -20,12 +20,12 @@ export const Route = createFileRoute("/settings")({
       { title: "Settings — RIFT" },
       {
         name: "description",
-        content: "Controller, sources, security, policies, users, integrations.",
+        content: "Controller, sources, security, policies, and integrations.",
       },
       { property: "og:title", content: "Settings — RIFT" },
       {
         property: "og:description",
-        content: "Controller, sources, security, policies, users, integrations.",
+        content: "Controller, sources, security, policies, and integrations.",
       },
     ],
   }),
@@ -37,7 +37,6 @@ const TABS = [
   { id: "sources", label: "Model sources" },
   { id: "security", label: "Security" },
   { id: "policies", label: "Policies" },
-  { id: "users", label: "Users" },
   { id: "integrations", label: "Integrations" },
 ] as const;
 
@@ -68,21 +67,9 @@ function SettingsPage() {
 
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
         {tab === "controller" && <ControllerTab />}
-        {tab === "sources" && <SourcesPreview />}
+        {tab === "sources" && <SourcesTab />}
         {tab === "security" && <SecurityTab />}
-        {tab === "policies" && (
-          <Unavailable
-            endpoint="/v1/settings/policies"
-            resource="Policy[] { id, scope, requiresConfirmation, allowedActions }"
-            hint="Policies replace multi-checkbox permission prompts with reusable rules."
-          />
-        )}
-        {tab === "users" && (
-          <Unavailable
-            endpoint="/v1/settings/users"
-            resource="User[] { email, role, lastActiveAt }"
-          />
-        )}
+        {tab === "policies" && <PoliciesTab />}
         {tab === "integrations" && <BackendIntegrations />}
       </div>
     </AppShell>
@@ -91,15 +78,20 @@ function SettingsPage() {
 
 function ControllerTab() {
   const connection = rift.connectionInfo();
+  const { data: health, unavailable, error, isLoading } = useHealth();
+  const controllerStatus =
+    unavailable || error ? "unavailable" : isLoading ? "checking" : health ? "live" : "unknown";
   return (
     <Panel title="Controller" aside={<SourceBadge source="live" />}>
-      <div className="grid sm:grid-cols-3 gap-4">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <KV label="Status" value={controllerStatus} />
         <KV label="URL" value={connection.root} />
-        <KV label="Adapter" value={connection.mode} />
+        <KV label="Compatibility" value="live compatibility adapter" />
         <KV label="Preview surfaces" value={connection.previewEnabled ? "enabled" : "disabled"} />
       </div>
-      <p className="mt-4 text-[12.5px] text-ink-secondary max-w-2xl">
-        The console uses the live legacy controller through a typed compatibility adapter. Set{" "}
+      <p className="mt-4 max-w-2xl text-[12.5px] text-ink-secondary">
+        This dashboard is connected to the live controller. The compatibility adapter translates the
+        current controller API into the dashboard contract; preview surfaces are disabled. Set{" "}
         <span className="rift-mono text-ink">VITE_RIFT_CONTROLLER_URL</span> only when the
         controller is not available through the same-origin proxy.
       </p>
@@ -107,39 +99,65 @@ function ControllerTab() {
   );
 }
 
-function SourcesPreview() {
+function SourcesTab() {
+  const { data, unavailable, error } = useSettings();
+  if (unavailable || error) {
+    return (
+      <Unavailable
+        endpoint="/v2/settings"
+        resource="SettingsSnapshot { modelSources, gateway, services, policies, mesh }"
+        reason={unavailable?.detail ?? error?.message}
+      />
+    );
+  }
+  const sources = Array.isArray(data?.modelSources.sources) ? data.modelSources.sources : [];
   return (
-    <Panel
-      title="Model sources / contract preview"
-      aside={<SourceBadge source="preview" />}
-      bodyClassName="p-0"
-    >
-      <div className="border-b border-border bg-attention/5 px-4 py-2 text-[11.5px] text-ink-secondary">
-        These rows demonstrate the future source registry. Credentials and verification are not
-        wired yet.
-      </div>
-      <ul className="divide-y divide-border text-[13px]">
-        <li className="flex items-center gap-3 px-4 py-3">
-          <StatDot tone="info" />
-          <span className="font-medium text-ink">Hugging Face Hub</span>
-          <span className="rift-mono text-[11px] text-ink-secondary">https://huggingface.co</span>
-          <span className="ml-auto rift-mono text-[11px] text-attention">preview</span>
-        </li>
-        <li className="flex items-center gap-3 px-4 py-3">
-          <StatDot tone="info" />
-          <span className="font-medium text-ink">Local model directory</span>
-          <span className="rift-mono text-[11px] text-ink-secondary">.rift/models</span>
-          <span className="ml-auto rift-mono text-[11px] text-attention">preview</span>
-        </li>
-      </ul>
+    <Panel title="Model sources" aside={<SourceBadge source="live" />} bodyClassName="p-0">
+      {sources.length === 0 ? (
+        <div className="p-4 text-[13px] text-ink-secondary">No model sources are configured.</div>
+      ) : (
+        <ul className="divide-y divide-border text-[13px]">
+          {sources.map((entry, index) => {
+            const source = asRecord(entry);
+            const ready = String(source.status ?? "unknown") === "ready";
+            return (
+              <li
+                key={String(source.id ?? index)}
+                className="flex flex-wrap items-center gap-3 px-4 py-3"
+              >
+                <StatDot tone={ready ? "ok" : "muted"} />
+                <span className="font-medium text-ink">{String(source.id ?? "source")}</span>
+                <span className="rift-mono text-[11px] text-ink-secondary break-all">
+                  {String(source.endpoint ?? source.path ?? "not specified")}
+                </span>
+                <span className="ml-auto rift-mono text-[11px] text-ink-secondary">
+                  {String(source.status ?? "unknown")}
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </Panel>
   );
 }
 
 function BackendIntegrations() {
-  const { data, unavailable } = useBackends();
-  if (unavailable)
-    return <Unavailable endpoint="/backends" resource="Backend provider detection" />;
+  const { data, unavailable, error, isLoading } = useBackends();
+  if (unavailable || error)
+    return (
+      <Unavailable
+        endpoint="/backends"
+        resource="Backend provider detection"
+        reason={unavailable?.detail ?? error?.message}
+      />
+    );
+  if (isLoading)
+    return (
+      <Panel title="Backend integrations" aside={<SourceBadge source="live" />}>
+        <p className="text-[13px] text-ink-secondary">Loading backend providers...</p>
+      </Panel>
+    );
   const providers =
     data?.providers && typeof data.providers === "object"
       ? Object.entries(data.providers as Record<string, unknown>)
@@ -158,32 +176,41 @@ function BackendIntegrations() {
             </tr>
           </thead>
           <tbody>
-            {providers.map(([name, value]) => {
-              const provider = asRecord(value);
-              const detection = asRecord(provider.detection);
-              const gate = asRecord(provider.lifecycle_gate);
-              const available = detection.available === true;
-              return (
-                <tr key={name} className="border-b border-border last:border-0">
-                  <td className="px-4 py-3 font-medium text-ink">{name}</td>
-                  <td className="px-4">
-                    <span className="inline-flex items-center gap-2">
-                      <StatDot tone={available ? "ok" : "muted"} />
-                      {available ? "yes" : "no"}
-                    </span>
-                  </td>
-                  <td className="px-4 rift-mono text-[11px] text-ink-secondary">
-                    {String(detection.version ?? "--")}
-                  </td>
-                  <td className="px-4 rift-mono text-[11px]">
-                    {String(detection.license ?? "unknown")}
-                  </td>
-                  <td className="px-4 rift-mono text-[11px] text-ink-secondary">
-                    {String(gate.advertised_status ?? "unknown")}
-                  </td>
-                </tr>
-              );
-            })}
+            {providers.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="px-4 py-10 text-center text-[13px] text-ink-secondary">
+                  The live controller returned no backend providers.
+                </td>
+              </tr>
+            ) : (
+              providers.map(([name, value]) => {
+                const provider = asRecord(value);
+                const detection = asRecord(provider.detection);
+                const gate = asRecord(provider.lifecycle_gate);
+                const manifest = asRecord(provider.manifest);
+                const available = detection.available === true;
+                return (
+                  <tr key={name} className="border-b border-border last:border-0">
+                    <td className="px-4 py-3 font-medium text-ink">{name}</td>
+                    <td className="px-4">
+                      <span className="inline-flex items-center gap-2">
+                        <StatDot tone={available ? "ok" : "muted"} />
+                        {available ? "yes" : "no"}
+                      </span>
+                    </td>
+                    <td className="px-4 rift-mono text-[11px] text-ink-secondary">
+                      {String(detection.version ?? "not detected")}
+                    </td>
+                    <td className="px-4 rift-mono text-[11px]">
+                      {String(detection.license ?? manifest.license ?? "unknown")}
+                    </td>
+                    <td className="px-4 rift-mono text-[11px] text-ink-secondary">
+                      {String(gate.advertised_status ?? "unknown")}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
           </tbody>
         </table>
       </div>
@@ -198,22 +225,112 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function SecurityTab() {
+  const { data, unavailable, error } = useSettings();
+  if (unavailable || error) {
+    return (
+      <Unavailable
+        endpoint="/v2/settings"
+        resource="SettingsSnapshot { gateway, mesh, policies }"
+        reason={unavailable?.detail ?? error?.message}
+      />
+    );
+  }
+  const gateway = data?.gateway ?? {};
+  const mesh = data?.mesh ?? {};
+  const securityWarnings = Array.isArray(gateway.security_warnings)
+    ? gateway.security_warnings.map(String)
+    : [];
+  const corsOrigins = Array.isArray(gateway.cors_origins) ? gateway.cors_origins.map(String) : [];
   return (
     <div className="grid gap-4">
-      <Panel title="Enrollment tokens">
-        <Unavailable
-          endpoint="/v1/settings/tokens"
-          resource="EnrollmentToken[] { token (redacted), expiresAt, createdBy, usedAt? }"
-          hint="Tokens are one-time and expire. Never revealed after creation."
-        />
+      {securityWarnings.length === 0 && (
+        <div className="border border-ok/40 bg-ok/5 px-4 py-3 text-[12.5px] text-ink-secondary">
+          No active exposure warnings. The gateway is not running, is loopback-bound, and has no
+          configured CORS origins.
+        </div>
+      )}
+      {securityWarnings.length > 0 && (
+        <div
+          className="border-2 border-error/60 bg-error/10 px-4 py-4 text-[13px] text-error"
+          role="alert"
+        >
+          <div className="rift-label text-error">Security warnings require operator attention</div>
+          <ul className="mt-2 grid gap-1 list-disc pl-4">
+            {securityWarnings.map((warning) => (
+              <li key={warning}>{warning}</li>
+            ))}
+          </ul>
+          <p className="mt-3 text-[12px] text-error/90">
+            Restrict the gateway to loopback or configure trusted origins and API keys before
+            exposing it to a network.
+          </p>
+        </div>
+      )}
+      <Panel title="Gateway and credentials" aside={<SourceBadge source="live" />}>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <KV label="Gateway" value={String(gateway.status ?? "not_started")} />
+          <KV label="Process" value={gateway.process_alive === true ? "alive" : "not running"} />
+          <KV label="Stored key records" value={String(gateway.key_count ?? 0)} />
+          <KV
+            label="API-key protection"
+            value={String(gateway.api_key_protection ?? "not reported")}
+          />
+          <KV label="Bound host" value={String(gateway.bound_host ?? "not reported")} />
+          <KV
+            label="CORS origins"
+            value={corsOrigins.length ? corsOrigins.join(", ") : "none configured"}
+          />
+        </div>
+        <p className="mt-4 text-[12px] text-ink-secondary">
+          Secret values are never returned to the dashboard. Create or rotate keys through an
+          explicit operator action.
+        </p>
       </Panel>
-      <Panel title="Service API keys">
-        <Unavailable
-          endpoint="/v1/settings/api-keys"
-          resource="ApiKey[] { id, label, prefix, createdAt, lastUsedAt }"
-          hint="Only the key prefix is stored; the full value is shown once at creation and never again."
-        />
+      <Panel title="Mesh trust" aside={<SourceBadge source="live" />}>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <KV label="Controller" value={String(mesh.controller_id ?? "not initialized")} />
+          <KV label="Managed nodes" value={String(mesh.managed_nodes ?? 0)} />
+          <KV
+            label="Enrollment"
+            value={String(asRecord(mesh.enrollment_window).open === true ? "open" : "closed")}
+          />
+        </div>
       </Panel>
     </div>
+  );
+}
+
+function PoliciesTab() {
+  const { data, unavailable, error } = useSettings();
+  if (unavailable || error) {
+    return (
+      <Unavailable
+        endpoint="/v2/settings"
+        resource="SettingsSnapshot { policies, services }"
+        reason={unavailable?.detail ?? error?.message}
+      />
+    );
+  }
+  const policies = data?.policies ?? {};
+  return (
+    <Panel title="Effective policy" aside={<SourceBadge source="live" />}>
+      {Object.keys(policies).length === 0 ? (
+        <p className="text-[13px] text-ink-secondary">
+          The live controller returned no effective policies.
+        </p>
+      ) : (
+        <div className="grid gap-3 text-[13px]">
+          {Object.entries(policies).map(([key, value]) => (
+            <div
+              key={key}
+              className="flex flex-wrap items-center justify-between gap-3 border-b border-border pb-2 last:border-0"
+            >
+              <span className="text-ink-secondary">{key.replaceAll("_", " ")}</span>
+              <span className="rift-mono text-ink">{String(value)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
   );
 }

@@ -3,11 +3,29 @@ import { z } from "zod";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, StatDot, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
-import { useService, useRevisions, useBenchmarks, useLogs } from "@/lib/rift/hooks";
+import {
+  useService,
+  useRevisions,
+  useBenchmarks,
+  useEvaluations,
+  useLogs,
+  useReports,
+} from "@/lib/rift/hooks";
 import { rift } from "@/lib/rift/client";
 import { bytes, relativeTime } from "@/lib/rift/format";
 import { cn } from "@/lib/utils";
-import { Copy, Gauge, Loader2, RotateCcw, Send, SlidersHorizontal, Trash2 } from "lucide-react";
+import {
+  CheckCircle2,
+  Copy,
+  Gauge,
+  Loader2,
+  RotateCcw,
+  Send,
+  ShieldCheck,
+  SlidersHorizontal,
+  Trash2,
+  XCircle,
+} from "lucide-react";
 import { useState } from "react";
 import type { Service } from "@/lib/rift/types";
 
@@ -41,7 +59,7 @@ function DeploymentDetail() {
   const { id } = Route.useParams();
   const { tab } = Route.useSearch();
   const navigate = useNavigate({ from: "/deployments/$id" });
-  const { data: service, unavailable } = useService(id);
+  const { data: service, unavailable, error, isLoading, refetch } = useService(id);
 
   return (
     <AppShell>
@@ -87,10 +105,33 @@ function DeploymentDetail() {
         </div>
       </div>
 
-      <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
-        {unavailable && <Unavailable endpoint={`/v1/services/${id}`} resource="Service" />}
+      <div className="max-w-[1400px] mx-auto min-w-0 px-4 py-6 grid gap-4">
+        {unavailable && <Unavailable endpoint="/services" resource="Service" />}
+        {isLoading && !service && (
+          <Panel title="Live deployment state">
+            <div className="flex items-center gap-2 text-[13px] text-ink-secondary" role="status">
+              <Loader2 className="size-4 animate-spin" aria-hidden />
+              Reading live service state...
+            </div>
+          </Panel>
+        )}
+        {error && !service && (
+          <Panel title="Live deployment state">
+            <div className="text-[13px] text-error" role="alert">
+              The controller could not return this deployment: {error.message}
+            </div>
+          </Panel>
+        )}
         {service && (
-          <ServiceActions service={service} onDeleted={() => navigate({ to: "/deployments" })} />
+          <ServiceActions
+            service={service}
+            onChanged={() => {
+              refetch();
+              window.setTimeout(refetch, 3_000);
+              window.setTimeout(refetch, 12_000);
+            }}
+            onDeleted={() => navigate({ to: "/deployments" })}
+          />
         )}
         {service && tab === "overview" && <OverviewTab s={service} />}
         {service && tab === "playground" && <PlaygroundTab s={service} />}
@@ -103,12 +144,21 @@ function DeploymentDetail() {
   );
 }
 
-function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: () => void }) {
+function ServiceActions({
+  service,
+  onChanged,
+  onDeleted,
+}: {
+  service: Service;
+  onChanged: () => void;
+  onDeleted: () => void;
+}) {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmTune, setConfirmTune] = useState(false);
+  const [confirmRestart, setConfirmRestart] = useState(false);
   const [confirmRecover, setConfirmRecover] = useState(false);
 
   const run = async (action: string, task: () => Promise<unknown>) => {
@@ -122,14 +172,18 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
       setMessage(
         typeof payload.reason === "string"
           ? payload.reason
-          : `${action} completed; refresh the live service state for details.`,
+          : ["restart", "recover"].includes(action)
+            ? `${action} completed; verifying service health.`
+            : `${action} completed; refresh the live service state for details.`,
       );
+      onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(null);
       setConfirmDelete(false);
       setConfirmTune(false);
+      setConfirmRestart(false);
       setConfirmRecover(false);
     }
   };
@@ -159,6 +213,44 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
         >
           <SlidersHorizontal className="size-3.5" /> Tune plan
         </button>
+        {confirmRestart ? (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => run("restart", () => rift.restartService(service.name))}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-attention text-ink text-[12px] font-medium disabled:opacity-50"
+          >
+            <RotateCcw className="size-3.5" /> Confirm restart
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => setConfirmRestart(true)}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-border text-[12px] hover:bg-muted disabled:opacity-50"
+          >
+            <RotateCcw className="size-3.5" /> Restart
+          </button>
+        )}
+        {confirmRecover ? (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => run("recover", () => rift.recoverService(service.name))}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-secondary text-white text-[12px] font-medium disabled:opacity-50"
+          >
+            <ShieldCheck className="size-3.5" /> Confirm recover
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => setConfirmRecover(true)}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] border border-border text-[12px] hover:bg-muted disabled:opacity-50"
+          >
+            <ShieldCheck className="size-3.5" /> Recover
+          </button>
+        )}
         {confirmTune ? (
           <button
             type="button"
@@ -232,7 +324,7 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
           </button>
         )}
       </div>
-      {(message || error || confirmTune || confirmRecover || confirmDelete) && (
+      {(message || error || confirmTune || confirmDelete || confirmRestart || confirmRecover) && (
         <div
           className="mt-2 rift-mono text-[11px] text-ink-secondary"
           role={error ? "alert" : undefined}
@@ -241,9 +333,11 @@ function ServiceActions({ service, onDeleted }: { service: Service; onDeleted: (
             message ??
             (confirmTune
               ? "Live tuning will restart the backend between candidates."
-              : confirmRecover
-                ? "Recovery will relaunch the last-known-good backend plan."
-                : "Deletion stops the service and removes its RIFT-managed state; model files are retained.")}
+              : confirmRestart
+                ? "Restart stops and relaunches the selected service using its current launch plan."
+                : confirmRecover
+                  ? "Recovery may relaunch the service using its last-known-good launch plan."
+                  : "Deletion stops the service and removes its RIFT-managed state; model files are retained.")}
         </div>
       )}
     </section>
@@ -392,46 +486,307 @@ function PlaygroundTab({ s }: { s: Service }) {
 }
 
 function PerformanceTab({ s }: { s: Service }) {
-  const { data, unavailable } = useBenchmarks(s.id);
-  if (unavailable)
-    return <Unavailable endpoint={`/v1/services/${s.id}/benchmarks`} resource="Benchmark[]" />;
+  const { data, unavailable, refetch } = useBenchmarks(s.id);
+  const evaluations = useEvaluations(s.name);
+  const reports = useReports();
+  const [benchmarkPrompt, setBenchmarkPrompt] = useState(
+    "Explain one practical benefit of local LLM inference in two sentences.",
+  );
+  const [benchmarkMaxTokens, setBenchmarkMaxTokens] = useState(48);
+  const [benchmarkWarmups, setBenchmarkWarmups] = useState(1);
+  const [benchmarkRepetitions, setBenchmarkRepetitions] = useState(3);
+  const [benchmarkConcurrency, setBenchmarkConcurrency] = useState(1);
+  const [benchmarkBusy, setBenchmarkBusy] = useState(false);
+  const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
+  const [evaluationBusy, setEvaluationBusy] = useState(false);
+  const [evaluationError, setEvaluationError] = useState<string | null>(null);
+  const latestEvaluation = evaluations.data?.[0];
+  const latestTuning = (Array.isArray(reports.data?.reports) ? reports.data.reports : [])
+    .map((value) => {
+      const entry = asRecord(value);
+      return {
+        created: Number(entry.created_unix_seconds ?? 0),
+        report: asRecord(entry.summary),
+      };
+    })
+    .filter(({ report }) => {
+      return String(report.service ?? "") === s.name && "winning_config" in report;
+    })
+    .sort((left, right) => right.created - left.created)[0]?.report;
+  const runEvaluation = async () => {
+    setEvaluationBusy(true);
+    setEvaluationError(null);
+    try {
+      await rift.evaluateService(s.name);
+      evaluations.refetch();
+    } catch (error) {
+      setEvaluationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setEvaluationBusy(false);
+    }
+  };
+  const runBenchmark = async () => {
+    setBenchmarkBusy(true);
+    setBenchmarkError(null);
+    try {
+      await rift.benchmarkSuite(s.name, {
+        prompt: benchmarkPrompt,
+        maxTokens: Math.min(128, Math.max(1, benchmarkMaxTokens)),
+        warmups: Math.max(0, benchmarkWarmups),
+        repetitions: Math.max(1, benchmarkRepetitions),
+        concurrency: Math.max(1, benchmarkConcurrency),
+      });
+      refetch();
+    } catch (error) {
+      setBenchmarkError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBenchmarkBusy(false);
+    }
+  };
+  if (unavailable) return <Unavailable endpoint="/reports" resource="Benchmark[]" />;
   const rows = data ?? [];
   return (
-    <Panel title="Benchmarks" bodyClassName="p-0">
-      {rows.length === 0 ? (
-        <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
-          No benchmarks recorded yet.
+    <div className="grid gap-4">
+      <Panel title="Benchmarks" bodyClassName="p-0">
+        {rows.length === 0 ? (
+          <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
+            No benchmarks recorded yet.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[620px] text-[13px] rift-mono">
+              <thead className="rift-label">
+                <tr className="border-b border-border">
+                  <th className="text-left px-4 h-9 font-normal">At</th>
+                  <th className="text-left px-4 font-normal">tok/s</th>
+                  <th className="text-left px-4 font-normal">first token</th>
+                  <th className="text-left px-4 font-normal">concurrency</th>
+                  <th className="text-left px-4 font-normal">ctx</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((b) => (
+                  <tr key={b.id} className="border-b border-border last:border-0">
+                    <td className="px-4 py-2">{relativeTime(b.measuredAt)}</td>
+                    <td className="px-4">{b.tokensPerSec.toFixed(1)}</td>
+                    <td className="px-4">{b.firstTokenMs}ms</td>
+                    <td className="px-4">{b.concurrency}</td>
+                    <td className="px-4">{b.contextTokens}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      <Panel title="Run benchmark">
+        <div className="grid gap-3">
+          <label className="grid gap-1 text-[12px]">
+            <span className="rift-label">Prompt</span>
+            <textarea
+              value={benchmarkPrompt}
+              onChange={(event) => setBenchmarkPrompt(event.target.value)}
+              rows={3}
+              className="w-full rounded-[4px] border border-border bg-raised p-2 text-[13px] resize-y"
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <label className="grid gap-1 text-[12px]">
+              <span className="rift-label">Output tokens</span>
+              <input
+                type="number"
+                min={1}
+                max={128}
+                value={benchmarkMaxTokens}
+                onChange={(event) => setBenchmarkMaxTokens(Number(event.target.value))}
+                className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+              />
+            </label>
+            <label className="grid gap-1 text-[12px]">
+              <span className="rift-label">Warmups</span>
+              <input
+                type="number"
+                min={0}
+                max={10}
+                value={benchmarkWarmups}
+                onChange={(event) => setBenchmarkWarmups(Number(event.target.value))}
+                className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+              />
+            </label>
+            <label className="grid gap-1 text-[12px]">
+              <span className="rift-label">Repetitions</span>
+              <input
+                type="number"
+                min={1}
+                max={20}
+                value={benchmarkRepetitions}
+                onChange={(event) => setBenchmarkRepetitions(Number(event.target.value))}
+                className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+              />
+            </label>
+            <label className="grid gap-1 text-[12px]">
+              <span className="rift-label">Concurrency</span>
+              <input
+                type="number"
+                min={1}
+                max={8}
+                value={benchmarkConcurrency}
+                onChange={(event) => setBenchmarkConcurrency(Number(event.target.value))}
+                className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+              />
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={runBenchmark}
+              disabled={
+                benchmarkBusy ||
+                !benchmarkPrompt.trim() ||
+                !["running", "healthy"].includes(s.status)
+              }
+              className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-primary text-primary-foreground text-[12px] font-medium hover:bg-[color:var(--oxide-deep)] disabled:opacity-50"
+            >
+              {benchmarkBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Gauge className="size-3.5" />
+              )}
+              Run measured benchmark
+            </button>
+            <span className="rift-mono text-[11px] text-ink-secondary">
+              Defaults: 1 warmup, 3 samples, concurrency 1.
+            </span>
+          </div>
+          {benchmarkError && (
+            <p className="rift-mono text-[11px] text-error" role="alert">
+              {benchmarkError}
+            </p>
+          )}
         </div>
-      ) : (
-        <table className="w-full text-[13px] rift-mono">
-          <thead className="rift-label">
-            <tr className="border-b border-border">
-              <th className="text-left px-4 h-9 font-normal">At</th>
-              <th className="text-left px-4 font-normal">tok/s</th>
-              <th className="text-left px-4 font-normal">first token</th>
-              <th className="text-left px-4 font-normal">concurrency</th>
-              <th className="text-left px-4 font-normal">ctx</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((b) => (
-              <tr key={b.id} className="border-b border-border last:border-0">
-                <td className="px-4 py-2">{relativeTime(b.measuredAt)}</td>
-                <td className="px-4">{b.tokensPerSec.toFixed(1)}</td>
-                <td className="px-4">{b.firstTokenMs}ms</td>
-                <td className="px-4">{b.concurrency}</td>
-                <td className="px-4">{b.contextTokens}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </Panel>
+      </Panel>
+      <Panel title="Latest tuning result" aside={<SourceBadge source="live" />}>
+        {reports.unavailable ? (
+          <p className="text-[12px] text-ink-secondary">Tuning history is unavailable.</p>
+        ) : !latestTuning ? (
+          <p className="text-[12px] text-ink-secondary">No tuning result recorded yet.</p>
+        ) : (
+          <div className="grid gap-4">
+            <div className="grid gap-4 sm:grid-cols-4">
+              <KV
+                label="Performance delta"
+                value={
+                  typeof latestTuning.improvement_percent === "number"
+                    ? `${latestTuning.improvement_percent.toFixed(2)}%`
+                    : "not measured"
+                }
+              />
+              <KV
+                label="Baseline score"
+                value={
+                  typeof latestTuning.baseline_score === "number"
+                    ? latestTuning.baseline_score.toFixed(3)
+                    : "not measured"
+                }
+              />
+              <KV
+                label="Winning score"
+                value={
+                  typeof latestTuning.winning_score === "number"
+                    ? latestTuning.winning_score.toFixed(3)
+                    : "not measured"
+                }
+              />
+              <KV label="Mode" value={String(latestTuning.mode ?? "measured")} />
+            </div>
+            <div>
+              <div className="rift-label">Winning parameters</div>
+              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-[4px] border border-border bg-raised p-3 rift-mono text-[11.5px] text-ink">
+                {JSON.stringify(latestTuning.winning_config, null, 2)}
+              </pre>
+            </div>
+            <p className="text-[12px] text-ink-secondary">
+              {String(
+                latestTuning.decision ?? "Winner selected from the recorded tuning candidates.",
+              )}
+            </p>
+          </div>
+        )}
+      </Panel>
+      <Panel
+        title="Answer quality"
+        aside={
+          <button
+            type="button"
+            onClick={runEvaluation}
+            disabled={evaluationBusy || s.status !== "running"}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-primary text-primary-foreground text-[12px] font-medium hover:bg-[color:var(--oxide-deep)] disabled:opacity-50"
+          >
+            {evaluationBusy ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <ShieldCheck className="size-3.5" />
+            )}
+            Run smoke check
+          </button>
+        }
+      >
+        <p className="text-[12px] text-ink-secondary">
+          Five bounded, deterministic checks. This measures behavior against explicit criteria; it
+          is not a general accuracy certification.
+        </p>
+        {evaluationError && (
+          <p className="mt-3 rift-mono text-[11px] text-error" role="alert">
+            {evaluationError}
+          </p>
+        )}
+        {evaluations.unavailable ? (
+          <p className="mt-3 rift-mono text-[11px] text-ink-secondary">
+            Answer evaluation is unavailable on this controller.
+          </p>
+        ) : latestEvaluation ? (
+          <div className="mt-4 grid gap-2">
+            <div className="flex flex-wrap items-center gap-3 rift-mono text-[11px]">
+              <span className="text-ink">
+                {latestEvaluation.suite.id} v{latestEvaluation.suite.version}
+              </span>
+              <span className="text-ink-secondary">
+                {latestEvaluation.summary.pass ?? 0} passed
+              </span>
+              <span className="text-error">{latestEvaluation.summary.fail ?? 0} failed</span>
+              <span className="text-ink-secondary">
+                {latestEvaluation.summary.not_assessed ?? 0} not assessed
+              </span>
+              <span className="ml-auto text-ink-secondary">{latestEvaluation.status}</span>
+            </div>
+            <ul className="divide-y divide-border border border-border rounded-[4px]">
+              {latestEvaluation.cases.map((item) => (
+                <li key={item.caseId} className="flex items-start gap-2 px-3 py-2 text-[12px]">
+                  {item.status === "pass" ? (
+                    <CheckCircle2 className="mt-0.5 size-3.5 text-secondary shrink-0" />
+                  ) : (
+                    <XCircle className="mt-0.5 size-3.5 text-error shrink-0" />
+                  )}
+                  <span className="min-w-0">
+                    <span className="font-medium text-ink">{item.caseId}</span>
+                    <span className="block text-ink-secondary">{item.detail}</span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <p className="mt-3 rift-mono text-[11px] text-ink-secondary">
+            No evaluation run recorded yet.
+          </p>
+        )}
+      </Panel>
+    </div>
   );
 }
 
 function LogsTab({ service }: { service: Service }) {
-  const { data, unavailable } = useLogs();
+  const { data, unavailable } = useLogs(service.name);
   if (unavailable) {
     return <Unavailable endpoint="/logs" resource={`${service.name} service logs`} />;
   }
@@ -456,6 +811,44 @@ function LogsTab({ service }: { service: Service }) {
 }
 
 function ConfigurationTab({ s }: { s: Service }) {
+  const details = s.details ?? {};
+  const model = details.model ?? {};
+  const serving = details.serving ?? {};
+  const gateway = details.gateway ?? {};
+  const launchPlan = details.launchPlan ?? {};
+  const modelPath = String(details.modelPath ?? model.selected_file ?? model.id ?? s.artifactId);
+  const contextLength =
+    serving.context_length ?? launchPlan.context_length ?? details.contextLength;
+  const concurrency = serving.concurrency ?? launchPlan.concurrency ?? details.concurrency;
+  const gatewayCors = gateway.cors_origins;
+  const corsOrigins = Array.isArray(gatewayCors)
+    ? gatewayCors.map(String)
+    : typeof gatewayCors === "string"
+      ? [gatewayCors]
+      : [];
+  const exposed = !["127.0.0.1", "localhost", "::1"].includes(s.endpoint.bindAddress);
+  const securityWarnings: string[] = [];
+  if (corsOrigins.includes("*")) {
+    securityWarnings.push("Unrestricted CORS is enabled for this service.");
+  }
+  if (exposed && gateway.api_key_protection === "not_configured") {
+    securityWarnings.push(
+      "The service is network-exposed but gateway API-key protection is not configured.",
+    );
+  }
+  const effectiveLaunch = {
+    service: s.name,
+    backend: s.backendKind,
+    backend_version: details.backendVersion ?? launchPlan.version ?? "unknown",
+    artifact: s.artifactId,
+    model: modelPath,
+    serving,
+    endpoint: s.endpoint,
+    placement: s.assignments,
+    launch_plan: launchPlan,
+    gateway,
+    process: { pid: details.pid ?? null, restart_count: details.restartCount ?? null },
+  };
   const yaml = `service:
   name: ${s.name}
   artifact: ${s.artifactId}
@@ -469,36 +862,149 @@ assignments:
 ${s.assignments.map((a) => `  - node: ${a.nodeId}\n    gpus: [${a.gpuIndices.join(", ")}]`).join("\n")}
 `;
   return (
-    <Panel
-      title="Normalized configuration"
-      aside={
-        <button
-          type="button"
-          onClick={() => navigator.clipboard.writeText(yaml)}
-          className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[4px] border border-border text-[11.5px] hover:bg-muted"
-        >
-          <Copy className="size-3" /> Copy YAML
-        </button>
-      }
-    >
-      <pre className="rift-mono text-[12.5px] text-ink whitespace-pre">{yaml}</pre>
-      <p className="mt-3 rift-mono text-[11px] text-ink-secondary">
-        Advanced users can export this via GET /v1/services/{s.id}/yaml or apply changes by
-        generating a new plan.
-      </p>
-    </Panel>
+    <div className="grid gap-4">
+      <Panel title="Effective launch settings" aside={<SourceBadge source="live" />}>
+        {securityWarnings.length > 0 && (
+          <div
+            className="mb-4 border border-error/50 bg-error/5 px-3 py-3 text-[12px] text-error"
+            role="alert"
+          >
+            <div className="rift-label text-error">Security attention required</div>
+            <ul className="mt-2 grid gap-1 list-disc pl-4">
+              {securityWarnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <KV
+            label="Backend"
+            value={`${s.backendKind} · ${String(details.backendVersion ?? launchPlan.version ?? "version unknown")}`}
+          />
+          <KV label="Model" value={modelPath} />
+          <KV
+            label="Endpoint"
+            value={`${s.endpoint.scheme}://${s.endpoint.bindAddress}:${s.endpoint.port}${s.endpoint.path}`}
+          />
+          <KV
+            label="Exposure"
+            value={`${String(details.exposure ?? "local")} · ${s.endpoint.bindAddress}`}
+          />
+          <KV
+            label="Context length"
+            value={contextLength == null ? "unknown" : String(contextLength)}
+          />
+          <KV label="Concurrency" value={concurrency == null ? "unknown" : String(concurrency)} />
+          <KV label="Process" value={details.pid == null ? "not running" : `PID ${details.pid}`} />
+          <KV
+            label="Gateway"
+            value={gateway.status == null ? "not configured" : String(gateway.status)}
+          />
+        </div>
+        <details className="mt-4 border-t border-border pt-3">
+          <summary className="cursor-pointer rift-label">Full effective launch payload</summary>
+          <pre className="mt-2 max-h-96 overflow-auto whitespace-pre-wrap rift-mono text-[11.5px] text-ink">
+            {JSON.stringify(effectiveLaunch, null, 2)}
+          </pre>
+        </details>
+      </Panel>
+      <Panel
+        title="Normalized configuration"
+        aside={
+          <button
+            type="button"
+            onClick={() => navigator.clipboard.writeText(yaml)}
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[4px] border border-border text-[11.5px] hover:bg-muted"
+          >
+            <Copy className="size-3" /> Copy YAML
+          </button>
+        }
+      >
+        <pre className="rift-mono text-[12.5px] text-ink whitespace-pre">{yaml}</pre>
+        <p className="mt-3 rift-mono text-[11px] text-ink-secondary">
+          Advanced users can export this via GET /services or apply changes by generating a new
+          plan.
+        </p>
+      </Panel>
+    </div>
   );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 function RevisionsTab({ id }: { id: string }) {
   const { data, unavailable } = useRevisions(id);
-  if (unavailable)
-    return (
-      <Unavailable endpoint={`/v1/services/${id}/revisions`} resource="DeploymentRevision[]" />
-    );
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState(false);
+  if (unavailable) return <Unavailable endpoint="/state" resource="DeploymentRevision[]" />;
   const rows = data ?? [];
+  const rollback = async () => {
+    setBusy(true);
+    setMessage(null);
+    setError(null);
+    try {
+      await rift.rollback(id);
+      setMessage("Rollback completed; refresh the live service state for details.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+      setConfirm(false);
+    }
+  };
   return (
-    <Panel title="Revisions" bodyClassName="p-0">
+    <Panel
+      title="Revisions"
+      bodyClassName="p-0"
+      aside={
+        rows.length > 0 && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => setConfirm(true)}
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[4px] border border-border text-[11.5px] hover:bg-muted disabled:opacity-50"
+          >
+            <RotateCcw className="size-3" /> Roll back last known-good
+          </button>
+        )
+      }
+    >
+      {(message || error) && (
+        <div
+          className="px-4 py-2 border-b border-border rift-mono text-[11px]"
+          role={error ? "alert" : undefined}
+        >
+          <span className={error ? "text-error" : "text-ink-secondary"}>{error ?? message}</span>
+        </div>
+      )}
+      {confirm && !busy && (
+        <div className="px-4 py-2 border-b border-border flex flex-wrap items-center gap-2 rift-mono text-[11px]">
+          <span className="text-ink-secondary">
+            This relaunches the last known-good service configuration.
+          </span>
+          <button
+            type="button"
+            onClick={rollback}
+            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[4px] bg-attention text-ink font-medium"
+          >
+            Confirm rollback
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirm(false)}
+            className="inline-flex items-center h-7 px-2.5 rounded-[4px] border border-border"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
       {rows.length === 0 ? (
         <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
           No revisions yet.
@@ -514,12 +1020,6 @@ function RevisionsTab({ id }: { id: string }) {
               <span className="rift-mono text-[11.5px] text-ink-secondary ml-auto">
                 {relativeTime(r.createdAt)}
               </span>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-[4px] border border-border text-[11.5px] hover:bg-muted"
-              >
-                <RotateCcw className="size-3" /> Roll back
-              </button>
             </li>
           ))}
         </ul>

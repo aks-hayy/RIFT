@@ -1,4 +1,4 @@
-import { AlertTriangle, ExternalLink } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 
 /**
  * `Unavailable` — shown wherever a required RIFT controller endpoint is
@@ -41,13 +41,6 @@ export function Unavailable({
             </div>
           </div>
           {hint && <p className="mt-3 text-[12px] text-ink-secondary max-w-xl">{hint}</p>}
-          <a
-            href="#"
-            className="mt-4 inline-flex items-center gap-1 text-[12px] text-primary hover:underline"
-          >
-            <ExternalLink className="size-3" aria-hidden />
-            RIFT controller API reference
-          </a>
         </div>
       </div>
     </div>

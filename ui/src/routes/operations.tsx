@@ -3,12 +3,24 @@ import { z } from "zod";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, StatDot, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
-import { useIncidents, useLatestPlan, useLogs, useReports, useTimeline } from "@/lib/rift/hooks";
+import {
+  useIncidents,
+  useLatestPlan,
+  useLogs,
+  useOperations,
+  useReports,
+  useTimeline,
+} from "@/lib/rift/hooks";
 import { relativeTime } from "@/lib/rift/format";
 import { cn } from "@/lib/utils";
+import { rift } from "@/lib/rift/client";
+import { Fragment, useState } from "react";
+import type { OperationRecord } from "@/lib/rift/types";
 
 const searchSchema = z.object({
-  tab: z.enum(["incidents", "rollouts", "audit", "logs", "metrics"]).catch("incidents"),
+  tab: z
+    .enum(["operations", "incidents", "rollouts", "audit", "logs", "metrics"])
+    .catch("operations"),
 });
 
 export const Route = createFileRoute("/operations")({
@@ -28,6 +40,7 @@ export const Route = createFileRoute("/operations")({
 });
 
 const TABS = [
+  { id: "operations", label: "Operations" },
   { id: "incidents", label: "Incidents" },
   { id: "rollouts", label: "Rollouts" },
   { id: "audit", label: "Audit log" },
@@ -64,7 +77,8 @@ function OperationsPage() {
         </div>
       </div>
 
-      <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
+      <div className="max-w-[1400px] mx-auto min-w-0 px-4 py-6 grid gap-4">
+        {tab === "operations" && <OperationsTab />}
         {tab === "incidents" && <IncidentsTab />}
         {tab === "rollouts" && <RolloutsTab />}
         {tab === "audit" && <AuditTab />}
@@ -72,6 +86,176 @@ function OperationsPage() {
         {tab === "metrics" && <MetricsTab />}
       </div>
     </AppShell>
+  );
+}
+
+function OperationsTab() {
+  const { data, unavailable, error, isLoading, refetch } = useOperations();
+  const [cancelling, setCancelling] = useState<string | null>(null);
+  if (unavailable || error)
+    return (
+      <Unavailable
+        endpoint="/v2/operations"
+        resource="Durable operations"
+        reason={unavailable?.detail ?? error?.message}
+      />
+    );
+  const operations = data ?? [];
+  return (
+    <Panel
+      title={`${operations.length} durable operation${operations.length === 1 ? "" : "s"}`}
+      aside={<SourceBadge source="live" />}
+      bodyClassName="p-0"
+    >
+      {isLoading ? (
+        <div className="px-4 py-12 text-center text-[13px] text-ink-secondary">
+          Loading operations...
+        </div>
+      ) : operations.length === 0 ? (
+        <div className="px-4 py-12 text-center text-[13px] text-ink-secondary">
+          No controller operations have been recorded.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[860px] text-[12.5px]">
+            <thead className="rift-label">
+              <tr className="border-b border-border">
+                <th className="h-9 px-4 text-left font-normal">Operation</th>
+                <th className="px-4 text-left font-normal">Action</th>
+                <th className="px-4 text-left font-normal">Stage</th>
+                <th className="px-4 text-left font-normal">Progress</th>
+                <th className="px-4 text-left font-normal">Updated</th>
+                <th className="px-4 text-right font-normal">Control</th>
+              </tr>
+            </thead>
+            <tbody>
+              {operations.map((operation) => (
+                <OperationRow
+                  key={operation.operationId}
+                  operation={operation}
+                  cancelling={cancelling === operation.operationId}
+                  onCancel={async () => {
+                    setCancelling(operation.operationId);
+                    try {
+                      await rift.cancelOperation(operation.operationId);
+                      refetch();
+                    } finally {
+                      setCancelling(null);
+                    }
+                  }}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function OperationRow({
+  operation,
+  cancelling,
+  onCancel,
+}: {
+  operation: OperationRecord;
+  cancelling: boolean;
+  onCancel: () => Promise<void>;
+}) {
+  const active = operation.status === "RUNNING";
+  const [expanded, setExpanded] = useState(false);
+  const hasDetails = Boolean(operation.error || operation.details || operation.result);
+  const tone =
+    operation.status === "FAILED" || operation.status === "INTERRUPTED"
+      ? "error"
+      : active
+        ? "attention"
+        : "ok";
+  return (
+    <Fragment>
+      <tr className="border-b border-border last:border-0">
+        <td className="px-4 py-3 rift-mono text-[11px] text-ink break-all">
+          {operation.operationId}
+        </td>
+        <td className="px-4 py-3 rift-mono text-[11px] text-ink-secondary break-all">
+          <div>{operation.action}</div>
+          <div className="mt-1 text-[10px] text-ink-secondary">request {operation.requestId}</div>
+        </td>
+        <td className="px-4 py-3">
+          <span className="inline-flex items-center gap-2">
+            <StatDot tone={tone} />
+            {operation.stage}
+          </span>
+          <span className="block mt-1 text-[11px] text-ink-secondary max-w-[280px]">
+            {operation.message}
+          </span>
+        </td>
+        <td className="px-4 py-3 rift-mono text-[11px]">
+          {operation.percent == null ? "indeterminate" : `${Math.round(operation.percent)}%`}
+        </td>
+        <td className="px-4 py-3 rift-mono text-[11px] text-ink-secondary">
+          {relativeTime(operation.updatedAt)}
+        </td>
+        <td className="px-4 py-3 text-right">
+          <div className="flex items-center justify-end gap-2">
+            {hasDetails && (
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setExpanded((value) => !value)}
+                className="h-7 px-2.5 rounded-[4px] border border-border text-[11px] hover:bg-muted"
+              >
+                {expanded ? "Hide details" : "Details"}
+              </button>
+            )}
+            {active ? (
+              <button
+                type="button"
+                onClick={() => void onCancel()}
+                disabled={cancelling}
+                className="h-7 px-2.5 rounded-[4px] border border-error/40 text-error text-[11px] hover:bg-error/10 disabled:opacity-50"
+              >
+                {cancelling ? "Cancelling..." : "Cancel"}
+              </button>
+            ) : (
+              <span className="rift-mono text-[11px] text-ink-secondary">
+                {operation.status.toLowerCase()}
+              </span>
+            )}
+          </div>
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="border-b border-border bg-muted/20">
+          <td colSpan={6} className="px-4 py-3">
+            <div className="grid gap-2 text-[11px]">
+              {operation.error && (
+                <div className="border-l-2 border-error pl-3" role="alert">
+                  <div className="rift-label text-error">Failure</div>
+                  <p className="mt-1 text-error break-words">{operation.error}</p>
+                </div>
+              )}
+              {operation.details && (
+                <div>
+                  <div className="rift-label">Stage details</div>
+                  <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rift-mono text-ink-secondary">
+                    {JSON.stringify(operation.details, null, 2)}
+                  </pre>
+                </div>
+              )}
+              {operation.result && (
+                <div>
+                  <div className="rift-label">Result</div>
+                  <pre className="mt-1 max-h-52 overflow-auto whitespace-pre-wrap rift-mono text-ink-secondary">
+                    {JSON.stringify(operation.result, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </Fragment>
   );
 }
 
@@ -252,7 +436,7 @@ function IncidentsTab() {
   if (unavailable)
     return (
       <Unavailable
-        endpoint="/v1/incidents"
+        endpoint="/incidents"
         resource="Incident[] { severity, status, title, detail, recovery }"
       />
     );

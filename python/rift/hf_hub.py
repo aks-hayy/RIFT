@@ -289,9 +289,10 @@ class HfHubClient:
         )
         part_path = local_path.with_suffix(local_path.suffix + ".part")
         resume_from = part_path.stat().st_size if part_path.exists() else 0
-        headers: dict[str, str] = {}
-        if resume_from > 0:
-            headers["Range"] = f"bytes={resume_from}-"
+        # Xet-backed Hub files can stall on an unbounded initial response.
+        # A zero-offset range still permits a full download while making the
+        # transport use the same resumable path as subsequent requests.
+        headers: dict[str, str] = {"Range": f"bytes={resume_from}-"}
         request = self._request(url, headers=headers)
         try:
             response = urlopen(request, timeout=60)

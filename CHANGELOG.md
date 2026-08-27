@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### UI Reliability And Answer Evaluation
+
+- Preserved reviewed deployment intent through plan creation and exact plan
+  application, including artifact, backend, node, service, and exposure.
+- Added immutable plan retrieval/application with reviewed hash validation and
+  durable operation IDs, atomic request claiming, stage updates, cancellation,
+  replay protection, and restart interruption states.
+- Added bounded, deterministic answer-quality smoke evaluation with five
+  explicit first-party cases, custom declarative suites, case-level results,
+  retention consent, and an optional approved-host OpenAI-compatible judge.
+- Added benchmark controls for prompts, output budgets, warmups, repetitions,
+  and concurrency, with sample and failure counts in persisted reports.
+- Added live settings, model-source, evaluation, operation, scoped-log, and
+  deployment-progress API paths plus dashboard controls for smoke checks and
+  configurable benchmark runs.
+- Added revision-aware automatic evaluation so refreshes do not rerun the
+  smoke suite for the same effective deployment.
+
+### Verification Boundary
+
+The Python control-plane, operation, evaluation, server, dashboard-launcher,
+adapter, mesh, enrollment, recommendation, and release-audit suites pass when
+run in isolated processes. The contributor UI production build remains an
+optional development artifact and was not available in this checkout because
+its Node dependencies are not installed; the packaged dashboard remains the
+portable runtime path. CUDA/native execution and external provider acceptance
+remain outside this reliability wave.
+
 ## 1.3.0 - 2026-08-22
 
 ### Release Hardening

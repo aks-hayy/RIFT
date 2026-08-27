@@ -161,6 +161,16 @@ def request_json(base_url, path, payload=None):
         return response.status, response.headers.get("Content-Type"), body
 
 
+def request_with_origin(base_url, path, origin):
+    request = urllib.request.Request(base_url + path, headers={"Origin": origin})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return (
+            response.status,
+            response.headers.get("Access-Control-Allow-Origin"),
+            response.headers.get("Access-Control-Allow-Credentials"),
+        )
+
+
 def test_server_routes_and_streaming():
     runtime = server_mod.RiftServerRuntime(model_path="fixture", engine_factory=fake_factory)
     httpd = server_mod.create_rift_server(host="127.0.0.1", port=0, runtime=runtime)
@@ -201,6 +211,25 @@ def test_server_routes_and_streaming():
         assert content_type.startswith("text/event-stream")
         assert "data: [DONE]" in body
         assert "rift-chat-local" in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+
+
+def test_runtime_cors_origins_allow_custom_dashboard_ports():
+    runtime = server_mod.RiftServerRuntime(cors_origins=("http://127.0.0.1:8971",))
+    httpd = server_mod.create_rift_server(host="127.0.0.1", port=0, runtime=runtime)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_port}"
+    try:
+        status, allowed_origin, allow_credentials = request_with_origin(
+            base_url, "/health", "http://127.0.0.1:8971"
+        )
+        assert status == 200
+        assert allowed_origin == "http://127.0.0.1:8971"
+        assert allow_credentials == "true"
     finally:
         httpd.shutdown()
         httpd.server_close()
@@ -260,6 +289,7 @@ def test_mesh_control_routes_use_one_persistent_controller():
 
 def main():
     test_server_routes_and_streaming()
+    test_runtime_cors_origins_allow_custom_dashboard_ports()
     test_hardware_control_route_uses_state_aware_discovery()
     test_mesh_control_routes_use_one_persistent_controller()
     print("rift server tests passed")

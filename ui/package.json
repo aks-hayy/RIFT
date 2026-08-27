@@ -5,13 +5,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "build": "vite build",
+    "build": "vite build && node scripts/build-static.mjs",
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "verify:setup-flow": "node --experimental-strip-types scripts/verify-setup-flow.mjs",
     "verify:recommendation-state": "node --experimental-strip-types scripts/verify-recommendation-state.mjs",
     "verify:benchmark-report": "node --experimental-strip-types scripts/verify-benchmark-report.mjs",
     "verify:live-actions": "node --experimental-strip-types scripts/verify-live-actions.mjs",
+    "verify:operation-state": "node --experimental-strip-types scripts/verify-operation-state.mjs",
     "verify:controller": "node scripts/verify-controller.mjs",
     "lint": "eslint .",
     "format": "prettier --write ."

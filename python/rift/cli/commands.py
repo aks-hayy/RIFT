@@ -225,40 +225,36 @@ def execute(args: Any, console: RiftConsole) -> int:
         return 1 if any(item.get("kind") == "error" for item in result.get("actions", [])) else 0
 
     if args.command == "apply":
-        config_path = args.config
+        selected_plan = None
+        if not getattr(args, "config", None):
+            selected_plan = _select_apply_plan(
+                orchestrator,
+                console,
+                getattr(args, "plan", None),
+                no_prompt=bool(getattr(args, "no_prompt", False)),
+                limit=int(getattr(args, "limit", 50)),
+            )
+        if selected_plan is False:
+            return 2
+        plan_id = str(selected_plan.get("plan_id")) if selected_plan else None
+        reviewed_hash = str(
+            getattr(args, "plan_hash", None)
+            or (selected_plan or {}).get("plan_hash")
+            or ""
+        ) or None
+        config_path = (selected_plan or {}).get("config_path") or getattr(args, "config", None)
         if not config_path:
-            inventory = orchestrator.list_plans(limit=args.limit)
-            if inventory.get("plans"):
-                selected_plan = _choose_saved_plan(
-                    console,
-                    inventory,
-                    selector=args.plan,
-                    no_prompt=args.no_prompt,
+            default_config = Path.cwd() / "rift.yaml"
+            if not default_config.is_file():
+                raise FileNotFoundError(
+                    "no saved deployment plans were found. Run `rift plan` first, "
+                    "or provide an explicit `rift apply --config PATH`."
                 )
-                config_path = str(selected_plan.get("config_path") or "")
-                if not config_path:
-                    raise ValueError(
-                        f"saved plan {selected_plan.get('plan_id')} has no configuration path; rerun `rift plan`"
-                    )
-                config_candidate = Path(config_path).expanduser()
-                if not config_candidate.is_absolute():
-                    config_candidate = Path.cwd() / config_candidate
-                if not config_candidate.is_file():
-                    raise FileNotFoundError(
-                        f"configuration for saved plan {selected_plan.get('plan_id')} was not found: {config_candidate}. "
-                        "Rerun `rift plan --recommendation-run ...` to recreate it."
-                    )
-                config_path = str(config_candidate)
-            else:
-                default_config = Path.cwd() / "rift.yaml"
-                if not default_config.is_file():
-                    raise FileNotFoundError(
-                        "no saved deployment plans were found. Run `rift plan` first, "
-                        "or provide an explicit `rift apply --config PATH`."
-                    )
-                config_path = str(default_config)
+            config_path = str(default_config)
         result = orchestrator.apply(
             config_path=config_path,
+            plan_id=plan_id,
+            plan_hash=reviewed_hash,
             permissions=ApplyPermissions(
                 allow_download=args.allow_download,
                 allow_install=args.allow_install,
@@ -358,6 +354,76 @@ def execute(args: Any, console: RiftConsole) -> int:
     if args.command == "system":
         return _system(args, console, orchestrator)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _select_apply_plan(
+    orchestrator: RiftOrchestrator,
+    console: RiftConsole,
+    requested: str | None,
+    *,
+    no_prompt: bool = False,
+    limit: int = 50,
+) -> dict[str, Any] | bool | None:
+    """Choose an immutable saved plan without falling back to an unrelated latest plan."""
+
+    inventory = orchestrator.list_plans(limit=limit)
+    plans = inventory.get("plans", []) if isinstance(inventory, dict) else inventory
+    plans = [item for item in plans if isinstance(item, dict)]
+    if not plans and not requested:
+        return None
+    if requested:
+        value = str(requested).strip()
+        if value.isdigit():
+            index = int(value)
+            if 1 <= index <= len(plans):
+                selected = plans[index - 1]
+                plan_id = str(selected.get("plan_id") or "").strip()
+                return orchestrator.load_plan_by_id(plan_id) if plan_id else selected
+            console.error(f"Unknown plan number: {value}", hint="Run `rift plan` to create a plan.")
+            return False
+        try:
+            return orchestrator.load_plan_by_id(value)
+        except (KeyError, ValueError) as exc:
+            console.error(str(exc), hint="Run `rift apply --plan NUMBER` to choose a saved plan.")
+            return False
+
+    if no_prompt or not sys.stdin.isatty() or console.json_output:
+        console.error(
+            "Saved deployment plans require an explicit selection in noninteractive mode.",
+            hint="Use `rift apply --plan PLAN_ID --plan-hash HASH ...`.",
+        )
+        return False
+
+    console._heading("Saved deployment plans")
+    rows = []
+    for index, plan in enumerate(plans, 1):
+        services = plan.get("services") or {}
+        if isinstance(services, dict):
+            names = ", ".join(str(name) for name in services) or "-"
+        else:
+            names = str(plan.get("service_count") or "-")
+        model = str(plan.get("model") or "-")
+        blockers = int(plan.get("blocker_count") or 0)
+        rows.append(
+            [
+                index,
+                str(plan.get("plan_id") or "-")[:24],
+                model[:42],
+                names[:20],
+                blockers,
+                str(plan.get("plan_hash") or "")[:12],
+            ]
+        )
+    console._table(["#", "PLAN", "MODEL", "SERVICES", "BLOCKERS", "HASH"], rows)
+    try:
+        answer = input("Choose a plan number or ID (blank to cancel): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        answer = ""
+    if not answer:
+        console.warning("No deployment plan selected. Nothing was applied.")
+        return False
+    return _select_apply_plan(orchestrator, console, answer, no_prompt=True, limit=limit)
 
 
 def _choose_plan_candidate(

@@ -80,6 +80,8 @@ FILES = {
 
 
 class FakeHubHandler(BaseHTTPRequestHandler):
+    range_headers = []
+
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
@@ -94,6 +96,7 @@ class FakeHubHandler(BaseHTTPRequestHandler):
         if path.startswith(prefix):
             name = path[len(prefix) :]
             if name in FILES:
+                self.__class__.range_headers.append(self.headers.get("Range"))
                 self._send_bytes(FILES[name])
                 return
         self.send_error(404)
@@ -192,6 +195,7 @@ def test_snapshot_download_and_rift_wrapper():
         assert (output_dir / "model.safetensors").read_bytes() == FILES["model.safetensors"]
         assert (output_dir / "nested" / "tokenizer.json").read_bytes() == FILES["nested/tokenizer.json"]
         assert not (output_dir / "pytorch_model.bin").exists()
+        assert FakeHubHandler.range_headers == ["bytes=0-"] * 3
 
         engine = rift.RiftEngine()
         wrapped = engine.pull_model_from_hub(

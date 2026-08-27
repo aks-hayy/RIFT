@@ -46,3 +46,7 @@ include = ["rift*"]
 
 [tool.setuptools.package-data]
 "rift" = ["web/static/**/*", "web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+python_files = ["*_tests.py"]

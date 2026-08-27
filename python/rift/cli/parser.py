@@ -229,7 +229,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply.add_argument("--config", help="Explicit YAML config; bypasses saved-plan selection")
     apply.add_argument("--plan", help="Saved plan number, plan ID, or plan path")
-    apply.add_argument("--no-prompt", action="store_true", help="Require --plan instead of reading interactive input")
+    apply.add_argument(
+        "--plan-hash",
+        help="Reviewed SHA-256 plan hash; defaults to the selected immutable plan hash",
+    )
+    apply.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Require --plan instead of reading interactive input",
+    )
     apply.add_argument("--limit", type=int, default=50, help="Maximum saved plans to show")
     apply.add_argument("--allow-download", action="store_true")
     apply.add_argument("--allow-install", action="store_true")

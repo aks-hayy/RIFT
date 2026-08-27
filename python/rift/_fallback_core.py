@@ -151,7 +151,10 @@ def build_info() -> dict[str, Any]:
 
 
 def cuda_device_count() -> int:
-    return int(_nvidia_hardware_profile().get("device_count") or 0)
+    # This is the optional native CUDA runtime count, not a best-effort
+    # hardware observation. The control plane may still report an NVIDIA GPU
+    # through its portable profile without claiming CUDA execution support.
+    return 0
 
 
 def inspect_model(*args: Any, **kwargs: Any) -> dict[str, Any]:

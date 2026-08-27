@@ -26,9 +26,9 @@ info:
   contact:
     name: RIFT Project
 servers:
-  - url: http://127.0.0.1:8777/api/rift/v1
+  - url: http://127.0.0.1:8777/api/rift
     description: Default standalone controller
-  - url: "{scheme}://{host}:{port}/api/rift/v1"
+  - url: "{scheme}://{host}:{port}/api/rift"
     description: Configurable controller
     variables:
       scheme:
@@ -58,11 +58,231 @@ tags:
 security:
   - controllerSession: []
   - controllerBearer: []
-x-rift-contract-status: target-with-implemented-mesh-v2
+x-rift-contract-status: implemented-legacy-and-v2-subset
 x-rift-legacy-base-url: http://127.0.0.1:8777/api/rift
 x-rift-agent-protocol: HTTPS JSON with mutual TLS; see rift-node-agent.openapi.yaml
+x-rift-implemented-v2-paths:
+  - /v2/plans
+  - /v2/plans/{planId}
+  - /v2/plans/{planId}/apply
+  - /v2/operations
+  - /v2/operations/{operationId}
+  - /v2/operations/{operationId}/cancel
+  - /v2/evaluations
+  - /v2/evaluations/{runId}
+  - /v2/settings
+  - /v2/model-sources
 
 paths:
+  # These are the live v2 resources used by the bundled dashboard. They are
+  # intentionally listed separately from the aspirational controller model
+  # below so generated clients do not silently target an unimplemented route.
+  /v2/plans:
+    get:
+      tags: [Plans]
+      operationId: listLivePlans
+      responses:
+        "200":
+          description: Immutable plans stored by this controller.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, plans]
+                properties:
+                  api_version: { type: string, const: "2" }
+                  plans:
+                    type: array
+                    items: { $ref: "#/components/schemas/LivePlan" }
+
+  /v2/plans/{planId}:
+    get:
+      tags: [Plans]
+      operationId: getLivePlan
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+      responses:
+        "200":
+          description: One immutable reviewed plan.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LivePlan" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/plans/{planId}/apply:
+    post:
+      tags: [Plans]
+      operationId: applyLivePlan
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_hash]
+              properties:
+                plan_hash: { type: string, minLength: 1 }
+                config: { type: string }
+                allow_download: { type: boolean, default: false }
+                allow_install: { type: boolean, default: false }
+                allow_launch: { type: boolean, default: false }
+                allow_remote: { type: boolean, default: false }
+                optimize: { type: boolean, default: false }
+                write_back: { type: boolean, default: false }
+      responses:
+        "202": { $ref: "#/components/responses/OperationAccepted" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v2/operations:
+    get:
+      tags: [Operations]
+      operationId: listLiveOperations
+      responses:
+        "200":
+          description: Durable operation records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operations]
+                properties:
+                  operations:
+                    type: array
+                    items: { $ref: "#/components/schemas/LiveOperation" }
+
+  /v2/operations/{operationId}:
+    get:
+      tags: [Operations]
+      operationId: getLiveOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: Durable operation progress and result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiveOperation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/operations/{operationId}/cancel:
+    post:
+      tags: [Operations]
+      operationId: cancelLiveOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { reason: { type: string } }
+      responses:
+        "200":
+          description: Updated operation record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiveOperation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/evaluations:
+    get:
+      tags: [Performance]
+      operationId: listLiveEvaluations
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Persisted answer-quality evaluation summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, evaluations]
+                properties:
+                  api_version: { type: string, const: "2" }
+                  evaluations:
+                    type: array
+                    items: { $ref: "#/components/schemas/EvaluationRun" }
+    post:
+      tags: [Performance]
+      operationId: createLiveEvaluation
+      parameters: [ { $ref: "#/components/parameters/RequestId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [service]
+              properties:
+                service: { type: string, minLength: 1 }
+                suite: { type: object, additionalProperties: true }
+                max_tokens: { type: integer, minimum: 1, maximum: 128, default: 128 }
+                deadline_seconds: { type: number, exclusiveMinimum: 0, default: 60 }
+                retain_responses: { type: boolean, default: false }
+                required: { type: boolean, default: false }
+                judge:
+                  type: object
+                  description: Optional external heuristic evaluator; all fields are explicit.
+                  required: [endpoint, model, allowed_hosts, credential_ref, external_data_consent]
+                  properties:
+                    endpoint: { type: string, format: uri }
+                    model: { type: string, minLength: 1 }
+                    allowed_hosts:
+                      type: array
+                      minItems: 1
+                      items: { type: string, minLength: 1 }
+                    credential_ref: { type: string, description: "none or env:VARIABLE_NAME" }
+                    external_data_consent: { type: boolean, const: true }
+                    timeout_seconds: { type: number, exclusiveMinimum: 0, default: 15 }
+      responses:
+        "202": { $ref: "#/components/responses/OperationAccepted" }
+
+  /v2/evaluations/{runId}:
+    get:
+      tags: [Performance]
+      operationId: getLiveEvaluation
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Full case-level evaluation report.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EvaluationRun" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/settings:
+    get:
+      tags: [Settings]
+      operationId: getLiveSettings
+      responses:
+        "200":
+          description: Live redacted operator settings and capabilities.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v2/model-sources:
+    get:
+      tags: [Models]
+      operationId: getLiveModelSources
+      responses:
+        "200":
+          description: Configured and managed model sources.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
   /health/live:
     get:
       tags: [Health]
@@ -1041,7 +1261,7 @@ paths:
         "422":
           $ref: "#/components/responses/ValidationFailed"
 
-  /api/rift/v2/mesh/sightings:
+  /v2/mesh/sightings:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1063,7 +1283,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshSightingsResponse"
 
-  /api/rift/v2/mesh/enrollment-window:
+  /v2/mesh/enrollment-window:
     servers:
       - url: http://127.0.0.1:8777
         description: Loopback operator API
@@ -1116,7 +1336,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshEnrollmentWindow"
 
-  /api/rift/v2/mesh/discover:
+  /v2/mesh/discover:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1198,7 +1418,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/enrollments:
+  /v2/mesh/enrollments:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1259,7 +1479,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/enrollments/{enrollmentId}/approve:
+  /v2/mesh/enrollments/{enrollmentId}/approve:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1308,7 +1528,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/enrollments/{enrollmentId}/certificate:
+  /v2/mesh/enrollments/{enrollmentId}/certificate:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1355,7 +1575,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/enrollments/{enrollmentId}/activate:
+  /v2/mesh/enrollments/{enrollmentId}/activate:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1391,7 +1611,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/nodes:
+  /v2/mesh/nodes:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1408,7 +1628,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshNodesResponse"
 
-  /api/rift/v2/mesh/nodes/{nodeId}/telemetry:
+  /v2/mesh/nodes/{nodeId}/telemetry:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1436,7 +1656,7 @@ paths:
         '403': { description: Node is not active or telemetry is not authorized. }
         '409': { description: Telemetry sequence is stale. }
 
-  /api/rift/v2/mesh/nodes/{nodeId}/capabilities:
+  /v2/mesh/nodes/{nodeId}/capabilities:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1484,7 +1704,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/links:
+  /v2/mesh/links:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1525,7 +1745,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshError"
 
-  /api/rift/v2/mesh/topology:
+  /v2/mesh/topology:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1542,7 +1762,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/MeshTopologyResponse"
 
-  /api/rift/v2/mesh/routes/resolve:
+  /v2/mesh/routes/resolve:
     servers:
       - url: http://127.0.0.1:8777
         description: Implemented local preview controller
@@ -1773,6 +1993,80 @@ components:
             $ref: "#/components/schemas/Problem"
 
   schemas:
+    LivePlan:
+      type: object
+      required: [rift_product, schema_version, plan_id, plan_hash, actions, services]
+      properties:
+        rift_product: { type: string, const: RIFT }
+        schema_version: { type: integer, const: 1 }
+        plan_id: { type: string }
+        plan_hash: { type: string }
+        config_path: { type: string }
+        materialized_config: { type: string }
+        read_only: { type: boolean, const: true }
+        actions: { type: array, items: { type: object, additionalProperties: true } }
+        services: { type: object, additionalProperties: true }
+        nodes: { type: array, items: { type: object, additionalProperties: true } }
+        drift: { type: array, items: { type: object, additionalProperties: true } }
+
+    LiveOperation:
+      type: object
+      required: [schema_version, request_id, operation_id, action, status, stage, percent]
+      properties:
+        schema_version: { type: integer, const: 2 }
+        request_id: { type: string }
+        operation_id: { type: string }
+        action: { type: string }
+        actor: { type: string }
+        status:
+          type: string
+          enum: [RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+        stage: { type: string }
+        message: { type: string }
+        percent: { type: [number, "null"], minimum: 0, maximum: 100 }
+        payload_sha256: { type: [string, "null"] }
+        created_unix_seconds: { type: number }
+        updated_unix_seconds: { type: number }
+        completed_unix_seconds: { type: number }
+        error: { type: string }
+        result: { type: object, additionalProperties: true }
+        details: { type: object, additionalProperties: true }
+
+    EvaluationRun:
+      type: object
+      required: [run_id, suite, status, service, summary, cases]
+      properties:
+        run_id: { type: string }
+        service: { type: string }
+        backend: { type: string }
+        status: { type: string, enum: [running, completed, deadline, not_run] }
+        available: { type: boolean }
+        required: { type: boolean }
+        suite: { type: object, additionalProperties: true }
+        summary: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+        cases:
+          type: array
+          items:
+            type: object
+            required: [case_id, status, criteria, detail]
+            properties:
+              case_id: { type: string }
+              status: { type: string, enum: [pass, fail, not_assessed, error] }
+              criteria: { type: string }
+              detail: { type: string }
+              elapsed_seconds: { type: [number, "null"] }
+              response: { type: string, description: Returned only with explicit retention consent. }
+              judge:
+                type: object
+                properties:
+                  status: { type: string, enum: [not_assessed, assessed, error] }
+                  score: { type: [number, "null"], minimum: 0, maximum: 1 }
+                  detail: { type: [string, "null"] }
+        model_revision: { type: object, additionalProperties: true }
+        configuration: { type: object, additionalProperties: true }
+        assessment: { type: string }
+        report_path: { type: string }
+
     Problem:
       type: object
       required: [type, title, status, detail, code, request_id]

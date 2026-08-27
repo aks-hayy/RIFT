@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useState } from "react";
 import {
   Monitor,
   Network,
@@ -67,12 +67,15 @@ export const Route = createFileRoute("/setup")({
 });
 
 type Mode = "standalone" | "cluster";
+type SourceMode = "automatic" | "huggingface" | "local-file" | "local-directory";
 
 interface SetupState {
   step: number;
   mode: Mode | null;
   useCase: UseCase | null;
   source: ModelArtifact["source"] | null;
+  sourceMode: SourceMode;
+  sourceReference: string;
   chosenRecommendation: ModelRecommendation | null;
   serviceName: string;
   exposure: "local" | "lan" | "public";
@@ -96,6 +99,8 @@ const STEPS = [
   "Finish",
 ] as const;
 
+const SetupStepNumberContext = createContext<number | null>(null);
+
 function SetupPage() {
   const navigate = useNavigate();
   const [s, setS] = useState<SetupState>({
@@ -103,6 +108,8 @@ function SetupPage() {
     mode: null,
     useCase: null,
     source: "huggingface",
+    sourceMode: "automatic",
+    sourceReference: "",
     chosenRecommendation: null,
     serviceName: "",
     exposure: "local",
@@ -162,67 +169,76 @@ function SetupPage() {
         <ProgressRail current={s.step} visible={visibleSteps} />
       </header>
 
-      <div className="flex-1">
-        <div className="max-w-[900px] mx-auto px-4 py-10">
-          {s.step === 0 && (
-            <StepMode value={s.mode} onChange={(v) => set("mode", v)} onNext={next} />
-          )}
-          {s.step === 1 && <StepDiscover mode={s.mode!} onNext={next} />}
-          {s.step === 2 && <StepManagedEnroll onNext={next} />}
-          {s.step === 3 && <StepNodesLive onNext={next} />}
-          {s.step === 4 && (
-            <StepUseCase value={s.useCase} onChange={(v) => set("useCase", v)} onNext={next} />
-          )}
-          {s.step === 5 && (
-            <StepSource
-              source={s.source}
-              onChange={(source) => set("source", source)}
-              onNext={next}
-            />
-          )}
-          {s.step === 6 && (
-            <StepRecommendation
-              useCase={s.useCase!}
-              source={s.source!}
-              chosen={s.chosenRecommendation}
-              onChoose={(r) => set("chosenRecommendation", r)}
-              onNext={next}
-            />
-          )}
-          {s.step === 7 && (
-            <StepService
-              serviceName={s.serviceName}
-              exposure={s.exposure}
-              onChange={(name, exp) => setS((p) => ({ ...p, serviceName: name, exposure: exp }))}
-              onNext={next}
-            />
-          )}
-          {s.step === 8 && (
-            <StepPlan
-              recommendation={s.chosenRecommendation}
-              serviceName={s.serviceName}
-              exposure={s.exposure}
-              plan={s.plan}
-              onPlan={(p) => set("plan", p)}
-              onNext={next}
-            />
-          )}
-          {s.step === 9 && (
-            <StepApply
-              plan={s.plan}
-              onApplied={(progress) => {
-                set("applyProgress", progress);
-                set("applyStarted", true);
-                next();
-              }}
-            />
-          )}
-          {s.step === 10 && (
-            <StepProgress plan={s.plan!} initialProgress={s.applyProgress} onNext={next} />
-          )}
-          {s.step === 11 && <StepFinish state={s} />}
-        </div>
-      </div>
+      <SetupStepNumberContext.Provider
+        value={visibleSteps.findIndex((item) => item.i === s.step) + 1 || 1}
+      >
+        <main className="flex-1" role="main">
+          <div className="max-w-[900px] mx-auto px-4 py-10">
+            {s.step === 0 && (
+              <StepMode value={s.mode} onChange={(v) => set("mode", v)} onNext={next} />
+            )}
+            {s.step === 1 && <StepDiscover mode={s.mode!} onNext={next} />}
+            {s.step === 2 && <StepManagedEnroll onNext={next} />}
+            {s.step === 3 && <StepNodesLive onNext={next} />}
+            {s.step === 4 && (
+              <StepUseCase value={s.useCase} onChange={(v) => set("useCase", v)} onNext={next} />
+            )}
+            {s.step === 5 && (
+              <StepSource
+                source={s.source}
+                sourceMode={s.sourceMode}
+                sourceReference={s.sourceReference}
+                onChange={(source, reference, mode) =>
+                  setS((p) => ({ ...p, source, sourceMode: mode, sourceReference: reference }))
+                }
+                onNext={next}
+              />
+            )}
+            {s.step === 6 && (
+              <StepRecommendation
+                useCase={s.useCase!}
+                source={s.source!}
+                sourceReference={s.sourceReference}
+                chosen={s.chosenRecommendation}
+                onChoose={(r) => set("chosenRecommendation", r)}
+                onNext={next}
+              />
+            )}
+            {s.step === 7 && (
+              <StepService
+                serviceName={s.serviceName}
+                exposure={s.exposure}
+                onChange={(name, exp) => setS((p) => ({ ...p, serviceName: name, exposure: exp }))}
+                onNext={next}
+              />
+            )}
+            {s.step === 8 && (
+              <StepPlan
+                recommendation={s.chosenRecommendation}
+                serviceName={s.serviceName}
+                exposure={s.exposure}
+                plan={s.plan}
+                onPlan={(p) => set("plan", p)}
+                onNext={next}
+              />
+            )}
+            {s.step === 9 && (
+              <StepApply
+                plan={s.plan}
+                onApplied={(progress) => {
+                  set("applyProgress", progress);
+                  set("applyStarted", true);
+                  next();
+                }}
+              />
+            )}
+            {s.step === 10 && (
+              <StepProgress plan={s.plan!} initialProgress={s.applyProgress} onNext={next} />
+            )}
+            {s.step === 11 && <StepFinish state={s} />}
+          </div>
+        </main>
+      </SetupStepNumberContext.Provider>
 
       <footer className="border-t border-border bg-raised">
         <div className="max-w-[1200px] mx-auto px-4 h-14 flex items-center justify-between">
@@ -235,7 +251,8 @@ function SetupPage() {
             <ArrowLeft className="size-4" aria-hidden /> Back
           </button>
           <span className="rift-mono text-[11px] text-ink-secondary">
-            Step {s.step + 1} of {STEPS.length}
+            Step {visibleSteps.findIndex((item) => item.i === s.step) + 1 || 1} of{" "}
+            {visibleSteps.length}
           </span>
         </div>
       </footer>
@@ -364,7 +381,7 @@ function StepDiscover({ mode, onNext }: { mode: Mode; onNext: () => void }) {
       {!rift.isConfigured() ? (
         <div className="mt-6">
           <Unavailable
-            endpoint={mode === "standalone" ? "/v1/nodes/self" : "/v1/controller/init"}
+            endpoint={mode === "standalone" ? "/hardware" : "/state"}
             method="POST"
             resource="RiftNode (self) / Controller status"
             hint="Configure VITE_RIFT_CONTROLLER_URL, or start the controller with `rift controller start`."
@@ -1061,67 +1078,106 @@ function StepUseCase({
 
 function StepSource({
   source,
+  sourceMode,
+  sourceReference,
   onChange,
   onNext,
 }: {
   source: ModelArtifact["source"] | null;
-  onChange: (source: ModelArtifact["source"]) => void;
+  sourceMode: SourceMode;
+  sourceReference: string;
+  onChange: (source: ModelArtifact["source"], reference: string, mode: SourceMode) => void;
   onNext: () => void;
 }) {
+  const options: Array<{
+    id: SourceMode;
+    source: ModelArtifact["source"];
+    label: string;
+    detail: string;
+    placeholder: string;
+  }> = [
+    {
+      id: "automatic",
+      source: "huggingface" as const,
+      label: "Automatic Hub search",
+      detail: "RIFT searches bounded Hugging Face query arms and ranks exact artifacts.",
+      placeholder: "",
+    },
+    {
+      id: "huggingface",
+      source: "huggingface" as const,
+      label: "Hugging Face repository",
+      detail: "Inspect one repository and choose its best compatible artifact.",
+      placeholder: "org/model or https://huggingface.co/org/model",
+    },
+    {
+      id: "local-file",
+      source: "local" as const,
+      label: "Local model path",
+      detail: "Inspect one local model file or directory in place.",
+      placeholder: "C:\\models\\model.gguf",
+    },
+    {
+      id: "local-directory",
+      source: "local" as const,
+      label: "Local model directory",
+      detail: "Inventory compatible artifacts and rank them before planning.",
+      placeholder: "C:\\models",
+    },
+  ];
+  const selected = sourceMode;
+  const active = options.find((item) => item.id === selected) ?? options[0];
   return (
     <div>
       <StepTitle
         eyebrow="Step 06 / Discovery"
-        title="Let RIFT find the model"
-        description="No Hugging Face repository ID is required. RIFT searches the Hub index, ranks viable artifacts against the discovered hardware, and returns the strongest practical choices."
+        title="Choose a model source"
+        description="Use automatic discovery, inspect a specific Hub repository, or let RIFT rank model files already on this machine."
       />
-      <div className="mt-6 rift-panel overflow-hidden">
-        <div className="flex items-start gap-3 border-b border-border bg-primary/5 p-4">
-          <div className="flex size-9 shrink-0 items-center justify-center rounded-[4px] border border-primary/30 bg-raised text-primary">
-            <Search className="size-4" aria-hidden />
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="text-[14px] font-medium text-ink">
-                Automatic Hugging Face discovery
-              </span>
-              <span className="rift-label text-primary">Default</span>
-            </div>
-            <p className="mt-1 text-[12.5px] leading-5 text-ink-secondary">
-              RIFT searches task, format, popularity, recency, and parameter-size query arms,
-              removes artifacts that do not fit, then enriches and scores the finalists.
-            </p>
-          </div>
-        </div>
-        <div className="grid gap-px bg-border sm:grid-cols-3">
-          <DiscoveryStage
-            index="01"
-            title="Measure"
-            detail="GPU, RAM, disk, platform, and installed backends"
+      <div className="mt-6 grid gap-3">
+        {options.map((item) => (
+          <label
+            key={item.id}
+            className={cn(
+              "rift-panel flex items-start gap-3 p-4 cursor-pointer",
+              selected === item.id && "border-primary ring-1 ring-primary",
+            )}
+          >
+            <input
+              type="radio"
+              name="model-source"
+              className="mt-1"
+              checked={selected === item.id}
+              onChange={() =>
+                onChange(item.source, item.id === "automatic" ? "" : sourceReference, item.id)
+              }
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[14px] font-medium text-ink">{item.label}</span>
+              <span className="mt-1 block text-[12.5px] text-ink-secondary">{item.detail}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+      {active.id !== "automatic" && (
+        <label className="mt-4 grid gap-1.5">
+          <span className="rift-label">{active.id === "huggingface" ? "Repository" : "Path"}</span>
+          <input
+            type="text"
+            value={sourceReference}
+            onChange={(event) => onChange(active.source, event.target.value, active.id)}
+            placeholder={active.placeholder}
+            className="h-10 px-3 rounded-[4px] border border-border bg-raised text-[13px] rift-mono focus:outline-none focus:border-primary"
           />
-          <DiscoveryStage
-            index="02"
-            title="Search"
-            detail="Broad indexed Hub queries without downloading candidates"
-          />
-          <DiscoveryStage
-            index="03"
-            title="Rank"
-            detail="Exact artifact, backend, fit, quality evidence, and warnings"
-          />
-        </div>
-        <div className="border-t border-border p-4 text-[12px] leading-5 text-ink-secondary">
-          This is a broad indexed search, not a literal download or page-by-page crawl of every Hub
-          repository. Exact repository pulls remain available for expert workflows through
-          <span className="rift-mono text-ink"> rift model pull org/repository</span>.
-        </div>
+        </label>
+      )}
+      <div className="mt-5 rift-surface p-4 text-[12px] leading-5 text-ink-secondary">
+        Automatic search is bounded and demand-driven. A specific source is inspected exactly; RIFT
+        will not substitute an unrelated file when the requested artifact is missing.
       </div>
       <PrimaryNext
-        disabled={!source}
-        onClick={() => {
-          onChange("huggingface");
-          onNext();
-        }}
+        disabled={!source || (active.id !== "automatic" && !sourceReference.trim())}
+        onClick={onNext}
       />
     </div>
   );
@@ -1148,12 +1204,14 @@ function DiscoveryStage({
 function StepRecommendation({
   useCase,
   source,
+  sourceReference,
   chosen,
   onChoose,
   onNext,
 }: {
   useCase: UseCase;
   source: ModelArtifact["source"];
+  sourceReference: string;
   chosen: ModelRecommendation | null;
   onChoose: (r: ModelRecommendation) => void;
   onNext: () => void;
@@ -1166,13 +1224,18 @@ function StepRecommendation({
     setResult(null);
     setErr(null);
     rift
-      .recommendDetailed({ useCase, source })
+      .recommendDetailed({
+        useCase,
+        source,
+        localPath: source === "local" ? sourceReference : undefined,
+        modelRef: source === "huggingface" && sourceReference ? sourceReference : undefined,
+      })
       .then((r) => alive && setResult(r))
       .catch((e) => alive && setErr(e));
     return () => {
       alive = false;
     };
-  }, [attempt, useCase, source]);
+  }, [attempt, useCase, source, sourceReference]);
 
   const [advanced, setAdvanced] = useState(false);
 
@@ -1186,9 +1249,10 @@ function StepRecommendation({
       {err ? (
         <div className="mt-6">
           <Unavailable
-            endpoint="/v1/recommendations"
+            endpoint="/v2/recommendations"
             method="POST"
             resource="ModelRecommendation[] { priority, artifact, backend, rationale, quality, performance, resources, compromises, warnings }"
+            reason={err.message}
           />
         </div>
       ) : !result ? (
@@ -1266,7 +1330,7 @@ function StepRecommendation({
           <div className="mt-3 rift-surface p-4 text-[12.5px] text-ink-secondary rift-mono">
             Advanced knobs (quantization override, backend selection, tensor parallelism, scoring
             internals) live here. Provided per-artifact by{" "}
-            <span className="text-ink">/v1/recommendations</span> under
+            <span className="text-ink">/v2/recommendations</span> under
             <span className="text-ink"> advanced</span>.
           </div>
         )}
@@ -1500,9 +1564,10 @@ function StepPlan({
       {err ? (
         <div className="mt-6">
           <Unavailable
-            endpoint="/v1/plans"
+            endpoint="/v2/plans"
             method="POST"
             resource="Plan { id, hash, actions[], affectedNodes, expectedDowntimeMs, rollback }"
+            reason={err.message}
           />
         </div>
       ) : !plan ? (
@@ -1759,20 +1824,46 @@ function StepProgress({
   initialProgress: ApplyProgress | null;
   onNext: () => void;
 }) {
-  const [percent, setPercent] = useState(initialProgress?.percent ?? 5);
+  const [percent, setPercent] = useState<number | null>(initialProgress?.percent ?? 5);
   const [phase, setPhase] = useState<string>(initialProgress?.phase ?? "queued");
   const [message, setMessage] = useState<string>(initialProgress?.message ?? "Waiting to start…");
   const [done, setDone] = useState(initialProgress?.phase === "succeeded");
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     if (initialProgress?.phase === "succeeded") return undefined;
     let alive = true;
     const poll = async () => {
       try {
+        const progress = initialProgress?.operationId
+          ? await rift.getOperation(initialProgress.operationId, plan.id, plan.hash)
+          : null;
+        if (!alive) return;
+        if (progress) {
+          setPhase(progress.phase);
+          setPercent(progress.percent);
+          setMessage(progress.message);
+          if (progress.status === "SUCCEEDED") {
+            const applied = progress.result?.applied;
+            setDone(applied !== false);
+            if (applied === false) {
+              setPhase("failed");
+              setMessage("The controller completed the operation without applying the plan.");
+            }
+          } else if (
+            progress.status === "FAILED" ||
+            progress.status === "CANCELLED" ||
+            progress.status === "INTERRUPTED"
+          ) {
+            setDone(false);
+            setMessage(progress.error ?? progress.message);
+          }
+          return;
+        }
         const service = await rift.getService(plan.serviceId);
         if (!alive) return;
         setPhase(service.status === "running" ? "succeeded" : service.status);
-        setPercent(service.status === "running" ? 100 : 65);
+        setPercent(service.status === "running" ? 100 : null);
         setMessage(
           service.status === "running"
             ? "The service is healthy and ready."
@@ -1784,19 +1875,12 @@ function StepProgress({
       }
     };
     void poll();
-    const timer = window.setInterval(poll, 2_000);
-    const timeout = window.setTimeout(() => {
-      if (alive && !done) {
-        setPhase("failed");
-        setMessage("The controller did not report a ready service within 60 seconds.");
-      }
-    }, 60_000);
+    const timer = window.setInterval(poll, 1_000);
     return () => {
       alive = false;
       window.clearInterval(timer);
-      window.clearTimeout(timeout);
     };
-  }, [plan.id, plan.serviceId, initialProgress, done]);
+  }, [plan.id, plan.hash, plan.serviceId, initialProgress]);
 
   return (
     <div>
@@ -1808,13 +1892,56 @@ function StepProgress({
       <div className="mt-6 rift-panel p-5">
         <div className="flex items-center justify-between mb-2">
           <span className="rift-label">{phase}</span>
-          <span className="rift-mono text-[12px] text-ink">{Math.round(percent)}%</span>
+          <span className="rift-mono text-[12px] text-ink">
+            {percent == null ? "indeterminate" : `${Math.round(percent)}%`}
+          </span>
         </div>
-        <div className="h-1.5 bg-muted rounded-[2px] overflow-hidden">
-          <div className="h-full bg-primary transition-all" style={{ width: `${percent}%` }} />
+        <div
+          className="h-1.5 bg-muted rounded-[2px] overflow-hidden"
+          aria-label="operation progress"
+        >
+          <div
+            className={cn(
+              "h-full bg-primary transition-all",
+              percent == null && "w-1/3 animate-pulse",
+            )}
+            style={percent == null ? undefined : { width: `${percent}%` }}
+          />
         </div>
         <div className="mt-3 rift-mono text-[12.5px] text-ink">{message}</div>
+        {initialProgress?.operationId &&
+          phase !== "succeeded" &&
+          phase !== "failed" &&
+          phase !== "cancelled" &&
+          phase !== "interrupted" && (
+            <button
+              type="button"
+              disabled={cancelling}
+              onClick={async () => {
+                setCancelling(true);
+                try {
+                  const result = await rift.cancelOperation(initialProgress.operationId!);
+                  setPhase(result.phase);
+                  setPercent(result.percent);
+                  setMessage(result.message);
+                } catch (error) {
+                  setMessage(error instanceof Error ? error.message : String(error));
+                } finally {
+                  setCancelling(false);
+                }
+              }}
+              className="mt-4 h-8 px-3 rounded-[4px] border border-error/40 text-error text-[12px] hover:bg-error/10 disabled:opacity-50"
+            >
+              {cancelling ? "Cancelling…" : "Cancel operation"}
+            </button>
+          )}
       </div>
+      {(phase === "failed" || phase === "cancelled" || phase === "interrupted") && (
+        <p className="mt-3 rift-mono text-[11px] text-error" role="alert">
+          This operation did not complete. Review the operation details and create a new plan before
+          retrying.
+        </p>
+      )}
       <PrimaryNext disabled={!done} onClick={onNext} label="Finish" />
     </div>
   );
@@ -1942,9 +2069,13 @@ function StepTitle({
   title: string;
   description?: string;
 }) {
+  const stepNumber = useContext(SetupStepNumberContext);
+  const numberedEyebrow = stepNumber
+    ? eyebrow.replace(/^Step \d+/, `Step ${String(stepNumber).padStart(2, "0")}`)
+    : eyebrow;
   return (
     <div>
-      <div className="rift-label mb-2">{eyebrow}</div>
+      <div className="rift-label mb-2">{numberedEyebrow}</div>
       <h1 className="text-[24px] leading-tight font-medium text-ink">{title}</h1>
       {description && (
         <p className="mt-2 text-[13.5px] text-ink-secondary max-w-2xl">{description}</p>

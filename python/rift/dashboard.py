@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import os
 from pathlib import Path
 import shutil
@@ -13,7 +14,8 @@ import time
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from .orchestrator import RiftOrchestrator
 from .reconciliation import ReconcilePolicy, RiftReconciler
@@ -181,7 +183,13 @@ def serve_dashboard(
 
         from .server import RiftServerRuntime
 
-        control_runtime = RiftServerRuntime()
+        dashboard_origins = {
+            f"http://127.0.0.1:{int(port)}",
+            f"http://localhost:{int(port)}",
+        }
+        if host not in {"127.0.0.1", "localhost", "0.0.0.0", "::"}:
+            dashboard_origins.add(f"http://{host}:{int(port)}")
+        control_runtime = RiftServerRuntime(cors_origins=tuple(sorted(dashboard_origins)))
         control_server = create_rift_server(host=host, port=control_port, runtime=control_runtime)
         control_thread = threading.Thread(
             target=control_server.serve_forever,
@@ -405,13 +413,87 @@ def _dashboard_ready(url: str) -> bool:
 
 def _create_static_server(host: str, port: int, control_api_url: str) -> ThreadingHTTPServer:
     root = bundled_dashboard_root()
+    route_files = {
+        "/": "/index.html",
+        "/setup": "/setup.html",
+        "/deployments": "/deployments.html",
+        "/nodes": "/nodes.html",
+        "/models": "/models.html",
+        "/operations": "/operations.html",
+        "/settings": "/settings.html",
+    }
 
     class StaticHandler(SimpleHTTPRequestHandler):
         def __init__(self, request, client_address, server):
             super().__init__(request, client_address, server, directory=str(root))
 
+        def _proxy_controller(self) -> None:
+            target = f"{control_api_url}{self.path}"
+            request_body = None
+            if self.command not in {"GET", "HEAD"}:
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._write_proxy_response(400, "application/json", b'{"error":"invalid content length"}')
+                    return
+                if content_length < 0 or content_length > 32 * 1024 * 1024:
+                    self._write_proxy_response(413, "application/json", b'{"error":"request body too large"}')
+                    return
+                request_body = self.rfile.read(content_length)
+            headers = {
+                key: value
+                for key, value in self.headers.items()
+                if key.lower() not in {"host", "content-length", "connection"}
+            }
+            upstream_request = Request(
+                target,
+                data=request_body,
+                headers=headers,
+                method=self.command,
+            )
+            try:
+                with urlopen(upstream_request, timeout=30) as upstream:
+                    payload = upstream.read()
+                    content_type = upstream.headers.get("Content-Type", "application/octet-stream")
+                    self._write_proxy_response(upstream.status, content_type, payload, upstream.headers)
+            except HTTPError as error:
+                payload = error.read()
+                content_type = error.headers.get("Content-Type", "application/json")
+                self._write_proxy_response(error.code, content_type, payload, error.headers)
+            except OSError as error:
+                detail = json.dumps({"error": "controller proxy unavailable", "detail": str(error)})
+                self._write_proxy_response(502, "application/json", detail.encode("utf-8"))
+
+        def _write_proxy_response(
+            self,
+            status: int,
+            content_type: str,
+            payload: bytes,
+            headers=None,
+        ) -> None:
+            self.send_response(status)
+            if headers is not None:
+                for key, value in headers.items():
+                    if key.lower() in {
+                        "connection",
+                        "content-length",
+                        "content-type",
+                        "transfer-encoding",
+                        "server",
+                        "date",
+                    }:
+                        continue
+                    self.send_header(key, value)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
         def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/rift"):
+                self._proxy_controller()
+                return
             if parsed.path == "/rift-config.js":
                 body = (
                     "window.RIFT_CONTROL_API = "
@@ -424,10 +506,36 @@ def _create_static_server(host: str, port: int, control_api_url: str) -> Threadi
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            candidate = root / parsed.path.lstrip("/")
+            if parsed.path in route_files:
+                self.path = route_files[parsed.path]
+            candidate = root / urlparse(self.path).path.lstrip("/")
             if not candidate.is_file() and not parsed.path.startswith("/assets/"):
                 self.path = "/index.html"
             super().do_GET()
+
+        def do_POST(self):  # noqa: N802
+            if urlparse(self.path).path.startswith("/api/rift"):
+                self._proxy_controller()
+                return
+            self.send_error(405, "POST is only supported for controller API routes")
+
+        def do_PUT(self):  # noqa: N802
+            if urlparse(self.path).path.startswith("/api/rift"):
+                self._proxy_controller()
+                return
+            self.send_error(405, "PUT is only supported for controller API routes")
+
+        def do_PATCH(self):  # noqa: N802
+            if urlparse(self.path).path.startswith("/api/rift"):
+                self._proxy_controller()
+                return
+            self.send_error(405, "PATCH is only supported for controller API routes")
+
+        def do_DELETE(self):  # noqa: N802
+            if urlparse(self.path).path.startswith("/api/rift"):
+                self._proxy_controller()
+                return
+            self.send_error(405, "DELETE is only supported for controller API routes")
 
         def log_message(self, format, *args):
             return

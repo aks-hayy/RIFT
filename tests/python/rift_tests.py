@@ -93,7 +93,7 @@ fake_core.inspect_model = lambda model_path, **kwargs: FakeNativeEngine().inspec
 fake_core.parse_model_topology = lambda *args, **kwargs: {}
 sys.modules["rift._core"] = fake_core
 
-rift = importlib.import_module("rift.rift")
+rift = importlib.reload(importlib.import_module("rift.rift"))
 
 
 def test_rift_inspect_plan_run_report():

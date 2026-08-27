@@ -12,7 +12,8 @@ import statistics
 import subprocess
 import time
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlsplit
+import uuid
 
 from .adapters.artifacts import source_from_candidate, source_from_local
 from .adapters.contracts import AdapterManifest
@@ -141,6 +142,13 @@ class RiftOrchestrator:
                         "max_backoff_seconds": 60.0,
                         "reset_after_healthy_seconds": 300.0,
                         "rollback_to_last_known_good": True,
+                    },
+                    "evaluation": {
+                        "enabled": True,
+                        "required": False,
+                        "retain_responses": False,
+                        "max_tokens": 128,
+                        "deadline_seconds": 60.0,
                     },
                     "gateway": {
                         "enabled": True,
@@ -298,7 +306,9 @@ class RiftOrchestrator:
             raise ValueError(f"models_dir does not exist: {root}")
         models: list[JsonDict] = []
         inspected_roots: set[str] = set()
-        candidates = [root] if root.is_file() else [root, *(item for item in root.iterdir() if item.is_dir())]
+        candidates = [root]
+        if root.is_dir():
+            candidates.extend(item for item in root.iterdir() if item.is_dir())
         for candidate in candidates:
             key = str(candidate.resolve())
             if key in inspected_roots:
@@ -714,6 +724,11 @@ class RiftOrchestrator:
         selector: str = "best_estimated",
         output: str | Path | None = None,
         write: bool = True,
+        artifact_id: str | None = None,
+        backend_kind: str | None = None,
+        target_node_id: str | None = None,
+        service_name: str = "chat",
+        exposure: str = "local",
     ) -> JsonDict:
         """Turn one immutable recommendation candidate into deployable YAML intent."""
 
@@ -755,14 +770,46 @@ class RiftOrchestrator:
                 ),
                 None,
             )
+        if selected is None and artifact_id:
+            selected = next(
+                (
+                    item
+                    for item in recommendations
+                    if str(item.get("artifact_id") or "") == artifact_id
+                    or str((item.get("selected_artifact") or {}).get("artifact_id") or "")
+                    == artifact_id
+                    or str((item.get("artifact_selection") or {}).get("artifact_id") or "")
+                    == artifact_id
+                ),
+                None,
+            )
+        elif artifact_id and selected is not None:
+            selected = next(
+                (
+                    item
+                    for item in recommendations
+                    if str(item.get("artifact_id") or "") == artifact_id
+                    or str((item.get("selected_artifact") or {}).get("artifact_id") or "")
+                    == artifact_id
+                    or str((item.get("artifact_selection") or {}).get("artifact_id") or "")
+                    == artifact_id
+                ),
+                None,
+            )
         if selected is None and selector == "best_estimated":
             selected = recommendations[0]
         if selected is None:
             raise ValueError(f"selector {selector} was not found in recommendation run {run_id}")
 
-        backend = str(selected.get("backend") or "")
+        backend = str(backend_kind or selected.get("backend") or "")
         if not backend or backend == "none":
             raise ValueError("selected candidate does not have a deployable backend adapter")
+        if backend not in self.providers:
+            raise ValueError(f"requested backend adapter is not registered: {backend}")
+        if exposure not in {"local", "lan", "public"}:
+            raise ValueError("exposure must be local, lan, or public")
+        if not str(service_name).strip():
+            raise ValueError("service_name must not be empty")
         artifact = dict(selected.get("selected_artifact") or selected.get("artifact_selection") or {})
         total_bytes = int(
             artifact.get("total_bytes")
@@ -781,6 +828,12 @@ class RiftOrchestrator:
         config = self.default_config()
         task = str(run.get("task") or "chat")
         config["project"] = f"rift-{task}-{run_id[:8]}"
+        model_source = str(
+            selected.get("source")
+            or run.get("source")
+            or (run.get("discovery") or {}).get("source")
+            or "huggingface"
+        )
         config["recommendation_run"] = {
             "id": run_id,
             "selector": selector,
@@ -791,7 +844,7 @@ class RiftOrchestrator:
         service["task"] = task
         service["model"].update(
             {
-                "source": "huggingface",
+                "source": model_source,
                 "endpoint": str((run.get("discovery") or {}).get("source") or "https://huggingface.co"),
                 "id": str(selected.get("repo_id") or ""),
                 "revision": str(selected.get("revision") or "main"),
@@ -822,7 +875,7 @@ class RiftOrchestrator:
         )
         service["policy"]["backend"] = backend
         service["placement"] = {
-            "node": "local",
+            "node": str(target_node_id or "local"),
             "decision": {
                 "reason": [
                     f"candidate was selected by recommendation run {run_id}",
@@ -831,6 +884,10 @@ class RiftOrchestrator:
                 "rejected_nodes": [],
             },
         }
+        service["exposure"] = exposure
+        service["serving"]["host"] = "127.0.0.1" if exposure == "local" else "0.0.0.0"
+        service["gateway"]["host"] = "127.0.0.1" if exposure == "local" else "0.0.0.0"
+        config["services"] = {service_name: service}
         target = self._resolve_path(
             output or self.plan_dir / f"recommendation-{run_id}.yaml"
         )
@@ -838,6 +895,13 @@ class RiftOrchestrator:
             "materialized": True,
             "recommendation_run_id": run_id,
             "selector": selector,
+            "artifact_id": artifact_id or str(
+                artifact.get("artifact_id") or selected.get("artifact_id") or ""
+            ),
+            "backend_kind": backend,
+            "target_node_id": str(target_node_id or "local"),
+            "service_name": service_name,
+            "exposure": exposure,
             "selected": selected,
             "config_path": str(target),
             "config": config,
@@ -855,17 +919,33 @@ class RiftOrchestrator:
         run_id: str,
         selector: str = "best_estimated",
         output: str | Path | None = None,
+        artifact_id: str | None = None,
+        backend_kind: str | None = None,
+        target_node_id: str | None = None,
+        service_name: str = "chat",
+        exposure: str = "local",
     ) -> JsonDict:
         materialized = self.materialize_recommendation_config(
             run_id=run_id,
             selector=selector,
             output=output,
             write=True,
+            artifact_id=artifact_id,
+            backend_kind=backend_kind,
+            target_node_id=target_node_id,
+            service_name=service_name,
+            exposure=exposure,
         )
         plan = self.plan(config_path=materialized["config_path"], write=True)
         plan["recommendation_run_id"] = run_id
         plan["recommendation_selector"] = selector
         plan["materialized_config"] = materialized["config_path"]
+        plan["artifact_id"] = materialized.get("artifact_id")
+        plan["backend_kind"] = materialized.get("backend_kind")
+        plan["target_node_id"] = materialized.get("target_node_id")
+        plan["service_name"] = materialized.get("service_name")
+        plan["exposure"] = materialized.get("exposure")
+        plan["plan_hash"] = self._plan_hash(plan)
         if plan.get("plan_path"):
             self._write_json(Path(str(plan["plan_path"])), plan)
         self._write_json(self.rift_dir / "plans" / "latest.json", plan)
@@ -892,11 +972,12 @@ class RiftOrchestrator:
                 discovered.setdefault(path.name, (path, source))
 
         plans: list[JsonDict] = []
-        for path, source in sorted(
+        ordered = sorted(
             discovered.values(),
-            key=lambda item: item[0].stat().st_mtime_ns,
-            reverse=True,
-        )[:limit]:
+            key=lambda item: (item[1] != "REPOSITORY", -item[0].stat().st_mtime_ns),
+        )
+        seen_plan_ids: set[str] = set()
+        for path, source in ordered:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -926,6 +1007,9 @@ class RiftOrchestrator:
             blockers = [item for item in actions if isinstance(item, dict) and item.get("kind") == "error"]
             config_path = str(payload.get("materialized_config") or payload.get("config_path") or "")
             plan_id = str(payload.get("plan_id") or path.stem)
+            if plan_id in seen_plan_ids:
+                continue
+            seen_plan_ids.add(plan_id)
             plans.append(
                 {
                     "plan_id": plan_id,
@@ -942,6 +1026,8 @@ class RiftOrchestrator:
                     "status": "BLOCKED" if blockers else "READY",
                 }
             )
+            if len(plans) >= limit:
+                break
         return {"root": str(self.plan_dir.resolve()), "count": len(plans), "plans": plans}
 
     def clear_plans(self) -> JsonDict:
@@ -1402,10 +1488,40 @@ class RiftOrchestrator:
                         backend_decision=backend_decision,
                     )
                 )
+                services[service_name] = {
+                    "backend": None,
+                    "model": model,
+                    "serving": serving,
+                    "provider_detection": {"available": False},
+                    "provider_fit": {"fits": False, "reason": "no compatible backend"},
+                    "backend_decision": backend_decision,
+                    "launch_plan": None,
+                    "placement": service.get("placement", {"node": "local"}),
+                    "decision": model.get("decision", {}),
+                    "monitoring": dict(service.get("monitoring") or self._default_monitoring_policy()),
+                    "recovery": dict(service.get("recovery") or self._default_recovery_policy()),
+                    "gateway": dict(service.get("gateway") or {}),
+                    "governance": governance_policy.evaluate(model=model, backend="none"),
+                }
                 continue
             provider = self.providers.get(backend)
             if provider is None:
                 actions.append(self._action("error", service_name, f"backend {backend} is not implemented"))
+                services[service_name] = {
+                    "backend": backend,
+                    "model": model,
+                    "serving": serving,
+                    "provider_detection": {"available": False},
+                    "provider_fit": {"fits": False, "reason": "provider is not registered"},
+                    "backend_decision": backend_decision,
+                    "launch_plan": None,
+                    "placement": service.get("placement", {"node": "local"}),
+                    "decision": model.get("decision", {}),
+                    "monitoring": dict(service.get("monitoring") or self._default_monitoring_policy()),
+                    "recovery": dict(service.get("recovery") or self._default_recovery_policy()),
+                    "gateway": dict(service.get("gateway") or {}),
+                    "governance": governance_policy.evaluate(model=model, backend=backend),
+                }
                 continue
             detect = self._provider_probe(provider, backend)
             model_fit = self._provider_fit(
@@ -1516,6 +1632,7 @@ class RiftOrchestrator:
             plan["plan_id"] = candidate.stem
             plan["plan_path"] = str(candidate.resolve())
             plan["runtime_plan_path"] = str(runtime_target.resolve())
+            plan["plan_hash"] = self._plan_hash(plan)
             self._write_json(candidate, plan)
             self._write_json(runtime_target, plan)
             self._write_json(self.plan_dir / "latest.json", plan)
@@ -1648,35 +1765,64 @@ class RiftOrchestrator:
         *,
         config_path: str | Path = "rift.yaml",
         permissions: ApplyPermissions | None = None,
+        plan_id: str | None = None,
+        plan_hash: str | None = None,
+        deployment_record_id: str | None = None,
         progress_callback: ApplyProgressCallback | None = None,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
     ) -> JsonDict:
         permissions = permissions or ApplyPermissions()
 
         def report(
             phase: str,
-            status: str,
+            message: str,
+            percent: float | None = None,
             details: JsonDict | None = None,
             **extra: Any,
         ) -> None:
-            if progress_callback is None:
-                return
             payload = dict(details or {})
             payload.update(extra)
-            try:
-                progress_callback(phase, status, payload)
-            except Exception:
-                # Progress output must never change deployment behavior.
-                return
+            if progress is not None:
+                # The server callback supports cancellation through its
+                # exception path, so preserve exceptions from this callback.
+                progress(phase, message, percent, payload or None)
+            elif progress_callback is not None:
+                try:
+                    progress_callback(phase, message, payload)
+                except Exception:
+                    # Console/UI progress must never change deployment behavior.
+                    return
 
-        report("planning", "running", config_path=str(config_path))
-        try:
-            plan = self.plan(config_path=config_path, write=True)
-        except Exception as exc:
-            report("planning", "failed", error=str(exc))
-            raise
+        report("planning", "running", 5.0, config_path=str(config_path))
+        if plan_id:
+            plan = self.load_plan_by_id(plan_id)
+            expected_hash = self._plan_hash(plan)
+            stored_hash = str(plan.get("plan_hash") or expected_hash)
+            if stored_hash != expected_hash:
+                return {
+                    "applied": False,
+                    "reason": "selected plan has been modified and must be recreated",
+                    "plan_id": plan_id,
+                }
+            if plan_hash and str(plan_hash) != stored_hash:
+                return {
+                    "applied": False,
+                    "reason": "reviewed plan hash does not match the selected plan",
+                    "plan_id": plan_id,
+                    "expected_plan_hash": stored_hash,
+                    "received_plan_hash": plan_hash,
+                }
+            config_path = str(plan.get("config_path") or config_path)
+        else:
+            try:
+                plan = self.plan(config_path=config_path, write=True)
+            except Exception as exc:
+                report("planning", "failed", None, error=str(exc))
+                raise
         report(
             "planning",
             "complete",
+            None,
             action_count=len(plan.get("actions") or []),
         )
         error_actions = [action for action in plan["actions"] if action.get("kind") == "error"]
@@ -1826,30 +1972,12 @@ class RiftOrchestrator:
                     hardware=plan["nodes"][0]["hardware"],
                     tuning=launch_plan.get("tuning"),
                 )
-            if permissions.optimize:
-                tuning = self.tune_service(service_name=service_name, plan=plan, write=True)
-                winning_tuning = tuning.get("winning_config", launch_plan.get("tuning", {}))
-                model = service.get("model") or {}
-                serving = service.get("serving") or {}
-                model_path = (
-                    self._downloaded_model_path(downloaded, model)
-                    if downloaded and downloaded.get("local_dir")
-                    else str(
-                        model.get("selected_file")
-                        or model.get("local_path")
-                        or model.get("id")
-                    )
-                )
-                launch_plan = self._provider_launch_spec(
-                    provider,
-                    model_path=model_path,
-                    host=str(serving.get("host") or "127.0.0.1"),
-                    port=int(serving.get("port") or 11735),
-                    context_length=int(serving.get("context_length") or 4096),
-                    concurrency=int(serving.get("concurrency") or 1),
-                    hardware=plan["nodes"][0]["hardware"],
-                    tuning=winning_tuning,
-                )
+            report(
+                "launching",
+                f"Starting {service_name} through {service['backend']}",
+                None,
+                {"service": service_name},
+            )
             try:
                 launched = provider.launch(
                     launch_plan,
@@ -1884,24 +2012,133 @@ class RiftOrchestrator:
                 "updated_unix_seconds": int(time.time()),
             }
             results.append({"service": service_name, "launched": launched})
-            report(
-                "launching",
-                "item_complete",
-                service=service_name,
-                backend=str(service["backend"]),
-                completed=index,
-                total=len(services),
+            report("launching", f"Started {service_name}; waiting for health", 85.0, {"service": service_name})
+        self.write_state(state)
+        tuning_results: list[JsonDict] = []
+        if permissions.optimize:
+            # Optimization is measured only after the reviewed deployment is
+            # healthy. This prevents a plan-only candidate from being reported
+            # as a measured improvement and keeps failed candidates reversible.
+            for service_name in plan["services"]:
+                report(
+                    "benchmarking",
+                    f"Measuring tuning candidates for {service_name}",
+                    None,
+                    {"service": service_name, "warmups": 1, "repetitions": 3, "candidates": 2},
+                )
+                tuning_results.append(
+                    self.tune_service(
+                        service_name=service_name,
+                        config_path=config_path,
+                        write=True,
+                        live=True,
+                        allow_restart=True,
+                        candidate_limit=2,
+                        warmup_runs=1,
+                        repeats=3,
+                    )
+                )
+            state = self.read_state()
+        evaluation_results: list[JsonDict] = []
+        for service_name, service in plan["services"].items():
+            evaluation = service.get("evaluation") or {}
+            if not bool(evaluation.get("enabled", True)):
+                continue
+            observation = self._service_observation(service_name, state["services"][service_name])
+            if not observation.get("healthy"):
+                if bool(evaluation.get("required", False)):
+                    evaluation_results.append(
+                        self.evaluate_service(
+                            service_name=service_name,
+                            max_tokens=min(128, int(evaluation.get("max_tokens") or 128)),
+                            total_deadline_seconds=float(evaluation.get("deadline_seconds") or 60.0),
+                            retain_responses=bool(evaluation.get("retain_responses", False)),
+                            required=True,
+                            write=True,
+                            judge=evaluation.get("judge") if isinstance(evaluation.get("judge"), dict) else None,
+                        )
+                    )
+                continue
+            report("benchmarking", f"Running answer-quality smoke checks for {service_name}", None, {"service": service_name})
+            evaluation_results.append(
+                self.evaluate_service(
+                    service_name=service_name,
+                    max_tokens=min(128, int(evaluation.get("max_tokens") or 128)),
+                    total_deadline_seconds=float(evaluation.get("deadline_seconds") or 60.0),
+                    retain_responses=bool(evaluation.get("retain_responses", False)),
+                    required=bool(evaluation.get("required", False)),
+                    write=True,
+                    judge=evaluation.get("judge") if isinstance(evaluation.get("judge"), dict) else None,
+                )
             )
+        if evaluation_results:
+            for evaluation_result in evaluation_results:
+                self._remember_evaluation_state(
+                    state,
+                    str(evaluation_result.get("service") or ""),
+                    evaluation_result,
+                )
+            self.write_state(state)
+        required_failures = [
+            item
+            for item in evaluation_results
+            if bool(item.get("required"))
+            and (
+                item.get("status") != "completed"
+                or int((item.get("summary") or {}).get("fail", 0)) > 0
+            )
+        ]
+        if required_failures:
+            stopped = []
+            for item in required_failures:
+                service_name = str(item.get("service") or "")
+                if service_name:
+                    stopped.append(self.stop_service(service_name=service_name))
+            report("failed", "Required answer-quality evaluation blocked promotion", None)
+            return {
+                "applied": False,
+                "reason": "required answer-quality evaluation failed; service was stopped",
+                "promotion_blocked": True,
+                "evaluation_failures": required_failures,
+                "stopped": stopped,
+                "plan": plan,
+                "install_results": install_results,
+                "results": results,
+                "tuning": tuning_results,
+                "evaluations": evaluation_results,
+                "state_path": str(self.state_path),
+            }
+        records: list[JsonDict] = []
+        for service_name, service in plan["services"].items():
+            state_service = state.get("services", {}).get(service_name)
+            if not isinstance(state_service, dict):
+                continue
+            record_id = deployment_record_id if len(plan["services"]) == 1 else None
+            record = self._upsert_deployment_record(
+                service_name=service_name,
+                plan=plan,
+                service=state_service,
+                config=config,
+                status="ready",
+                record_id=record_id,
+            )
+            state_service["deployment_record_id"] = record["deployment_id"]
+            records.append(record)
+        if records:
+            self.write_state(state)
         report("launching", "complete", completed=len(services), total=len(services))
         report("persisting", "running")
-        self.write_state(state)
         report("persisting", "complete")
         report("complete", "complete", service_count=len(results))
+        report("succeeded", "Deployment completed", 100.0)
         return {
             "applied": True,
             "plan": plan,
             "install_results": install_results,
             "results": results,
+            "tuning": tuning_results,
+            "evaluations": evaluation_results,
+            "deployment_records": records,
             "state_path": str(self.state_path),
         }
 
@@ -1910,6 +2147,7 @@ class RiftOrchestrator:
         plan: JsonDict,
         *,
         progress_callback: ApplyProgressCallback | None = None,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
     ) -> list[JsonDict]:
         downloads = []
         download_actions = [action for action in plan["actions"] if action.get("kind") == "download"]
@@ -1969,19 +2207,27 @@ class RiftOrchestrator:
             result["artifact_manifest_path"] = self.artifacts.write(manifest, manifest_path)
             downloads.append({"service": service_name, **result})
             completed += 1
-            if progress_callback is not None:
+            details = {
+                "service": service_name,
+                "repo_id": repo_id,
+                "completed": completed,
+                "total": len(download_actions),
+                "local_dir": local_dir,
+                "reused": bool(result.get("reused")),
+            }
+            if progress is not None:
+                progress(
+                    "downloading",
+                    f"Downloaded artifact for {service_name}",
+                    None,
+                    details,
+                )
+            elif progress_callback is not None:
                 try:
                     progress_callback(
                         "downloading",
                         "item_complete",
-                        {
-                            "service": service_name,
-                            "repo_id": repo_id,
-                            "completed": completed,
-                            "total": len(download_actions),
-                            "local_dir": local_dir,
-                            "reused": bool(result.get("reused")),
-                        },
+                        details,
                     )
                 except Exception:
                     pass
@@ -2051,17 +2297,38 @@ class RiftOrchestrator:
             if not isinstance(item, dict):
                 continue
             if selected_file and str(item.get("path") or "") == selected_file:
-                return str(item.get("local_path"))
+                local_path = Path(str(item.get("local_path") or ""))
+                if not local_path.is_file():
+                    raise ValueError(f"selected model file is missing after download: {selected_file}")
+                return str(local_path)
         local_dir = Path(str(downloaded.get("local_dir") or ""))
         if selected_file:
             candidate = local_dir.joinpath(*Path(selected_file).parts)
             if candidate.is_file():
                 return str(candidate)
-        if str(model.get("format") or "").lower() == "gguf" and local_dir.is_dir():
-            ggufs = sorted(local_dir.rglob("*.gguf"))
-            if ggufs:
-                return str(ggufs[0])
-        return str(local_dir)
+            raise ValueError(f"selected model file was not materialized: {selected_file}")
+        selected_files = [str(item) for item in model.get("selected_files", []) if str(item).strip()]
+        if selected_files:
+            missing = [item for item in selected_files if not local_dir.joinpath(*Path(item).parts).is_file()]
+            if missing:
+                raise ValueError(f"selected model files are missing after download: {', '.join(missing[:3])}")
+            return str(local_dir)
+        if local_dir.is_file():
+            return str(local_dir)
+        if local_dir.is_dir():
+            supported_files = sorted(
+                item
+                for item in local_dir.iterdir()
+                if item.is_file() and item.suffix.lower() in {".gguf", ".safetensors", ".bin"}
+            )
+            if len(supported_files) == 1:
+                return str(supported_files[0])
+            if not supported_files:
+                return str(local_dir)
+            raise ValueError(
+                "download contains multiple model files but no selected_file; recreate the plan with an exact artifact"
+            )
+        raise ValueError(f"downloaded model directory does not exist: {local_dir}")
 
     @property
     def state_path(self) -> Path:
@@ -2247,12 +2514,82 @@ class RiftOrchestrator:
                     "recovery": action,
                 }
             )
+            evaluation = service.get("evaluation") or {}
+            if (
+                service["status"] == "healthy"
+                and bool(evaluation.get("enabled", True))
+                and str(service.get("desired_state") or "running") != "stopped"
+            ):
+                fingerprint = self._evaluation_fingerprint(state, service, name)
+                previous = service.get("evaluation_state") or {}
+                if str(previous.get("fingerprint") or "") != fingerprint:
+                    evaluation_result = self.evaluate_service(
+                        service_name=name,
+                        max_tokens=min(128, int(evaluation.get("max_tokens") or 128)),
+                        total_deadline_seconds=float(evaluation.get("deadline_seconds") or 60.0),
+                        retain_responses=bool(evaluation.get("retain_responses", False)),
+                        required=bool(evaluation.get("required", False)),
+                        write=True,
+                    )
+                    service["evaluation_state"] = {
+                        "fingerprint": fingerprint,
+                        "run_id": evaluation_result.get("run_id"),
+                        "status": evaluation_result.get("status"),
+                        "summary": dict(evaluation_result.get("summary") or {}),
+                        "completed_unix_seconds": evaluation_result.get("completed_unix_seconds"),
+                    }
+                    results[-1]["answer_quality"] = {
+                        "run_id": evaluation_result.get("run_id"),
+                        "status": evaluation_result.get("status"),
+                        "summary": evaluation_result.get("summary"),
+                        "required": bool(evaluation.get("required", False)),
+                    }
         self.write_state(state)
         return {
             "rift_product": "RIFT",
             "created_unix_seconds": current_time,
             "allow_recovery": allow_recovery,
             "results": results,
+        }
+
+    def _evaluation_fingerprint(
+        self,
+        state: JsonDict,
+        service: JsonDict,
+        service_name: str | None = None,
+    ) -> str:
+        """Identify the effective deployment revision tested by the smoke suite."""
+
+        return self._fingerprint(
+            {
+                "config_fingerprint": state.get("config_fingerprint"),
+                "service": service_name or service.get("name"),
+                "model": service.get("model"),
+                "backend": service.get("backend"),
+                "launch_plan": service.get("launch_plan"),
+                "serving": service.get("serving"),
+            }
+        )
+
+    def _remember_evaluation_state(
+        self,
+        state: JsonDict,
+        service_name: str,
+        evaluation_result: JsonDict,
+    ) -> None:
+        """Persist a small evaluation index without retaining model responses."""
+
+        if not service_name:
+            return
+        service = (state.get("services") or {}).get(service_name)
+        if not isinstance(service, dict):
+            return
+        service["evaluation_state"] = {
+            "fingerprint": self._evaluation_fingerprint(state, service, service_name),
+            "run_id": evaluation_result.get("run_id"),
+            "status": evaluation_result.get("status"),
+            "summary": dict(evaluation_result.get("summary") or {}),
+            "completed_unix_seconds": evaluation_result.get("completed_unix_seconds"),
         }
 
     def recover(
@@ -2304,6 +2641,59 @@ class RiftOrchestrator:
             "recovered": result.get("action") in ("restarted", "rolled_back"),
             "service": service_name,
             "result": result,
+            "state_path": str(self.state_path),
+        }
+
+    def stop_service(self, *, service_name: str) -> JsonDict:
+        """Stop a service while retaining its desired configuration and model."""
+
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        if service is None:
+            return {"stopped": False, "service": service_name, "reason": "service not found"}
+        pid_value = (service.get("runtime") or {}).get("pid")
+        pid = int(pid_value) if pid_value not in (None, "") else None
+        termination = self._terminate_pid(pid) if pid is not None and self._process_alive(pid) else {
+            "stopped": True,
+            "status": "not_running",
+            "pid": pid,
+        }
+        service["desired_state"] = "stopped"
+        service["status"] = "stopped"
+        service["updated_unix_seconds"] = int(time.time())
+        self._set_deployment_record_status(
+            service_name=service_name,
+            service=service,
+            status="stopped",
+        )
+        self.write_state(state)
+        return {"stopped": bool(termination.get("stopped")), "service": service_name, "termination": termination}
+
+    def rollback_service(self, *, service_name: str, allow_launch: bool = False) -> JsonDict:
+        """Re-launch the persisted last-known-good command when available."""
+
+        if not allow_launch:
+            return {
+                "rolled_back": False,
+                "service": service_name,
+                "reason": "--allow-launch is required for rollback",
+                "required_permission": "allow_launch",
+            }
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        if service is None:
+            return {"rolled_back": False, "service": service_name, "reason": "service not found"}
+        known_good = service.get("last_known_good_launch_plan") or service.get("launch_plan") or {}
+        if not known_good.get("command"):
+            return {"rolled_back": False, "service": service_name, "reason": "no last-known-good launch plan is recorded"}
+        service["launch_plan"] = dict(known_good)
+        observation = self._service_observation(service_name, service)
+        result = self._restart_service(state, service_name, service, observation, time.time(), bypass_limits=True)
+        self.write_state(state)
+        return {
+            "rolled_back": result.get("action") in ("restarted", "rolled_back"),
+            "service": service_name,
+            "result": {**result, "used_last_known_good": True},
             "state_path": str(self.state_path),
         }
 
@@ -2912,6 +3302,25 @@ class RiftOrchestrator:
                 return json.loads(path.read_text(encoding="utf-8"))
         return {"available": False}
 
+    def load_plan_by_id(self, plan_id: str) -> JsonDict:
+        value = str(plan_id or "").strip()
+        if not value or Path(value).name != value or Path(value).suffix:
+            raise ValueError("plan_id must be a plan filename stem")
+        candidates = [self.rift_dir / "plans" / f"{value}.json", self.plan_dir / f"{value}.json"]
+        path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if path is None:
+            raise KeyError(f"plan not found: {plan_id}")
+        try:
+            plan = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"plan is not readable: {plan_id}") from exc
+        if not isinstance(plan, dict):
+            raise ValueError(f"plan is not an object: {plan_id}")
+        plan.setdefault("plan_id", value)
+        plan.setdefault("plan_path", str(path))
+        plan.setdefault("plan_hash", self._plan_hash(plan))
+        return plan
+
     def generated_config(self, path: str | Path = ".rift/generated/rift.generated.yaml") -> JsonDict:
         target = self._resolve_path(path)
         if not target.exists():
@@ -2929,6 +3338,55 @@ class RiftOrchestrator:
                     payload = {}
                 reports.append({"path": str(path), "summary": payload})
         return {"reports": reports}
+
+    def evaluations(self, *, service_name: str | None = None, limit: int = 50) -> JsonDict:
+        """List persisted answer-evaluation runs without exposing credentials."""
+
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        root = self.rift_dir / "reports"
+        entries: list[JsonDict] = []
+        if root.is_dir():
+            for path in sorted(root.glob("*-evaluation.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                if service_name and str(payload.get("service") or "") != service_name:
+                    continue
+                entries.append(
+                    {
+                        "run_id": payload.get("run_id"),
+                        "service": payload.get("service"),
+                        "status": payload.get("status"),
+                        "summary": payload.get("summary", {}),
+                        "suite": {
+                            "id": (payload.get("suite") or {}).get("id"),
+                            "version": (payload.get("suite") or {}).get("version"),
+                        },
+                        "created_unix_seconds": payload.get("started_unix_seconds"),
+                        "path": str(path),
+                    }
+                )
+                if len(entries) >= limit:
+                    break
+        return {"api_version": "2", "count": len(entries), "evaluations": entries}
+
+    def load_evaluation(self, run_id: str) -> JsonDict:
+        value = str(run_id or "").strip()
+        if not value or Path(value).name != value or Path(value).suffix:
+            raise ValueError("evaluation run id is invalid")
+        root = self.rift_dir / "reports"
+        for path in root.glob("*-evaluation.json") if root.is_dir() else ():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("run_id") == value:
+                return payload
+        raise KeyError(f"evaluation run not found: {value}")
 
     def backend_status(self) -> JsonDict:
         return {
@@ -2952,6 +3410,266 @@ class RiftOrchestrator:
             },
             "registry": self.backend_host.diagnostics(),
         }
+
+    def model_sources(self) -> JsonDict:
+        """Return actual configured and managed model sources for the operator UI."""
+
+        sources: list[JsonDict] = [
+            {
+                "id": "huggingface",
+                "kind": "huggingface",
+                "endpoint": "https://huggingface.co",
+                "configured": True,
+                "status": "ready",
+                "credentials": "not configured in controller state",
+            }
+        ]
+        managed = self.rift_dir / "models"
+        managed_bytes = 0
+        managed_files = 0
+        if managed.is_dir():
+            for item in managed.rglob("*"):
+                if item.is_file():
+                    try:
+                        managed_bytes += item.stat().st_size
+                        managed_files += 1
+                    except OSError:
+                        continue
+        sources.append(
+            {
+                "id": "rift-managed",
+                "kind": "local",
+                "path": str(managed),
+                "configured": True,
+                "status": "ready" if managed.is_dir() else "empty",
+                "file_count": managed_files,
+                "bytes": managed_bytes,
+            }
+        )
+        config_path = self.root / "rift.yaml"
+        if config_path.is_file():
+            try:
+                config = self.load_config(config_path)
+            except Exception as exc:
+                return {"available": False, "reason": f"rift.yaml could not be read: {exc}", "sources": sources}
+            seen: set[str] = set()
+            for service in (config.get("services") or {}).values():
+                model = (service or {}).get("model") if isinstance(service, dict) else {}
+                if not isinstance(model, dict):
+                    continue
+                path = str(model.get("local_path") or "").strip()
+                if path and path not in seen:
+                    seen.add(path)
+                    candidate = Path(path).expanduser()
+                    sources.append(
+                        {
+                            "id": f"configured-{len(sources)}",
+                            "kind": "local",
+                            "path": str(candidate),
+                            "configured": True,
+                            "status": "ready" if candidate.exists() else "missing",
+                        }
+                    )
+        return {"available": True, "sources": sources}
+
+    def settings_snapshot(self) -> JsonDict:
+        """Return the redacted settings that are actually backed by RIFT state."""
+
+        config_path = self.root / "rift.yaml"
+        config: JsonDict = {}
+        config_error: str | None = None
+        if config_path.is_file():
+            try:
+                loaded = self.load_config(config_path)
+                if isinstance(loaded, dict):
+                    config = loaded
+            except Exception as exc:
+                config_error = str(exc)
+        services: JsonDict = {}
+        gateway_configs: list[JsonDict] = []
+        exposed_services: list[str] = []
+        for name, service in (config.get("services") or {}).items():
+            if not isinstance(service, dict):
+                continue
+            policy = service.get("policy")
+            serving = service.get("serving")
+            backend_name = service.get("backend")
+            gateway_config = service.get("gateway")
+            if isinstance(gateway_config, dict):
+                gateway_configs.append({"service": str(name), **gateway_config})
+            if str(service.get("exposure") or "local").lower() not in ("local", "loopback"):
+                exposed_services.append(str(name))
+            if not backend_name and isinstance(policy, dict):
+                backend_name = policy.get("backend")
+            services[str(name)] = {
+                "backend": backend_name,
+                "exposure": service.get("exposure") or "local",
+                "context_length": serving.get("context_length") if isinstance(serving, dict) else None,
+                "concurrency": serving.get("concurrency") if isinstance(serving, dict) else None,
+                "allow_remote": bool((service.get("permissions") or {}).get("allow_remote", False)) if isinstance(service.get("permissions"), dict) else False,
+            }
+        gateway = self.gateway_status()
+        configured_gateway = gateway_configs[0] if gateway_configs else {}
+        gateway_state = gateway.get("state") if isinstance(gateway.get("state"), dict) else {}
+        gateway_host = str(
+            configured_gateway.get("host")
+            or gateway_state.get("host")
+            or "127.0.0.1"
+        )
+        configured_cors = configured_gateway.get("cors_origins") or ()
+        if isinstance(configured_cors, str):
+            configured_cors = (configured_cors,)
+        cors_origins = [str(item) for item in configured_cors if str(item).strip()]
+        api_key_env = str(configured_gateway.get("api_key_env") or "RIFT_GATEWAY_API_KEYS")
+        environment_keys = [
+            item.strip()
+            for item in os.environ.get(api_key_env, "").split(",")
+            if item.strip()
+        ]
+        stored_keys = gateway.get("api_keys")
+        stored_key_count = (
+            int(stored_keys.get("count") or 0)
+            if isinstance(stored_keys, dict)
+            else len(stored_keys or [])
+        )
+        api_key_count = stored_key_count + len(environment_keys)
+        security_warnings: list[str] = []
+        if "*" in cors_origins:
+            security_warnings.append(
+                "Unrestricted CORS is enabled; any browser origin can call the gateway."
+            )
+        if gateway_host not in ("127.0.0.1", "localhost", "::1") or exposed_services:
+            if api_key_count == 0:
+                security_warnings.append(
+                    "Gateway exposure is beyond loopback but no API key is configured."
+                )
+            if not gateway.get("configured", False):
+                security_warnings.append(
+                    "Gateway security is not active because the gateway has not been started."
+                )
+        return {
+            "api_version": "2",
+            "available": config_error is None,
+            "config_path": str(config_path),
+            "config_error": config_error,
+            "model_sources": self.model_sources(),
+            "gateway": {
+                "configured": gateway.get("configured", False),
+                "status": gateway.get("status", "not_started"),
+                "process_alive": gateway.get("process_alive", False),
+                "state_path": gateway.get("state_path"),
+                "metrics_path": gateway.get("metrics_path"),
+                "key_count": api_key_count,
+                "api_key_env": api_key_env,
+                "api_key_protection": "configured" if api_key_count else "not_configured",
+                "bound_host": gateway_host,
+                "cors_origins": cors_origins,
+                "security_warnings": security_warnings,
+            },
+            "services": services,
+            "policies": {
+                "apply_requires_explicit_permissions": True,
+                "remote_actions_require_allow_remote": True,
+                "model_files_deleted_on_destroy": False,
+            },
+            "mesh": self.mesh_snapshot(),
+        }
+
+    def mesh_snapshot(self) -> JsonDict:
+        """Expose mesh status without exposing pairing codes or private material."""
+
+        mesh_root = self.rift_dir / "mesh"
+        controller_id = None
+        state_path = mesh_root / "controller.json"
+        if state_path.is_file():
+            try:
+                value = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    controller_id = value.get("controller_id")
+            except (OSError, json.JSONDecodeError):
+                pass
+        return {
+            "controller_id": controller_id,
+            "enrollment_window": self._mesh_enrollment_snapshot(),
+            "managed_nodes": len((self.read_state().get("nodes") or {})),
+        }
+
+    def _mesh_enrollment_snapshot(self) -> JsonDict:
+        try:
+            return self.mesh_controller().enrollment_window_status()
+        except Exception as exc:
+            return {"available": False, "reason": str(exc)}
+
+    def recommend_local_models(
+        self,
+        *,
+        task: str = "chat",
+        models_dir: str,
+        top: int = 10,
+    ) -> JsonDict:
+        if top <= 0:
+            raise ValueError("top must be positive")
+        discovery = self.discover(local=True, models_dir=models_dir, write=False)
+        hardware = discovery["nodes"][0]["hardware"]
+        ranked: list[JsonDict] = []
+        for item in self.scan_local_models(models_dir):
+            model = {**item, **dict(item.get("artifact") or {})}
+            decision = self._select_provider_for_model(
+                model=model, hardware=hardware, requested="auto"
+            )
+            backend = str(decision.get("backend") or "")
+            winner = next(
+                (candidate for candidate in decision.get("candidates", []) if candidate.get("backend") == backend),
+                None,
+            )
+            if not winner or not winner.get("fits"):
+                continue
+            size = int(item.get("size") or model.get("total_bytes") or model.get("size") or 0)
+            ranked.append(
+                {
+                    "repo_id": str(item["path"]),
+                    "local_path": str(item["path"]),
+                    "source": "local",
+                    "format": item.get("format"),
+                    "quantization": item.get("quantization"),
+                    "selected_file": str(item["path"]),
+                    "selected_files": [str(item["path"])],
+                    "selected_download_bytes": 0,
+                    "estimated_download_bytes": size,
+                    "parameters_b": model.get("parameters_b"),
+                    "model_type": model.get("architecture") or model.get("model_type") or "local artifact",
+                    "backend": backend,
+                    "license": model.get("license") or "unknown",
+                    "gated": False,
+                    "final_score": float(winner.get("score") or 0.0),
+                    "confidence": 0.5,
+                    "scores": {"hardware_fit": float(winner.get("score") or 0.0), "quality_proxy": 0.0},
+                    "evidence": [
+                        "artifact was inspected from the supplied local path",
+                        str(winner.get("reason") or "backend accepted the local artifact"),
+                    ],
+                    "warnings": [],
+                    "artifact_selection": model,
+                    "disk_feasibility": {"status": "local_artifact", "required_bytes": 0},
+                    "backend_candidates": decision.get("candidates", []),
+                }
+            )
+        ranked.sort(key=lambda item: (-float(item["final_score"]), int(item.get("estimated_download_bytes") or 0), str(item["repo_id"])))
+        run_id = f"local-{time.time_ns()}"
+        result = {
+            "recommendation_run_id": run_id,
+            "task": task,
+            "source": "local",
+            "recommendations": ranked[:top],
+            "candidate_counts": {"raw": len(ranked), "after_filters": len(ranked), "enriched": len(ranked), "returned": min(top, len(ranked))},
+            "query_arms": [],
+            "answer": {"headline": "Local model inventory", "detail": f"Ranked {len(ranked)} compatible local artifacts."},
+            "created_unix_seconds": time.time(),
+            "recommendation_contract": "v2",
+            "hardware_profile": hardware,
+        }
+        self.recommendation_store.save_recommendation(result)
+        return result
 
     def calibrate_hardware(self, *, sample_bytes: int = 32 * 1024**2, force: bool = False) -> JsonDict:
         from .system_profile import HardwareAnalyzer
@@ -2992,8 +3710,17 @@ class RiftOrchestrator:
         service_name: str = "chat",
         warmups: int = 1,
         repetitions: int = 3,
+        prompt: str | None = None,
+        max_tokens: int = 48,
+        concurrency: int = 1,
         write: bool = True,
     ) -> JsonDict:
+        if warmups < 0 or repetitions <= 0:
+            raise ValueError("warmups cannot be negative and repetitions must be positive")
+        if max_tokens <= 0 or max_tokens > 128:
+            raise ValueError("max_tokens must be between 1 and 128")
+        if concurrency <= 0:
+            raise ValueError("concurrency must be positive")
         state = self.read_state()
         service = state.get("services", {}).get(service_name)
         if not service:
@@ -3003,17 +3730,34 @@ class RiftOrchestrator:
         api_base = runtime.get("api_base") or (service.get("launch_plan") or {}).get("api_base")
         if not provider or not api_base:
             return {"available": False, "reason": "service has no benchmarkable provider/api_base"}
-        report = BenchmarkSuite().run(
+        suite = (
+            BenchmarkSuite()
+            if not str(prompt or "").strip()
+            else BenchmarkSuite(
+                (
+                    {
+                        "id": "operator-prompt",
+                        "task": "operator",
+                        "prompt": str(prompt).strip(),
+                        "max_tokens": int(max_tokens),
+                    },
+                )
+            )
+        )
+        report = suite.run(
             provider.benchmark,
             base_url=str(api_base),
             warmups=warmups,
             repetitions=repetitions,
+            concurrency=concurrency,
             metadata={
                 "service": service_name,
                 "backend": service.get("backend"),
                 "model": service.get("model"),
                 "launch_plan": service.get("launch_plan"),
                 "hardware_fingerprint": (self.engine.hardware_profile() or {}).get("fingerprint"),
+                "operator_prompt": bool(str(prompt or "").strip()),
+                "max_tokens": int(max_tokens),
             },
         )
         if write:
@@ -3037,6 +3781,179 @@ class RiftOrchestrator:
             details=report.get("summary", {}),
         )
         return report
+
+    def evaluate_service(
+        self,
+        *,
+        service_name: str = "chat",
+        suite: JsonDict | None = None,
+        max_tokens: int = 128,
+        total_deadline_seconds: float = 60.0,
+        retain_responses: bool = False,
+        required: bool = False,
+        write: bool = True,
+        judge: JsonDict | None = None,
+    ) -> JsonDict:
+        """Run explicit, bounded answer checks against one healthy service.
+
+        Evaluation is deliberately independent from service health. A model can
+        be reachable while failing a content criterion, and that result must not
+        make the backend appear dead to the supervisor.
+        """
+
+        from .evaluation import (
+            EvaluationCaseResult,
+            EvaluationRun,
+            EvaluationSuite,
+            evaluate_suite,
+            invoke_openai_compatible,
+            default_evaluation_suite,
+            invoke_judge_openai_compatible,
+        )
+
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if total_deadline_seconds <= 0.0:
+            raise ValueError("total_deadline_seconds must be positive")
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        if not isinstance(service, dict):
+            return {
+                "available": False,
+                "status": "not_run",
+                "service": service_name,
+                "reason": f"service not found in state: {service_name}",
+            }
+        selected_suite = default_evaluation_suite() if suite is None else EvaluationSuite.from_mapping(suite)
+        runtime = service.get("runtime") or {}
+        launch_plan = service.get("launch_plan") or {}
+        api_base = str(runtime.get("api_base") or launch_plan.get("api_base") or "").strip()
+        backend_name = str(service.get("backend") or "")
+        provider = self.providers.get(backend_name)
+        health = None
+        if provider is not None and api_base:
+            try:
+                health = provider.health(base_url=api_base, timeout_seconds=2.0)
+            except Exception as exc:
+                health = {"healthy": False, "reason": str(exc)}
+        model = service.get("model") or {}
+        model_id = str(
+            runtime.get("model")
+            or launch_plan.get("model")
+            or model.get("id")
+            or model.get("selected_file")
+            or service_name
+        )
+        run_id = f"evaluation-{service_name}-{time.time_ns()}"
+        configuration = {
+            "max_tokens": min(128, int(max_tokens)),
+            "deadline_seconds": float(total_deadline_seconds),
+            "retain_responses": bool(retain_responses),
+            "required": bool(required),
+            "context_length": (service.get("serving") or {}).get("context_length"),
+            "concurrency": (service.get("serving") or {}).get("concurrency"),
+        }
+        judge_invoke = None
+        if judge is not None:
+            if not isinstance(judge, dict):
+                raise ValueError("judge must be an object")
+            if "token" in judge:
+                raise ValueError("judge credentials must use credential_ref, not an inline token")
+            if not bool(judge.get("external_data_consent", False)):
+                raise PermissionError("judge requires explicit external_data_consent")
+            credential_ref = str(judge.get("credential_ref") or "").strip()
+            if not credential_ref:
+                raise ValueError("judge credential_ref is required")
+            token = None
+            if credential_ref != "none":
+                if not credential_ref.startswith("env:"):
+                    raise ValueError("judge credential_ref must be none or env:VARIABLE_NAME")
+                env_name = credential_ref[4:].strip()
+                if not env_name or not env_name.replace("_", "").isalnum() or not env_name[0].isalpha():
+                    raise ValueError("judge environment credential reference is invalid")
+                token = os.environ.get(env_name)
+                if not token:
+                    raise ValueError("judge credential environment variable is not set")
+            allowed_hosts = judge.get("allowed_hosts")
+            if not isinstance(allowed_hosts, list) or not all(str(host).strip() for host in allowed_hosts):
+                raise ValueError("judge allowed_hosts must be a non-empty array")
+            judge_endpoint = str(judge.get("endpoint") or "").strip()
+            judge_model = str(judge.get("model") or "").strip()
+            judge_invoke = invoke_judge_openai_compatible(
+                judge_endpoint,
+                model=judge_model,
+                token=token,
+                allowed_hosts=[str(host) for host in allowed_hosts],
+                timeout_seconds=min(30.0, float(judge.get("timeout_seconds") or 15.0)),
+            )
+            configuration["judge"] = {
+                "enabled": True,
+                "endpoint_host": str(urlsplit(judge_endpoint).hostname or ""),
+                "model": judge_model,
+                "allowed_hosts": [str(host) for host in allowed_hosts],
+                "external_data_consent": True,
+                "credential_ref": credential_ref,
+            }
+        if not api_base or provider is None or not bool((health or {}).get("healthy")):
+            reason = (
+                "service is not healthy or has no OpenAI-compatible endpoint"
+                if not health
+                else str(health.get("reason") or "service health check failed")
+            )
+            run = EvaluationRun(
+                run_id=run_id,
+                suite=selected_suite,
+                status="not_run",
+                service=service_name,
+                backend=backend_name,
+                model={"id": model_id},
+                configuration=configuration,
+            )
+            run.cases = [
+                EvaluationCaseResult(case.case_id, "not_assessed", case.kind, reason)
+                for case in selected_suite.cases
+            ]
+            run.completed_unix_seconds = time.time()
+            result = run.to_dict()
+            result.update({"available": False, "health": health, "required": bool(required)})
+        else:
+            invoke = invoke_openai_compatible(api_base, model=model_id, timeout_seconds=min(30.0, total_deadline_seconds))
+            run = evaluate_suite(
+                selected_suite,
+                invoke,
+                run_id=run_id,
+                max_tokens=min(128, int(max_tokens)),
+                total_deadline_seconds=total_deadline_seconds,
+                retain_responses=retain_responses,
+                service=service_name,
+                backend=backend_name,
+                model={"id": model_id},
+                configuration=configuration,
+                judge=judge_invoke,
+            )
+            result = run.to_dict()
+            result.update({"available": True, "health": health, "required": bool(required)})
+        result["service"] = service_name
+        result["model_revision"] = {
+            "artifact": model.get("selected_file") or model.get("local_path") or model.get("id"),
+            "config_fingerprint": state.get("config_fingerprint"),
+        }
+        if write:
+            target = self._timestamped("reports", f"{service_name}-evaluation")
+            self._write_json(target, result)
+            result["report_path"] = str(target)
+        self.observability_store.append(
+            "evaluation_completed",
+            status="ok" if result.get("status") == "completed" and result.get("summary", {}).get("fail", 0) == 0 else "warning",
+            service=service_name,
+            details={
+                "run_id": run_id,
+                "status": result.get("status"),
+                "summary": result.get("summary"),
+                "required": bool(required),
+            },
+        )
+        return result
 
     def logs(self, *, service_name: str = "chat", tail: int = 200) -> JsonDict:
         if tail <= 0:
@@ -3264,26 +4181,25 @@ class RiftOrchestrator:
                 max_tokens=max_tokens,
             )
         if plan is None:
-            config_path_resolved = self._resolve_path(config_path)
-            if config_path_resolved.is_file():
-                plan = self.plan(config_path=config_path_resolved, write=False)
+            active_state = self.read_state()
+            active_value = active_state.get("services", {}).get(service_name)
+            active_service = active_value if isinstance(active_value, dict) else {}
+            active_backend = str(active_service.get("backend") or "")
+            active_launch_plan = active_service.get("launch_plan")
+            if active_backend and isinstance(active_launch_plan, dict) and active_launch_plan:
+                plan = {
+                    "config_path": active_service.get("config_path"),
+                    "services": {
+                        service_name: {
+                            "backend": active_backend,
+                            "launch_plan": active_launch_plan,
+                        }
+                    },
+                    "nodes": [{"hardware": self.engine.hardware_profile()}],
+                }
             else:
-                active_state = self.read_state()
-                active_service = active_state.get("services", {}).get(service_name)
-                active_backend = str((active_service or {}).get("backend") or "")
-                active_launch_plan = dict((active_service or {}).get("launch_plan") or {})
-                if not active_backend or not active_launch_plan:
-                    plan = self.plan(config_path=config_path_resolved, write=False)
-                else:
-                    plan = {
-                        "services": {
-                            service_name: {
-                                "backend": active_backend,
-                                "launch_plan": active_launch_plan,
-                            }
-                        },
-                        "nodes": [{"hardware": self.engine.hardware_profile()}],
-                    }
+                config_path_resolved = self._resolve_path(config_path)
+                plan = self.plan(config_path=config_path_resolved, write=False)
         service = plan.get("services", {}).get(service_name)
         if not service:
             # UI-managed deployments can originate from a saved recommendation
@@ -3889,10 +4805,237 @@ class RiftOrchestrator:
                 )
             else:
                 stopped.append({"service": name, "container_termination": container_termination})
+            self._set_deployment_record_status(
+                service_name=name,
+                service=service,
+                status="deleted",
+            )
             services.pop(name, None)
             removed.append(name)
         self.write_state(state)
         return {"stopped": stopped, "removed": removed, "state_path": str(self.state_path)}
+
+    @property
+    def deployment_records_path(self) -> Path:
+        return self.rift_dir / "deployments" / "records.json"
+
+    def list_deployment_records(self) -> list[JsonDict]:
+        """Return durable deployment history, newest first.
+
+        Deployment records intentionally outlive service state. They are the
+        operator's reusable inventory of successful model/backend pairings,
+        while the controller's service map remains the source of truth for
+        what is currently running.
+        """
+
+        path = self.deployment_records_path
+        if not path.is_file():
+            return []
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"deployment records are not readable: {path}") from exc
+        if isinstance(payload, dict):
+            records = payload.get("records", [])
+        else:
+            records = payload
+        if not isinstance(records, list):
+            raise ValueError(f"deployment records must contain a records array: {path}")
+        return [dict(item) for item in records if isinstance(item, dict)]
+
+    def load_deployment_record(self, record_id: str) -> JsonDict:
+        value = str(record_id or "").strip()
+        if not value or Path(value).name != value or "/" in value or "\\" in value:
+            raise ValueError("deployment_id is invalid")
+        for record in self.list_deployment_records():
+            if str(record.get("deployment_id") or "") == value:
+                return record
+        raise KeyError(f"deployment record not found: {record_id}")
+
+    def relaunch_deployment(
+        self,
+        *,
+        record_id: str,
+        allow_launch: bool = False,
+        allow_download: bool = False,
+        allow_install: bool = False,
+        allow_remote: bool = False,
+        optimize: bool = False,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
+    ) -> JsonDict:
+        """Recreate a saved deployment through the ordinary plan/apply path."""
+
+        if not allow_launch:
+            return {
+                "applied": False,
+                "deployment_id": record_id,
+                "reason": "--allow-launch is required to launch a saved deployment",
+                "required_permission": "allow_launch",
+            }
+        record = self.load_deployment_record(record_id)
+        snapshot = record.get("config_snapshot")
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("services"), dict):
+            raise ValueError("saved deployment has no reusable configuration snapshot")
+        snapshot_path = self.rift_dir / "deployments" / f"{record_id}.yaml"
+        write_yaml(snapshot_path, snapshot)
+        if progress is not None:
+            progress("preparing", "Revalidating the saved deployment configuration", 5.0, {"deployment_id": record_id})
+        result = self.apply(
+            config_path=snapshot_path,
+            permissions=ApplyPermissions(
+                allow_download=allow_download,
+                allow_install=allow_install,
+                allow_launch=allow_launch,
+                allow_remote=allow_remote,
+                optimize=optimize,
+            ),
+            deployment_record_id=record_id,
+            progress=progress,
+        )
+        return {**result, "deployment_id": record_id, "relaunch": True}
+
+    def _set_deployment_record_status(
+        self,
+        *,
+        service_name: str,
+        service: JsonDict,
+        status: str,
+    ) -> JsonDict | None:
+        record_id = str(service.get("deployment_record_id") or "")
+        record: JsonDict | None = None
+        if record_id:
+            try:
+                record = self.load_deployment_record(record_id)
+            except (KeyError, ValueError):
+                record = None
+        if record is None:
+            candidates = [
+                item
+                for item in self.list_deployment_records()
+                if str(item.get("service_name") or "") == service_name
+            ]
+            record = candidates[0] if candidates else None
+        if record is None:
+            return None
+        record["status"] = status
+        record["updated_unix_seconds"] = time.time()
+        if status == "stopped":
+            record["stopped_unix_seconds"] = time.time()
+        if status == "deleted":
+            record["deleted_unix_seconds"] = time.time()
+        records = self.list_deployment_records()
+        for index, item in enumerate(records):
+            if item.get("deployment_id") == record.get("deployment_id"):
+                records[index] = record
+                break
+        self._write_deployment_records(records)
+        return record
+
+    def _upsert_deployment_record(
+        self,
+        *,
+        service_name: str,
+        plan: JsonDict,
+        service: JsonDict,
+        config: JsonDict,
+        status: str,
+        record_id: str | None = None,
+    ) -> JsonDict:
+        records = self.list_deployment_records()
+        existing: JsonDict | None = None
+        if record_id:
+            existing = next((item for item in records if item.get("deployment_id") == record_id), None)
+        now = time.time()
+        deployment_id = record_id or f"dep-{uuid.uuid4().hex[:12]}"
+        snapshot = self._deployment_config_snapshot(
+            service_name=service_name,
+            service=service,
+            config=config,
+        )
+        snapshot_path = self.rift_dir / "deployments" / f"{deployment_id}.yaml"
+        write_yaml(snapshot_path, snapshot)
+        launch = dict(service.get("launch_plan") or {})
+        model = dict(service.get("model") or {})
+        serving = dict(service.get("serving") or {})
+        runtime = dict(service.get("runtime") or {})
+        provider_detection = dict(service.get("provider_detection") or {})
+        backend = str(service.get("backend") or "external")
+        record = {
+            "schema_version": 1,
+            "deployment_id": deployment_id,
+            "service_name": service_name,
+            "display_name": service_name,
+            "status": status,
+            "model": model,
+            "backend": {
+                "kind": backend,
+                "version": provider_detection.get("version"),
+                "executable": provider_detection.get("executable"),
+            },
+            "node": dict(service.get("placement") or {"node": "local"}),
+            "endpoint": {
+                "api_base": runtime.get("api_base") or launch.get("api_base"),
+                "openai_base": runtime.get("openai_base") or launch.get("openai_base"),
+                "host": serving.get("host") or launch.get("host"),
+                "port": serving.get("port") or launch.get("port"),
+                "path": "/v1",
+            },
+            "serving": serving,
+            "gateway": dict(service.get("gateway") or {}),
+            "launch": launch,
+            "last_known_good": dict(service.get("last_known_good_launch_plan") or launch),
+            "plan": {
+                "id": plan.get("plan_id"),
+                "hash": plan.get("plan_hash"),
+                "config_path": plan.get("config_path"),
+            },
+            "config_snapshot": snapshot,
+            "config_snapshot_path": str(snapshot_path),
+            "runtime": runtime,
+            "relaunch_count": int((existing or {}).get("relaunch_count") or 0) + (1 if existing else 0),
+            "created_unix_seconds": (existing or {}).get("created_unix_seconds", now),
+            "updated_unix_seconds": now,
+            "last_started_unix_seconds": now if status == "ready" else (existing or {}).get("last_started_unix_seconds"),
+        }
+        if existing:
+            index = next(index for index, item in enumerate(records) if item.get("deployment_id") == deployment_id)
+            records[index] = record
+        else:
+            records.insert(0, record)
+        self._write_deployment_records(records)
+        return record
+
+    def _deployment_config_snapshot(
+        self,
+        *,
+        service_name: str,
+        service: JsonDict,
+        config: JsonDict,
+    ) -> JsonDict:
+        snapshot = json.loads(json.dumps(config, default=str))
+        services = snapshot.setdefault("services", {})
+        configured = dict(services.get(service_name) or {})
+        effective_model = dict(service.get("model") or configured.get("model") or {})
+        download = service.get("download")
+        if isinstance(download, dict) and download.get("local_dir"):
+            try:
+                effective_model["local_path"] = self._downloaded_model_path(download, effective_model)
+                effective_model["source"] = "local"
+            except (OSError, ValueError):
+                pass
+        configured["model"] = effective_model
+        configured["serving"] = dict(service.get("serving") or configured.get("serving") or {})
+        configured["placement"] = dict(service.get("placement") or configured.get("placement") or {})
+        configured["gateway"] = dict(service.get("gateway") or configured.get("gateway") or {})
+        configured.setdefault("policy", {})["backend"] = str(service.get("backend") or "auto")
+        services[service_name] = configured
+        return snapshot
+
+    def _write_deployment_records(self, records: list[JsonDict]) -> None:
+        self._write_json(
+            self.deployment_records_path,
+            {"schema_version": 1, "records": records},
+        )
 
     def _optimized_config(self, plan: JsonDict, tuning_report: JsonDict) -> JsonDict:
         config = self.load_config(plan["config_path"])
@@ -3923,8 +5066,16 @@ class RiftOrchestrator:
     def _fingerprint(self, payload: Any) -> str:
         return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
+    def _plan_hash(self, plan: JsonDict) -> str:
+        content = {
+            key: value
+            for key, value in plan.items()
+            if key not in {"plan_hash", "plan_id", "plan_path"}
+        }
+        return self._fingerprint(content)
+
     def _timestamped(self, folder: str, stem: str) -> Path:
-        return self.rift_dir / folder / f"{int(time.time())}-{stem}.json"
+        return self.rift_dir / folder / f"{time.time_ns()}-{stem}.json"
 
     @property
     def plan_dir(self) -> Path:
@@ -3934,7 +5085,19 @@ class RiftOrchestrator:
 
     def _write_json(self, path: Path, payload: JsonDict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        temporary = path.with_suffix(f".{time.time_ns()}.tmp")
+        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        try:
+            with temporary.open("wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
     def _resolve_path(self, path: str | Path) -> Path:
         target = Path(path)

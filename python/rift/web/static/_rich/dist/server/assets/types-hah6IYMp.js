@@ -354,7 +354,7 @@ function createRootRoute(options) {
 function createFileRoute(path) {
 	return new FileRoute(path, { silent: true }).createRoute;
 }
-/** 
+/**
 @deprecated It's no longer recommended to use the `FileRoute` class directly.
 Instead, use `createFileRoute('/path/to/file')(options)` to create a file route.
 */

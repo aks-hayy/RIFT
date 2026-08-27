@@ -1,8 +1,12 @@
 import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
+from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,7 +44,16 @@ def test_bundled_dashboard_has_rift_favicon():
 def test_rich_dashboard_build_plan_is_detected():
     plan = dashboard.rich_dashboard_plan(ROOT / "ui", port=8766, control_port=8778)
     if plan is None:
-        assert shutil.which("node") is None
+        packaged = dashboard.bundled_rich_dashboard_root()
+        assert shutil.which("node") is None or not (
+            (ROOT / "ui" / "scripts" / "serve-dist.mjs").is_file()
+            and (ROOT / "ui" / "dist" / "server" / "server.js").is_file()
+            and (ROOT / "ui" / "dist" / "client").is_dir()
+        ) or not (
+            (packaged / "scripts" / "serve-dist.mjs").is_file()
+            and (packaged / "dist" / "server" / "server.js").is_file()
+            and (packaged / "dist" / "client").is_dir()
+        )
         return
     assert plan is not None
     assert plan["server_script"].endswith(
@@ -101,6 +114,46 @@ def test_dashboard_validation_errors_are_actionable():
             raise AssertionError("expected missing dashboard failure")
 
 
+def test_bundled_dashboard_proxies_controller_api_requests():
+    class ControllerHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = json.dumps({"available": True, "providers": {"llama.cpp": {}}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    controller = ThreadingHTTPServer(("127.0.0.1", 0), ControllerHandler)
+    controller_thread = threading.Thread(target=controller.serve_forever, daemon=True)
+    controller_thread.start()
+    static = dashboard._create_static_server(
+        "127.0.0.1", 0, f"http://127.0.0.1:{controller.server_address[1]}"
+    )
+    static_thread = threading.Thread(target=static.serve_forever, daemon=True)
+    static_thread.start()
+    try:
+        host, port = static.server_address
+        with urlopen(f"http://{host}:{port}/api/rift/v2/settings", timeout=2) as response:
+            assert response.status == 200
+            assert response.headers["Content-Type"].startswith("application/json")
+            assert len(response.headers.get_all("Content-Type")) == 1
+            assert json.loads(response.read()) == {
+                "available": True,
+                "providers": {"llama.cpp": {}},
+            }
+    finally:
+        static.shutdown()
+        static.server_close()
+        controller.shutdown()
+        controller.server_close()
+        static_thread.join(timeout=2)
+        controller_thread.join(timeout=2)
+
+
 def main():
     test_dashboard_source_discovery_and_launch_plan()
     test_bundled_dashboard_has_rift_favicon()
@@ -108,6 +161,7 @@ def main():
     test_packaged_rich_dashboard_bundle_is_complete()
     test_dashboard_root_environment_override()
     test_dashboard_validation_errors_are_actionable()
+    test_bundled_dashboard_proxies_controller_api_requests()
     print("RIFT dashboard launcher tests passed")
 
 

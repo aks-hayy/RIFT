@@ -64,7 +64,7 @@ serving backend, GPU runtime, or compiler.
 Windows:
 
 ```powershell
-git clone <rift-repository>
+git clone https://github.com/aks-hayy/RIFT
 cd rift
 .\bootstrap.ps1
 .\.venv\Scripts\rift.exe start
@@ -290,8 +290,10 @@ rift service tune --service chat --live --allow-restart
 Live tuning measures a baseline and bounded backend candidates, waits for
 health after each restart, selects the highest valid measured throughput, saves
 the report, and restores the last known-good configuration if a candidate fails.
-The current `rift apply --optimize` path is intended for optimization but does
-not replace this explicit live tuning command yet.
+`rift apply --optimize` performs the same bounded measurement after the reviewed
+service becomes healthy, using two candidates, one warmup, and three measured
+repetitions per candidate. The baseline remains authoritative when tuning is
+unavailable or a candidate fails.
 
 ## Focused Commands
 
