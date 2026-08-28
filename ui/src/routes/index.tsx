@@ -2,7 +2,14 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, StatDot, KV, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
-import { useHealth, useServices, useNodes, useIncidents, useTimeline } from "@/lib/rift/hooks";
+import {
+  useHealth,
+  useServices,
+  useNodes,
+  useIncidents,
+  useTimeline,
+  useTelemetryLatest,
+} from "@/lib/rift/hooks";
 import { rift } from "@/lib/rift/client";
 import { bytes, pct, relativeTime } from "@/lib/rift/format";
 import { Plus, ArrowRight, Rocket } from "lucide-react";
@@ -48,6 +55,7 @@ function HomePage() {
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-2 grid gap-4">
           <HealthPanel />
+          <FleetTelemetryPanel />
           <ServicesPanel />
         </div>
         <div className="grid gap-4">
@@ -57,6 +65,44 @@ function HomePage() {
         </div>
       </div>
     </AppShell>
+  );
+}
+
+function FleetTelemetryPanel() {
+  const { data, unavailable, isLoading } = useTelemetryLatest();
+  if (unavailable) return null;
+  if (isLoading && !data)
+    return (
+      <Panel title="Resource telemetry">
+        <div className="text-[13px] text-ink-secondary">Loading live resource telemetry…</div>
+      </Panel>
+    );
+  const samples = data ?? [];
+  const cpu = samples
+    .map((item) => item.sample.cpuPercent)
+    .filter((item): item is number => item != null);
+  const gpuTemp = samples
+    .map((item) => item.sample.gpuTemperatureC)
+    .filter((item): item is number => item != null);
+  const ram = samples
+    .map((item) => item.sample.hostRamPressurePercent)
+    .filter((item): item is number => item != null);
+  const max = (items: number[]) => (items.length ? Math.max(...items).toFixed(1) : "unavailable");
+  return (
+    <Panel
+      title="Resource telemetry"
+      aside={<span className="rift-mono text-[11px] text-ink-secondary">live · 2s</span>}
+    >
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <KV label="Host CPU peak" value={`${max(cpu)}%`} />
+        <KV label="Host RAM pressure" value={`${max(ram)}%`} />
+        <KV label="GPU temperature" value={gpuTemp.length ? `${max(gpuTemp)}°C` : "unavailable"} />
+        <KV
+          label="Telemetry sources"
+          value={`${samples.length} service${samples.length === 1 ? "" : "s"}`}
+        />
+      </div>
+    </Panel>
   );
 }
 

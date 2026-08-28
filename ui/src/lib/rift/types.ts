@@ -153,6 +153,56 @@ export interface ServiceEndpoint {
 
 export type ServiceStatus = "planning" | "applying" | "running" | "degraded" | "stopped" | "failed";
 
+export interface TelemetrySample {
+  observedAt: string;
+  serviceName?: string;
+  processId?: number;
+  cpuPercent?: number;
+  processCpuPercent?: number;
+  hostRamAvailableBytes?: number;
+  hostRamPressurePercent?: number;
+  cpuTemperatureC?: number;
+  processRssBytes?: number;
+  gpuUtilizationPercent?: number;
+  gpuTemperatureC?: number;
+  gpuVramUsedBytes?: number;
+  gpuVramTotalBytes?: number;
+  gpuVramPressurePercent?: number;
+  gpuPowerWatts?: number;
+  availability?: Record<string, string>;
+}
+
+export interface TelemetrySession {
+  sessionId: string;
+  serviceName: string;
+  nodeId: string;
+  status: string;
+  startedAt: string;
+  stoppedAt?: string;
+  sampleCount?: number;
+}
+
+export interface ResourceReport {
+  reportId: string;
+  sessionId: string;
+  serviceName: string;
+  nodeId: string;
+  startedAt: string;
+  stoppedAt: string;
+  durationSeconds: number;
+  sampleCount: number;
+  metrics: Record<string, { average?: number; peak?: number; minimum?: number; maximum?: number }>;
+  costs?: {
+    energyJoules?: number;
+    electricityCost?: number;
+    computeCost?: number;
+    totalCost?: number;
+    currency?: string | null;
+    basis?: string;
+  };
+  coverage?: Record<string, unknown>;
+}
+
 export interface Service {
   id: ServiceId;
   name: string;
@@ -354,6 +404,22 @@ export interface SettingsSnapshot {
   services: Record<string, Record<string, unknown>>;
   policies: Record<string, unknown>;
   mesh: Record<string, unknown>;
+}
+
+export type AccountingSettingSource = "service" | "global" | "unconfigured";
+
+export interface ServiceTelemetryAccounting {
+  apiVersion: string;
+  service: string;
+  configPath?: string;
+  electricityPricePerKwh: number | null;
+  computeCostPerNodeHour: number | null;
+  electricityPriceSource: AccountingSettingSource;
+  computeCostSource: AccountingSettingSource;
+  configured: boolean;
+  currency?: string | null;
+  serviceOverrides?: Record<string, number | null>;
+  globalDefaults?: Record<string, number | null>;
 }
 
 export interface DeploymentRevision {

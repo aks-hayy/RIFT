@@ -51,6 +51,20 @@ def migrate_config(config: JsonDict) -> tuple[JsonDict, list[str]]:
         result["version"] = 2
         changes.append("migrated config schema 1 to 2 with governance and observability policies")
         version = 2
+    observability = result.setdefault("observability", {})
+    if isinstance(observability, dict):
+        telemetry = observability.setdefault("telemetry", {})
+        if isinstance(telemetry, dict):
+            telemetry.setdefault("enabled", True)
+            telemetry.setdefault("sample_interval_seconds", 2.0)
+            telemetry.setdefault("raw_retention_hours", 48)
+            telemetry.setdefault("rollup_retention_days", 90)
+            telemetry.setdefault("report_retention_days", 365)
+            telemetry.setdefault("electricity_price_per_kwh", None)
+            telemetry.setdefault("compute_cost_per_node_hour", None)
+            telemetry.setdefault("prometheus", {"enabled": True})
+            telemetry.setdefault("otlp", {"enabled": False, "endpoint": None})
+            changes.append("added backend-neutral resource telemetry defaults")
     if version > CURRENT_CONFIG_SCHEMA:
         raise ValueError(f"config schema {version} is newer than supported {CURRENT_CONFIG_SCHEMA}")
     return result, changes

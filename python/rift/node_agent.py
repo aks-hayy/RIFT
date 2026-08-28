@@ -247,6 +247,34 @@ class NodeAgentController:
             "runtime": self.orchestrator.status(),
         }
 
+    def telemetry(self) -> JsonDict:
+        """Return this node's local telemetry for controller forwarding."""
+        latest = self.orchestrator.telemetry_latest(node_id="local")
+        latest_items = [item for item in latest.get("samples") or [] if isinstance(item, dict)]
+        latest_sample = next(
+            (item.get("sample") for item in latest_items if isinstance(item.get("sample"), dict)),
+            {},
+        )
+        samples = [item["sample"] for item in latest_items if isinstance(item.get("sample"), dict)]
+        state = self._read_json(self.agent_state_path)
+        sequence = int(state.get("telemetry_sequence") or 0) + 1
+        state["telemetry_sequence"] = sequence
+        state["updated_unix_seconds"] = time.time()
+        self._write_json(self.agent_state_path, state)
+        latest_session = latest_items[0].get("session") if latest_items else {}
+        if not isinstance(latest_session, dict):
+            latest_session = {}
+        return {
+            "node_id": self.policy.node_id,
+            "observed_at": time.time(),
+            "sequence": sequence,
+            "session_id": str(latest_session.get("session_id") or "") or None,
+            "samples": samples[:1000],
+            **latest_sample,
+            "telemetry": latest,
+            "sessions": self.orchestrator.telemetry_sessions(node_id="local"),
+        }
+
     def inference(self, payload: JsonDict) -> JsonDict:
         """Proxy one bounded OpenAI-compatible request through the node policy.
 
@@ -355,6 +383,7 @@ class _NodeAgentHandler(BaseHTTPRequestHandler):
             "/v1/discovery": self.controller.discover,
             "/v1/artifacts": self.controller.artifact_inventory,
             "/v1/state": self.controller.status,
+            "/v1/telemetry": self.controller.telemetry,
         }
         operation = routes.get(self.path)
         if operation is None:
