@@ -18,6 +18,8 @@ import type {
   OperationRecord,
   SettingsSnapshot,
   EvaluationRun,
+  ResourceReport,
+  ServiceTelemetryAccounting,
 } from "./types";
 
 export const keys = {
@@ -42,6 +44,10 @@ export const keys = {
   settings: ["rift", "settings"] as const,
   evaluations: (id: string) => ["rift", "evaluations", id] as const,
   operations: ["rift", "operations"] as const,
+  telemetryLatest: (service?: string) => ["rift", "telemetry", "latest", service ?? "all"] as const,
+  telemetryReports: (service?: string) =>
+    ["rift", "telemetry", "reports", service ?? "all"] as const,
+  telemetryAccounting: (service: string) => ["rift", "telemetry", "accounting", service] as const,
 };
 
 /** Wrap a Query hook so callers can render `unavailable` states cleanly. */
@@ -209,6 +215,44 @@ export function useReports() {
       queryFn: ({ signal }) => rift.reports(signal),
       staleTime: 5_000,
       refetchInterval: 5_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useTelemetryLatest(service?: string) {
+  return shape(
+    useQuery({
+      queryKey: keys.telemetryLatest(service),
+      queryFn: ({ signal }) => rift.telemetryLatest(service, signal),
+      staleTime: 1_000,
+      refetchInterval: 2_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useResourceReports(service?: string) {
+  return shape(
+    useQuery<ResourceReport[]>({
+      queryKey: keys.telemetryReports(service),
+      queryFn: ({ signal }) => rift.resourceReports(service, signal),
+      staleTime: 5_000,
+      refetchInterval: 15_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useServiceTelemetryAccounting(service: string | undefined) {
+  return shape(
+    useQuery<ServiceTelemetryAccounting>({
+      queryKey: service
+        ? keys.telemetryAccounting(service)
+        : ["rift", "telemetry", "accounting", "none"],
+      queryFn: ({ signal }) => rift.serviceTelemetryAccounting(service!, signal),
+      enabled: !!service,
+      staleTime: 5_000,
       retry: false,
     }),
   );

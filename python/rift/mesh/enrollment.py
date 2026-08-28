@@ -262,15 +262,25 @@ class EnrollmentService:
         sequence = int(snapshot.get("sequence") or 0)
         if sequence <= int(node.get("telemetry_sequence") or 0):
             raise ValueError("telemetry sequence must increase monotonically")
+        batch = snapshot.get("samples")
+        if batch is not None and (not isinstance(batch, list) or len(batch) > 1000):
+            raise ValueError("telemetry samples must be a list of at most 1000 items")
         allowed = {
             "sequence", "observed_at", "battery_percent", "charging", "available_memory_bytes",
             "low_memory", "thermal_status", "runtime_state", "active_model_sha256",
+            "samples", "session_id", "cpu_percent", "process_cpu_percent", "host_ram_pressure_percent",
+            "host_ram_available_bytes", "gpu_utilization_percent", "gpu_temperature_c",
+            "gpu_vram_used_bytes", "gpu_vram_total_bytes", "gpu_power_watts", "gpu_devices",
+            "gpu_vram_pressure_percent", "cpu_temperature_c",
+            "availability", "stale_after_seconds",
         }
         telemetry = {key: value for key, value in snapshot.items() if key in allowed}
         telemetry["sequence"] = sequence
         telemetry["observed_at"] = float(snapshot.get("observed_at") or self._clock())
         node["telemetry_sequence"] = sequence
         node["telemetry"] = telemetry
+        node["telemetry_received_at"] = float(self._clock())
+        node["telemetry_stale"] = (float(self._clock()) - telemetry["observed_at"]) > 6.0
         node["last_seen_at"] = telemetry["observed_at"]
         self._save()
         return dict(telemetry)

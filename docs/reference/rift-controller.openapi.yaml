@@ -272,6 +272,55 @@ paths:
             application/json:
               schema: { type: object, additionalProperties: true }
 
+  /v2/services/{serviceName}/telemetry/accounting:
+    parameters:
+      - name: serviceName
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      tags: [Performance]
+      operationId: getServiceTelemetryAccounting
+      summary: Read effective resource accounting rates for one service.
+      description: Service overrides take precedence over global observability.telemetry defaults.
+      responses:
+        "200":
+          description: Effective accounting settings and their configuration sources.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Performance]
+      operationId: updateServiceTelemetryAccounting
+      summary: Persist service-scoped electricity and compute rates.
+      description: A null value clears the service override and restores the global default when configured.
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accounting:
+                  type: object
+                  properties:
+                    electricity_price_per_kwh: { type: [number, "null"], minimum: 0 }
+                    compute_cost_per_node_hour: { type: [number, "null"], minimum: 0 }
+                  additionalProperties: false
+              required: [accounting]
+              additionalProperties: false
+      responses:
+        "200":
+          description: Persisted effective accounting settings.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /v2/model-sources:
     get:
       tags: [Models]
@@ -967,6 +1016,98 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MetricSeriesSet"
+
+  /telemetry/latest:
+    get:
+      tags: [Telemetry]
+      operationId: getLatestTelemetry
+      summary: Read the latest node and managed-service resource samples.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: node
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Latest best-effort samples. Unsupported sensors are null and annotated in availability.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/series:
+    get:
+      tags: [Telemetry]
+      operationId: getTelemetrySeries
+      summary: Read raw or rolled-up telemetry samples for a session or service.
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: number }
+        - name: until
+          in: query
+          schema: { type: number }
+      responses:
+        "200":
+          description: Telemetry series.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/reports:
+    get:
+      tags: [Telemetry]
+      operationId: listResourceReports
+      summary: List completed service resource reports.
+      responses:
+        "200":
+          description: Completed reports retained after services stop or are deleted.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/reports/{reportId}:
+    get:
+      tags: [Telemetry]
+      operationId: getResourceReport
+      summary: Read one completed resource report.
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Resource report.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ResourceReport" } }
+            text/csv: { schema: { type: string } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /telemetry/signals:
+    get:
+      tags: [Telemetry]
+      operationId: listResourceSignals
+      summary: List sustained resource threshold signals for managed services.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Warning, critical, and hysteresis-clear signals.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
 
   /deployments/{deploymentId}/playground-session:
     post:
@@ -3795,6 +3936,23 @@ components:
                     - type: number
                   minItems: 2
                   maxItems: 2
+
+    ResourceReport:
+      type: object
+      required: [report_id, session_id, service_name, node_id, started_at, stopped_at, metrics, coverage]
+      properties:
+        report_id: { type: string }
+        session_id: { type: string }
+        service_name: { type: string }
+        node_id: { type: string }
+        started_at: { type: number }
+        stopped_at: { type: number }
+        duration_seconds: { type: number }
+        sample_count: { type: integer }
+        metrics: { type: object, additionalProperties: true }
+        costs: { type: object, additionalProperties: true }
+        traffic: { type: object, additionalProperties: true }
+        coverage: { type: object, additionalProperties: true }
 
     AuditEvent:
       type: object

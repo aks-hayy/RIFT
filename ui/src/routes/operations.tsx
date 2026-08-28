@@ -9,6 +9,7 @@ import {
   useLogs,
   useOperations,
   useReports,
+  useResourceReports,
   useTimeline,
 } from "@/lib/rift/hooks";
 import { relativeTime } from "@/lib/rift/format";
@@ -392,6 +393,7 @@ function LogsTab() {
 
 function MetricsTab() {
   const { data, unavailable } = useReports();
+  const resourceReports = useResourceReports();
   if (unavailable)
     return <Unavailable endpoint="/reports" resource="Benchmark and tuning reports" />;
   const reports = Array.isArray(data?.reports) ? data.reports : [];
@@ -411,6 +413,49 @@ function MetricsTab() {
       </Panel>
       <Panel title="Tuning">
         <Metric label="Runs" value={String(tuningCount)} />
+      </Panel>
+      <Panel
+        title="Resource reports"
+        className="sm:col-span-3"
+        aside={<SourceBadge source="live" />}
+        bodyClassName="p-0"
+      >
+        {resourceReports.data?.length ? (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[700px] text-[12px] rift-mono">
+              <thead className="rift-label">
+                <tr className="border-b border-border">
+                  <th className="text-left px-4 h-9 font-normal">Service</th>
+                  <th className="text-left px-4 font-normal">Node</th>
+                  <th className="text-left px-4 font-normal">Duration</th>
+                  <th className="text-left px-4 font-normal">Samples</th>
+                  <th className="text-left px-4 font-normal">GPU energy</th>
+                  <th className="text-left px-4 font-normal">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resourceReports.data.map((report) => (
+                  <tr key={report.reportId} className="border-b border-border last:border-0">
+                    <td className="px-4 py-2">{report.serviceName}</td>
+                    <td className="px-4">{report.nodeId}</td>
+                    <td className="px-4">{report.durationSeconds.toFixed(1)}s</td>
+                    <td className="px-4">{report.sampleCount}</td>
+                    <td className="px-4">
+                      {report.costs?.energyJoules == null
+                        ? "unavailable"
+                        : `${report.costs.energyJoules.toFixed(1)} J`}
+                    </td>
+                    <td className="px-4">completed</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="px-4 py-8 text-[13px] text-ink-secondary">
+            No completed resource reports yet.
+          </div>
+        )}
       </Panel>
     </div>
   );

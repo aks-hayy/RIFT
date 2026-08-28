@@ -287,6 +287,33 @@ def test_mesh_control_routes_use_one_persistent_controller():
     assert route["lease"]["service_id"] == "chat"
 
 
+def test_service_accounting_api_reads_and_updates_the_selected_service(tmp_path):
+    from rift.operations import OperationStore
+    from rift.orchestrator import RiftOrchestrator
+    from rift.rift_yaml import write_yaml
+
+    orchestrator = RiftOrchestrator(root=tmp_path)
+    write_yaml(tmp_path / "rift.yaml", orchestrator.default_config())
+    runtime = server_mod.RiftServerRuntime(
+        orchestrator_factory=lambda: orchestrator,
+        operation_store=OperationStore(tmp_path / "operations"),
+    )
+    try:
+        path = "/api/rift/v2/services/chat/telemetry/accounting"
+        initial = runtime.control_get(path)
+        assert initial["configured"] is False
+        updated = runtime.control_post(
+            path,
+            {"accounting": {"electricity_price_per_kwh": 0.22}},
+        )
+        assert updated["electricity_price_per_kwh"] == 0.22
+        assert updated["electricity_price_source"] == "service"
+        assert runtime.control_get(path)["electricity_price_per_kwh"] == 0.22
+    finally:
+        runtime.shutdown()
+        orchestrator.close()
+
+
 def main():
     test_server_routes_and_streaming()
     test_runtime_cors_origins_allow_custom_dashboard_ports()

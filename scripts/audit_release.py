@@ -31,6 +31,7 @@ _KNOWN_PYTHON = {
     "pyyaml": {"license": "MIT", "url": "https://github.com/yaml/pyyaml/blob/main/LICENSE"},
     "zeroconf": {"license": "LGPL-2.1-or-later", "url": "https://github.com/python-zeroconf/python-zeroconf/blob/master/LICENSE"},
     "cryptography": {"license": "Apache-2.0 OR BSD-3-Clause", "url": "https://github.com/pyca/cryptography/blob/main/LICENSE"},
+    "psutil": {"license": "BSD-3-Clause", "url": "https://github.com/giampaolo/psutil/blob/master/LICENSE"},
     "setuptools": {"license": "MIT", "url": "https://github.com/pypa/setuptools/blob/main/LICENSE"},
     "wheel": {"license": "MIT", "url": "https://github.com/pypa/wheel/blob/main/LICENSE.txt"},
 }

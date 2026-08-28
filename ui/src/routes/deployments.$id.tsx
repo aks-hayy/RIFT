@@ -10,6 +10,9 @@ import {
   useEvaluations,
   useLogs,
   useReports,
+  useTelemetryLatest,
+  useResourceReports,
+  useServiceTelemetryAccounting,
 } from "@/lib/rift/hooks";
 import { rift } from "@/lib/rift/client";
 import { bytes, relativeTime } from "@/lib/rift/format";
@@ -20,13 +23,14 @@ import {
   Gauge,
   Loader2,
   RotateCcw,
+  Save,
   Send,
   ShieldCheck,
   SlidersHorizontal,
   Trash2,
   XCircle,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { Service } from "@/lib/rift/types";
 
 const searchSchema = z.object({
@@ -487,6 +491,9 @@ function PlaygroundTab({ s }: { s: Service }) {
 
 function PerformanceTab({ s }: { s: Service }) {
   const { data, unavailable, refetch } = useBenchmarks(s.id);
+  const telemetry = useTelemetryLatest(s.name);
+  const resourceReports = useResourceReports(s.name);
+  const accounting = useServiceTelemetryAccounting(s.name);
   const evaluations = useEvaluations(s.name);
   const reports = useReports();
   const [benchmarkPrompt, setBenchmarkPrompt] = useState(
@@ -500,6 +507,24 @@ function PerformanceTab({ s }: { s: Service }) {
   const [benchmarkError, setBenchmarkError] = useState<string | null>(null);
   const [evaluationBusy, setEvaluationBusy] = useState(false);
   const [evaluationError, setEvaluationError] = useState<string | null>(null);
+  const [electricityPrice, setElectricityPrice] = useState("");
+  const [computeCost, setComputeCost] = useState("");
+  const [accountingBusy, setAccountingBusy] = useState(false);
+  const [accountingError, setAccountingError] = useState<string | null>(null);
+  const [accountingSaved, setAccountingSaved] = useState(false);
+  useEffect(() => {
+    if (!accounting.data) return;
+    setElectricityPrice(
+      accounting.data.electricityPricePerKwh == null
+        ? ""
+        : String(accounting.data.electricityPricePerKwh),
+    );
+    setComputeCost(
+      accounting.data.computeCostPerNodeHour == null
+        ? ""
+        : String(accounting.data.computeCostPerNodeHour),
+    );
+  }, [accounting.data]);
   const latestEvaluation = evaluations.data?.[0];
   const latestTuning = (Array.isArray(reports.data?.reports) ? reports.data.reports : [])
     .map((value) => {
@@ -543,10 +568,204 @@ function PerformanceTab({ s }: { s: Service }) {
       setBenchmarkBusy(false);
     }
   };
+  const saveAccounting = async () => {
+    const parseRate = (value: string, label: string): number | null => {
+      if (!value.trim()) return null;
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0) {
+        throw new Error(`${label} must be a non-negative number or blank.`);
+      }
+      return parsed;
+    };
+    setAccountingBusy(true);
+    setAccountingError(null);
+    setAccountingSaved(false);
+    try {
+      await rift.updateServiceTelemetryAccounting(s.name, {
+        electricityPricePerKwh: parseRate(electricityPrice, "Electricity price"),
+        computeCostPerNodeHour: parseRate(computeCost, "Compute cost"),
+      });
+      await Promise.all([accounting.refetch(), resourceReports.refetch()]);
+      setAccountingSaved(true);
+    } catch (error) {
+      setAccountingError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setAccountingBusy(false);
+    }
+  };
   if (unavailable) return <Unavailable endpoint="/reports" resource="Benchmark[]" />;
   const rows = data ?? [];
+  const live = telemetry.data?.[0];
+  const liveSample = live?.sample;
+  const value = (item: number | undefined, suffix = "") =>
+    item == null || Number.isNaN(item) ? "unavailable" : `${item.toFixed(1)}${suffix}`;
   return (
     <div className="grid gap-4">
+      <Panel
+        title="Live resources"
+        aside={
+          <span className="rift-mono text-[11px] text-ink-secondary">
+            {liveSample
+              ? `sampled ${relativeTime(liveSample.observedAt)}`
+              : "waiting for telemetry"}
+          </span>
+        }
+      >
+        {telemetry.unavailable ? (
+          <div className="text-[13px] text-ink-secondary">
+            Resource telemetry is not available from this controller.
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            <KV label="Service CPU" value={value(liveSample?.processCpuPercent, "%")} />
+            <KV
+              label="Service memory"
+              value={
+                liveSample?.processRssBytes == null
+                  ? "unavailable"
+                  : bytes(liveSample.processRssBytes)
+              }
+            />
+            <KV label="GPU utilization" value={value(liveSample?.gpuUtilizationPercent, "%")} />
+            <KV label="GPU temperature" value={value(liveSample?.gpuTemperatureC, "°C")} />
+            <KV label="GPU power" value={value(liveSample?.gpuPowerWatts, " W")} />
+            <KV label="Host RAM pressure" value={value(liveSample?.hostRamPressurePercent, "%")} />
+            <KV
+              label="GPU VRAM"
+              value={
+                liveSample?.gpuVramUsedBytes == null
+                  ? "unavailable"
+                  : `${bytes(liveSample.gpuVramUsedBytes)} / ${bytes(liveSample.gpuVramTotalBytes ?? 0)}`
+              }
+            />
+            <KV
+              label="Collection"
+              value={liveSample?.availability?.gpu === "measured" ? "measured" : "partial"}
+            />
+          </div>
+        )}
+      </Panel>
+      <Panel title="Resource accounting" aside={<SourceBadge source="live" />}>
+        {accounting.unavailable ? (
+          <p className="text-[12px] text-ink-secondary">
+            Service accounting settings are unavailable from this controller.
+          </p>
+        ) : (
+          <div className="grid gap-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <label className="grid gap-1 text-[12px]">
+                <span className="rift-label">Electricity price / kWh</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.0001"
+                  value={electricityPrice}
+                  onChange={(event) => setElectricityPrice(event.target.value)}
+                  placeholder="Not configured"
+                  className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+                />
+                <span className="text-[11px] text-ink-secondary">
+                  {accounting.data?.electricityPriceSource === "global"
+                    ? "Using the global telemetry default. Enter a value to override it for this service."
+                    : "Leave blank to clear this service override."}
+                </span>
+              </label>
+              <label className="grid gap-1 text-[12px]">
+                <span className="rift-label">Compute cost / node-hour</span>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.0001"
+                  value={computeCost}
+                  onChange={(event) => setComputeCost(event.target.value)}
+                  placeholder="Not configured"
+                  className="h-8 rounded-[4px] border border-border bg-raised px-2 rift-mono"
+                />
+                <span className="text-[11px] text-ink-secondary">
+                  Applied to this service's runtime duration in future reports.
+                </span>
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={saveAccounting}
+                disabled={accountingBusy}
+                className="inline-flex items-center gap-1.5 h-8 px-3 rounded-[4px] bg-primary text-primary-foreground text-[12px] font-medium hover:bg-[color:var(--oxide-deep)] disabled:opacity-50"
+              >
+                {accountingBusy ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Save className="size-3.5" />
+                )}
+                Save service rates
+              </button>
+              <span className="rift-mono text-[11px] text-ink-secondary">
+                {accounting.data?.configPath
+                  ? `Stored in ${accounting.data.configPath}`
+                  : "Stored in the service configuration"}
+              </span>
+              {accountingSaved && <span className="text-[11px] text-secondary">Saved</span>}
+            </div>
+            {accountingError && (
+              <p className="rift-mono text-[11px] text-error" role="alert">
+                {accountingError}
+              </p>
+            )}
+          </div>
+        )}
+      </Panel>
+      {resourceReports.data && resourceReports.data.length > 0 && (
+        <Panel title="Completed resource reports" bodyClassName="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-[13px] rift-mono">
+              <thead className="rift-label">
+                <tr className="border-b border-border">
+                  <th className="text-left px-4 h-9 font-normal">Stopped</th>
+                  <th className="text-left px-4 font-normal">Samples</th>
+                  <th className="text-left px-4 font-normal">CPU avg</th>
+                  <th className="text-left px-4 font-normal">GPU energy</th>
+                  <th className="text-left px-4 font-normal">Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {resourceReports.data.map((report) => {
+                  const cpu = report.metrics.process_cpu_percent?.average;
+                  const energy = report.costs?.energyJoules;
+                  const electricity = report.costs?.electricityCost;
+                  const compute = report.costs?.computeCost;
+                  const cost =
+                    report.costs?.totalCost ??
+                    (electricity == null && compute == null
+                      ? undefined
+                      : (electricity ?? 0) + (compute ?? 0));
+                  return (
+                    <tr key={report.reportId} className="border-b border-border last:border-0">
+                      <td className="px-4 py-2">{relativeTime(report.stoppedAt)}</td>
+                      <td className="px-4">{report.sampleCount}</td>
+                      <td className="px-4">{value(cpu, "%")}</td>
+                      <td className="px-4">
+                        {energy == null ? "unavailable" : `${energy.toFixed(1)} J`}
+                      </td>
+                      <td className="px-4">
+                        {cost == null ? (
+                          "unconfigured"
+                        ) : (
+                          <span
+                            title={`Electricity: ${electricity ?? 0}; compute: ${compute ?? 0}`}
+                          >
+                            {cost.toFixed(4)}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      )}
       <Panel title="Benchmarks" bodyClassName="p-0">
         {rows.length === 0 ? (
           <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">

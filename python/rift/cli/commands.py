@@ -747,6 +747,31 @@ def _service(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) ->
         result = orchestrator.logs(service_name=args.service, tail=args.tail)
         console.render(result, title=f"{args.service} logs")
         return 0 if result.get("available") else 1
+    if args.service_command == "telemetry":
+        if args.report_id:
+            result = orchestrator.telemetry_report(args.report_id)
+        elif args.signals:
+            result = orchestrator.telemetry_signals(
+                service_name=args.service,
+                session_id=args.session_id,
+                limit=args.limit,
+            )
+        elif args.report:
+            result = orchestrator.telemetry_reports(
+                service_name=args.service,
+                node_id=args.node,
+                limit=args.limit,
+            )
+        elif args.session_id:
+            result = orchestrator.telemetry_series(
+                session_id=args.session_id,
+                since=args.since,
+                until=args.until,
+            )
+        else:
+            result = orchestrator.telemetry_latest(service_name=args.service, node_id=args.node)
+        console.render(result, title="Resource telemetry")
+        return 0
     if args.service_command == "gateway":
         serve_gateway(
             config_path=args.config,

@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
 import statistics
 import subprocess
+import tempfile
 import time
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse, urlsplit
@@ -36,10 +38,12 @@ from .rift_yaml import read_yaml, write_yaml
 from .system_profile import HardwareAnalyzer
 from .state_store import StateStore
 from .runtime_paths import RiftPaths
+from .telemetry import ResourcePolicy, TelemetryStore, TelemetrySupervisor
 
 
 JsonDict = dict[str, Any]
 ApplyProgressCallback = Callable[[str, str, JsonDict], None]
+_TELEMETRY_RUNTIMES: dict[str, tuple[TelemetryStore, TelemetrySupervisor | None]] = {}
 
 
 @dataclass
@@ -79,12 +83,72 @@ class RiftOrchestrator:
         self.providers = self.backend_host.enabled()
         self.overlays = overlay_registry()
         self.observability_store = ObservabilityStore(root=self.root, data_root=self.rift_dir)
+        self._telemetry_store: TelemetryStore | None = None
+        self._telemetry_supervisor: TelemetrySupervisor | None = None
+        self._telemetry_ephemeral = str(self.root).lower().startswith(
+            str(Path(tempfile.gettempdir())).lower()
+        )
+        self._telemetry_registry_key = (
+            None if self._telemetry_ephemeral else str(self.rift_dir.resolve())
+        )
         self.evidence_engine = EvidenceEngine(root=self.root, data_root=self.rift_dir)
         self.artifacts = ArtifactManifest(root=self.root)
         self.recommendation_store = RecommendationStore(self.rift_dir)
         from .gateway import ApiKeyStore
 
         self.api_keys = ApiKeyStore(self.rift_dir / "gateway" / "api_keys.json")
+
+    @property
+    def telemetry_store(self) -> TelemetryStore:
+        if self._telemetry_store is None:
+            # Test/fake orchestrators frequently use a short-lived temporary
+            # root on Windows. An in-memory store avoids holding a SQLite file
+            # handle across TemporaryDirectory cleanup while preserving the
+            # durable on-disk store for every real controller/node.
+            if self._telemetry_registry_key and self._telemetry_registry_key in _TELEMETRY_RUNTIMES:
+                self._telemetry_store = _TELEMETRY_RUNTIMES[self._telemetry_registry_key][0]
+            else:
+                path: str | Path = ":memory:" if self._telemetry_ephemeral else self.rift_dir / "telemetry" / "telemetry.db"
+                self._telemetry_store = TelemetryStore(path)
+                if self._telemetry_registry_key:
+                    _TELEMETRY_RUNTIMES[self._telemetry_registry_key] = (self._telemetry_store, None)
+        return self._telemetry_store
+
+    @property
+    def telemetry_supervisor(self) -> TelemetrySupervisor:
+        if self._telemetry_supervisor is None:
+            if self._telemetry_registry_key and self._telemetry_registry_key in _TELEMETRY_RUNTIMES:
+                store, supervisor = _TELEMETRY_RUNTIMES[self._telemetry_registry_key]
+                self._telemetry_supervisor = supervisor or TelemetrySupervisor(
+                    store, interval_seconds=2.0, node_id="local", policy=ResourcePolicy()
+                )
+                _TELEMETRY_RUNTIMES[self._telemetry_registry_key] = (store, self._telemetry_supervisor)
+            else:
+                self._telemetry_supervisor = TelemetrySupervisor(
+                    self.telemetry_store,
+                    interval_seconds=2.0,
+                    node_id="local",
+                    policy=ResourcePolicy(),
+                )
+        return self._telemetry_supervisor
+
+    def close(self) -> None:
+        if not self._telemetry_ephemeral:
+            return
+        if self._telemetry_supervisor is not None:
+            self._telemetry_supervisor.close()
+        if self._telemetry_store is not None:
+            self._telemetry_store.close()
+
+    def __del__(self) -> None:
+        # Persistent controller/node runtimes share a registry-backed
+        # supervisor. Ephemeral test/facade runtimes own their resources and
+        # must release their sampler thread when the facade is collected.
+        if getattr(self, "_telemetry_ephemeral", False):
+            try:
+                self.close()
+            except (AttributeError, RuntimeError):
+                pass
 
     def init_config(self, path: str | Path = "rift.yaml", *, overwrite: bool = False) -> JsonDict:
         target = self.root / path
@@ -99,6 +163,19 @@ class RiftOrchestrator:
             "schema_version": 1,
             "version": 1,
             "project": "rift-local",
+            "observability": {
+                "telemetry": {
+                    "enabled": True,
+                    "sample_interval_seconds": 2.0,
+                    "raw_retention_hours": 48,
+                    "rollup_retention_days": 90,
+                    "report_retention_days": 365,
+                    "electricity_price_per_kwh": None,
+                    "compute_cost_per_node_hour": None,
+                    "prometheus": {"enabled": True},
+                    "otlp": {"enabled": False, "endpoint": None},
+                }
+            },
             "nodes": [
                 {
                     "name": "local",
@@ -130,6 +207,12 @@ class RiftOrchestrator:
                     },
                     "monitoring": {
                         "enabled": True,
+                        "resources": {
+                            "enabled": True,
+                            "sample_interval_seconds": 2.0,
+                            "electricity_price_per_kwh": None,
+                            "compute_cost_per_node_hour": None,
+                        },
                         "health_timeout_seconds": 2.0,
                         "startup_grace_seconds": 180.0,
                         "failure_threshold": 3,
@@ -190,6 +273,11 @@ class RiftOrchestrator:
             raise ValueError("rift config requires at least one node")
         if not isinstance(config.get("services"), dict) or not config["services"]:
             raise ValueError("rift config requires at least one service")
+        telemetry = (config.get("observability") or {}).get("telemetry") or {}
+        if not isinstance(telemetry, dict):
+            raise ValueError("observability.telemetry must be an object")
+        for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour"):
+            self._validate_accounting_rate(key, telemetry.get(key))
         for name, service in config["services"].items():
             if not isinstance(service, dict):
                 raise ValueError(f"service {name} must be an object")
@@ -206,6 +294,13 @@ class RiftOrchestrator:
                 raise ValueError(f"service {name} recovery must be an object")
             if not isinstance(gateway, dict):
                 raise ValueError(f"service {name} gateway must be an object")
+            resources = monitoring.get("resources") or {}
+            if not isinstance(resources, dict):
+                raise ValueError(f"service {name} monitoring.resources must be an object")
+            for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour"):
+                self._validate_accounting_rate(key, resources.get(key))
+            if float(resources.get("sample_interval_seconds", 2.0)) <= 0.0:
+                raise ValueError(f"service {name} resource sample_interval_seconds must be positive")
             if float(monitoring.get("health_timeout_seconds", 2.0)) <= 0.0:
                 raise ValueError(f"service {name} health_timeout_seconds must be positive")
             if float(monitoring.get("startup_grace_seconds", 180.0)) < 0.0:
@@ -2011,6 +2106,11 @@ class RiftOrchestrator:
                 "last_known_good_launch_plan": None,
                 "updated_unix_seconds": int(time.time()),
             }
+            self._telemetry_start_service(
+                service_name,
+                state["services"][service_name],
+                backend=str(service.get("backend") or "unknown"),
+            )
             results.append({"service": service_name, "launched": launched})
             report("launching", f"Started {service_name}; waiting for health", 85.0, {"service": service_name})
         self.write_state(state)
@@ -2370,7 +2470,17 @@ class RiftOrchestrator:
             observation = self._service_observation(name, service)
             phase = str(observation.get("phase") or "unknown")
             counts[phase if phase in counts else "unknown"] += 1
-            services[name] = {**service, "observation": observation, "health": observation["health"]}
+            telemetry = None
+            try:
+                active = self.telemetry_store.active_session(name)
+                if active:
+                    samples = self.telemetry_store.series(active["session_id"], limit=1)["samples"]
+                    telemetry = {"session": active, "sample": samples[-1] if samples else None}
+                elif (service.get("telemetry") or {}).get("last_report"):
+                    telemetry = {"report": (service.get("telemetry") or {}).get("last_report")}
+            except Exception:
+                telemetry = None
+            services[name] = {**service, "observation": observation, "health": observation["health"], "telemetry": telemetry}
         return {
             "rift_product": "RIFT",
             "state_path": str(self.state_path),
@@ -2446,6 +2556,18 @@ class RiftOrchestrator:
                 )
                 continue
             observation = self._service_observation(name, service, now=current_time)
+            telemetry_sample = None
+            if observation.get("process_alive") and bool((monitoring.get("resources") or {}).get("enabled", True)):
+                try:
+                    active_session = self.telemetry_supervisor.attach_service(
+                        name,
+                        process_id=int((service.get("runtime") or {}).get("pid") or 0) or None,
+                    )
+                    if active_session is None:
+                        self._telemetry_start_service(name, service, backend=str(service.get("backend") or "unknown"))
+                    telemetry_sample = self.telemetry_supervisor.sample_once(name)
+                except Exception:
+                    telemetry_sample = None
             history = history_root.setdefault(name, [])
             history.append(observation)
             del history[: max(0, len(history) - int(monitoring.get("history_limit", 100)))]
@@ -2510,6 +2632,7 @@ class RiftOrchestrator:
                     "available": True,
                     "status": service["status"],
                     "observation": observation,
+                    "telemetry": telemetry_sample,
                     "supervisor": dict(supervisor),
                     "recovery": action,
                 }
@@ -2644,6 +2767,253 @@ class RiftOrchestrator:
             "state_path": str(self.state_path),
         }
 
+    def _telemetry_start_service(self, service_name: str, service: JsonDict, *, backend: str | None = None) -> None:
+        """Start/attach the node supervisor without making telemetry a launch dependency."""
+        monitoring = dict(service.get("monitoring") or {})
+        resources = self._effective_telemetry_resources(service)
+        if not bool(resources.get("enabled", True)):
+            return
+        pid_value = (service.get("runtime") or {}).get("pid")
+        pid = int(pid_value) if pid_value not in (None, "") else None
+        try:
+            session = self.telemetry_supervisor.start_service(
+                service_name,
+                process_id=pid,
+                metadata={
+                    "backend": backend or service.get("backend"),
+                    "model": (service.get("model") or {}).get("id"),
+                    "scope": (service.get("runtime") or {}).get("resource_scope") or {"kind": "pid", "pid": pid},
+                    "electricity_price_per_kwh": resources.get("electricity_price_per_kwh"),
+                    "compute_cost_per_node_hour": resources.get("compute_cost_per_node_hour"),
+                },
+                interval_seconds=float(resources.get("sample_interval_seconds", 2.0)),
+            )
+            service["telemetry"] = {
+                "enabled": True,
+                "session_id": session.get("session_id"),
+                "started_at": session.get("started_at"),
+                "node_id": session.get("node_id", "local"),
+            }
+        except Exception as exc:
+            service["telemetry"] = {"enabled": True, "status": "unavailable", "reason": str(exc)}
+
+    @staticmethod
+    def _validate_accounting_rate(name: str, value: Any) -> None:
+        if value is None:
+            return
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be a non-negative finite number or null")
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a non-negative finite number or null") from exc
+        if not math.isfinite(number) or number < 0.0:
+            raise ValueError(f"{name} must be a non-negative finite number or null")
+
+    def _effective_telemetry_resources(
+        self,
+        service: JsonDict,
+        *,
+        config: JsonDict | None = None,
+    ) -> JsonDict:
+        """Merge global telemetry defaults with a service's explicit overrides."""
+        if config is None:
+            try:
+                loaded = read_yaml(self._resolve_path("rift.yaml"))
+                config = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                config = {}
+        telemetry = (config.get("observability") or {}).get("telemetry") or {}
+        global_resources = dict(telemetry) if isinstance(telemetry, dict) else {}
+        monitoring = service.get("monitoring") or {}
+        service_resources = monitoring.get("resources") or {} if isinstance(monitoring, dict) else {}
+        if not isinstance(service_resources, dict):
+            service_resources = {}
+        effective = dict(global_resources)
+        for key, value in service_resources.items():
+            if key in ("electricity_price_per_kwh", "compute_cost_per_node_hour") and value is None:
+                continue
+            effective[key] = value
+        return effective
+
+    def service_telemetry_accounting(
+        self,
+        service_name: str,
+        *,
+        config: JsonDict | None = None,
+    ) -> JsonDict:
+        """Return effective and service-scoped resource accounting settings."""
+        loaded = config if config is not None else self.load_config()
+        services = loaded.get("services") or {}
+        service = services.get(service_name)
+        if not isinstance(service, dict):
+            raise KeyError(f"service not found: {service_name}")
+        telemetry = (loaded.get("observability") or {}).get("telemetry") or {}
+        global_resources = dict(telemetry) if isinstance(telemetry, dict) else {}
+        monitoring = service.get("monitoring") or {}
+        service_resources = monitoring.get("resources") or {} if isinstance(monitoring, dict) else {}
+        if not isinstance(service_resources, dict):
+            service_resources = {}
+        effective = self._effective_telemetry_resources(service, config=loaded)
+        rates = {
+            "electricity_price_per_kwh": effective.get("electricity_price_per_kwh"),
+            "compute_cost_per_node_hour": effective.get("compute_cost_per_node_hour"),
+        }
+        sources = {
+            "electricity_price_source": (
+                "service" if service_resources.get("electricity_price_per_kwh") is not None
+                else "global" if global_resources.get("electricity_price_per_kwh") is not None
+                else "unconfigured"
+            ),
+            "compute_cost_source": (
+                "service" if service_resources.get("compute_cost_per_node_hour") is not None
+                else "global" if global_resources.get("compute_cost_per_node_hour") is not None
+                else "unconfigured"
+            ),
+        }
+        return {
+            "api_version": "2",
+            "service": service_name,
+            "config_path": str(self._resolve_path("rift.yaml")),
+            **rates,
+            **sources,
+            "configured": any(value is not None for value in rates.values()),
+            "currency": None,
+            "service_overrides": {
+                key: service_resources.get(key)
+                for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour")
+            },
+            "global_defaults": {
+                key: global_resources.get(key)
+                for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour")
+            },
+        }
+
+    def update_service_telemetry_accounting(
+        self,
+        service_name: str,
+        *,
+        updates: dict[str, Any],
+    ) -> JsonDict:
+        """Persist service accounting overrides and refresh any live session."""
+        if not str(service_name).strip():
+            raise ValueError("service name is required")
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("at least one accounting setting is required")
+        allowed = {"electricity_price_per_kwh", "compute_cost_per_node_hour"}
+        unknown = sorted(set(updates) - allowed)
+        if unknown:
+            raise ValueError(f"unsupported accounting setting: {unknown[0]}")
+        normalized: dict[str, float | None] = {}
+        for key, value in updates.items():
+            self._validate_accounting_rate(key, value)
+            normalized[key] = None if value is None else float(value)
+
+        config_path = self._resolve_path("rift.yaml")
+        config = self.load_config(config_path)
+        services = config.get("services") or {}
+        service = services.get(service_name)
+        if not isinstance(service, dict):
+            raise KeyError(f"service not found: {service_name}")
+        monitoring = service.setdefault("monitoring", {})
+        if not isinstance(monitoring, dict):
+            raise ValueError(f"service {service_name} monitoring must be an object")
+        resources = monitoring.setdefault("resources", {})
+        if not isinstance(resources, dict):
+            raise ValueError(f"service {service_name} monitoring.resources must be an object")
+        resources.update(normalized)
+        self.validate_config(config)
+        self._write_yaml_atomic(config_path, config)
+
+        state = self.read_state()
+        state_service = (state.get("services") or {}).get(service_name)
+        if isinstance(state_service, dict):
+            state_monitoring = state_service.setdefault("monitoring", {})
+            if isinstance(state_monitoring, dict):
+                state_resources = state_monitoring.setdefault("resources", {})
+                if isinstance(state_resources, dict):
+                    state_resources.update(normalized)
+            state["config_fingerprint"] = self._fingerprint(config)
+            self.write_state(state)
+
+        snapshot = self.service_telemetry_accounting(service_name, config=config)
+        active = self.telemetry_store.active_session(service_name)
+        if active is not None:
+            self.telemetry_store.update_session_metadata(
+                str(active["session_id"]),
+                {
+                    "electricity_price_per_kwh": snapshot["electricity_price_per_kwh"],
+                    "compute_cost_per_node_hour": snapshot["compute_cost_per_node_hour"],
+                },
+            )
+        self.observability_store.append(
+            "telemetry_accounting_updated",
+            details={"service": service_name, "settings": normalized},
+        )
+        return snapshot
+
+    def _telemetry_finish_service(self, service_name: str) -> JsonDict | None:
+        try:
+            report = self.telemetry_supervisor.stop_service(service_name)
+            if not report:
+                return None
+            gateway_path = self.rift_dir / "gateway" / "metrics.json"
+            try:
+                gateway = json.loads(gateway_path.read_text(encoding="utf-8")) if gateway_path.is_file() else {}
+            except (OSError, json.JSONDecodeError):
+                gateway = {}
+            if isinstance(gateway, dict):
+                report["traffic"] = {
+                    "requests_total": int(gateway.get("requests_total") or 0),
+                    "requests_succeeded": int(gateway.get("requests_succeeded") or 0),
+                    "requests_failed": int(gateway.get("requests_failed") or 0),
+                    "input_tokens_observed": int(gateway.get("tokens_input_observed") or 0),
+                    "output_tokens_observed": int(gateway.get("tokens_output_observed") or 0),
+                    "coverage": "measured" if int(gateway.get("requests_with_usage") or 0) else "unknown",
+                }
+            self.telemetry_store.update_report(report)
+            return report
+        except (KeyError, OSError, RuntimeError):
+            return None
+
+    def telemetry_latest(self, *, service_name: str | None = None, node_id: str | None = None) -> JsonDict:
+        sessions = self.telemetry_store.list_sessions(service_name=service_name, node_id=node_id, limit=100)["sessions"]
+        latest: list[JsonDict] = []
+        for session in sessions:
+            if str(session.get("status") or "") != "running":
+                continue
+            series = self.telemetry_store.series(str(session["session_id"]), limit=1)["samples"]
+            if series:
+                latest.append({"session": session, "sample": series[-1]})
+        latest.sort(key=lambda item: float((item.get("sample") or {}).get("observed_at") or 0), reverse=True)
+        return {"api_version": "1", "updated_at": time.time(), "samples": latest}
+
+    def telemetry_series(self, *, session_id: str | None = None, service_name: str | None = None, since: float | None = None, until: float | None = None) -> JsonDict:
+        if session_id:
+            result = self.telemetry_store.series(session_id, since=since, until=until)
+            result["api_version"] = "1"
+            return result
+        sessions = self.telemetry_store.list_sessions(service_name=service_name, limit=100)["sessions"]
+        return {
+            "api_version": "1",
+            "sessions": [self.telemetry_store.series(str(item["session_id"]), since=since, until=until) for item in sessions],
+        }
+
+    def telemetry_sessions(self, *, service_name: str | None = None, node_id: str | None = None, limit: int = 100) -> JsonDict:
+        return {"api_version": "1", **self.telemetry_store.list_sessions(service_name=service_name, node_id=node_id, limit=limit)}
+
+    def telemetry_reports(self, *, service_name: str | None = None, node_id: str | None = None, limit: int = 100) -> JsonDict:
+        return {"api_version": "1", **self.telemetry_store.list_reports(service_name=service_name, node_id=node_id, limit=limit)}
+
+    def telemetry_signals(self, *, service_name: str | None = None, session_id: str | None = None, limit: int = 100) -> JsonDict:
+        return {"api_version": "1", **self.telemetry_store.list_signals(service_name=service_name, session_id=session_id, limit=limit)}
+
+    def telemetry_report(self, report_id: str) -> JsonDict:
+        report = self.telemetry_store.get_report(report_id)
+        if report is None:
+            raise KeyError(report_id)
+        return {"api_version": "1", "report": report}
+
     def stop_service(self, *, service_name: str) -> JsonDict:
         """Stop a service while retaining its desired configuration and model."""
 
@@ -2658,6 +3028,9 @@ class RiftOrchestrator:
             "status": "not_running",
             "pid": pid,
         }
+        telemetry_report = self._telemetry_finish_service(service_name)
+        if telemetry_report:
+            service["telemetry"] = {"last_report": telemetry_report}
         service["desired_state"] = "stopped"
         service["status"] = "stopped"
         service["updated_unix_seconds"] = int(time.time())
@@ -2667,7 +3040,12 @@ class RiftOrchestrator:
             status="stopped",
         )
         self.write_state(state)
-        return {"stopped": bool(termination.get("stopped")), "service": service_name, "termination": termination}
+        return {
+            "stopped": bool(termination.get("stopped")),
+            "service": service_name,
+            "termination": termination,
+            "resource_report": telemetry_report,
+        }
 
     def rollback_service(self, *, service_name: str, allow_launch: bool = False) -> JsonDict:
         """Re-launch the persisted last-known-good command when available."""
@@ -3980,7 +4358,38 @@ class RiftOrchestrator:
         }
 
     def prometheus_metrics(self) -> str:
-        return self.observability_store.prometheus(self.observability()["snapshot"])
+        body = self.observability_store.prometheus(self.observability()["snapshot"])
+        latest = self.telemetry_latest().get("samples") or []
+        lines = [body.rstrip()]
+        metric_map = {
+            "cpu_percent": "rift_telemetry_cpu_utilization_percent",
+            "process_cpu_percent": "rift_telemetry_service_cpu_utilization_percent",
+            "host_ram_pressure_percent": "rift_telemetry_host_ram_pressure_percent",
+            "host_ram_available_bytes": "rift_telemetry_host_ram_available_bytes",
+            "cpu_temperature_c": "rift_telemetry_cpu_temperature_celsius",
+            "process_rss_bytes": "rift_telemetry_service_memory_bytes",
+            "gpu_utilization_percent": "rift_telemetry_gpu_utilization_percent",
+            "gpu_temperature_c": "rift_telemetry_gpu_temperature_celsius",
+            "gpu_vram_used_bytes": "rift_telemetry_gpu_vram_used_bytes",
+            "gpu_vram_pressure_percent": "rift_telemetry_gpu_vram_pressure_percent",
+            "gpu_power_watts": "rift_telemetry_gpu_power_watts",
+        }
+        emitted: set[str] = set()
+        for item in latest:
+            session = item.get("session") or {}
+            sample = item.get("sample") or {}
+            service = str(session.get("service_name") or "unknown").replace('"', "")
+            node = str(session.get("node_id") or "local").replace('"', "")
+            labels = f'service="{service}",node="{node}"'
+            for key, metric in metric_map.items():
+                value = sample.get(key)
+                if not isinstance(value, (int, float)):
+                    continue
+                if metric not in emitted:
+                    lines.append(f"# TYPE {metric} gauge")
+                    emitted.add(metric)
+                lines.append(f"{metric}{{{labels}}} {float(value)}")
+        return "\n".join(line for line in lines if line) + "\n"
 
     def prune_observability(self) -> JsonDict:
         return self.observability_store.prune()
@@ -4805,6 +5214,12 @@ class RiftOrchestrator:
                 )
             else:
                 stopped.append({"service": name, "container_termination": container_termination})
+            resource_report = self._telemetry_finish_service(name)
+            if resource_report:
+                service["telemetry"] = {
+                    "last_report": resource_report,
+                    "stopped_at": resource_report.get("stopped_at"),
+                }
             self._set_deployment_record_status(
                 service_name=name,
                 service=service,
@@ -5091,6 +5506,21 @@ class RiftOrchestrator:
             with temporary.open("wb") as stream:
                 stream.write(encoded)
                 stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+
+    def _write_yaml_atomic(self, path: Path, payload: JsonDict) -> None:
+        """Replace a configuration file only after the complete document is written."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{time.time_ns()}.tmp")
+        try:
+            write_yaml(temporary, payload)
+            with temporary.open("r+b") as stream:
                 os.fsync(stream.fileno())
             temporary.replace(path)
         finally:

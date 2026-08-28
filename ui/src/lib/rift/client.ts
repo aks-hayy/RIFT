@@ -32,6 +32,10 @@ import type {
   RiftEvent,
   RiftNode,
   Service,
+  ResourceReport,
+  ServiceTelemetryAccounting,
+  TelemetrySample,
+  TelemetrySession,
   UseCase,
 } from "./types";
 import {
@@ -465,6 +469,166 @@ function mapServices(payload: unknown): Service[] {
 
 async function listServices(signal?: AbortSignal): Promise<Service[]> {
   return mapServices(await req<JsonObject>("GET", "/services", undefined, signal));
+}
+
+function mapTelemetrySample(value: unknown): TelemetrySample {
+  const raw = object(value);
+  return {
+    observedAt: iso(raw.observed_at),
+    serviceName: text(raw.service_name) || undefined,
+    processId: numeric(raw.process_id) || undefined,
+    cpuPercent: raw.cpu_percent == null ? undefined : numeric(raw.cpu_percent),
+    processCpuPercent:
+      raw.process_cpu_percent == null ? undefined : numeric(raw.process_cpu_percent),
+    hostRamAvailableBytes:
+      raw.host_ram_available_bytes == null ? undefined : numeric(raw.host_ram_available_bytes),
+    hostRamPressurePercent:
+      raw.host_ram_pressure_percent == null ? undefined : numeric(raw.host_ram_pressure_percent),
+    cpuTemperatureC: raw.cpu_temperature_c == null ? undefined : numeric(raw.cpu_temperature_c),
+    processRssBytes: raw.process_rss_bytes == null ? undefined : numeric(raw.process_rss_bytes),
+    gpuUtilizationPercent:
+      raw.gpu_utilization_percent == null ? undefined : numeric(raw.gpu_utilization_percent),
+    gpuTemperatureC: raw.gpu_temperature_c == null ? undefined : numeric(raw.gpu_temperature_c),
+    gpuVramUsedBytes:
+      raw.gpu_vram_used_bytes == null ? undefined : numeric(raw.gpu_vram_used_bytes),
+    gpuVramTotalBytes:
+      raw.gpu_vram_total_bytes == null ? undefined : numeric(raw.gpu_vram_total_bytes),
+    gpuVramPressurePercent:
+      raw.gpu_vram_pressure_percent == null ? undefined : numeric(raw.gpu_vram_pressure_percent),
+    gpuPowerWatts: raw.gpu_power_watts == null ? undefined : numeric(raw.gpu_power_watts),
+    availability: Object.fromEntries(
+      Object.entries(object(raw.availability)).map(([key, item]) => [key, text(item)]),
+    ),
+  };
+}
+
+function mapResourceReport(value: unknown): ResourceReport {
+  const raw = object(value);
+  const rawCosts = object(raw.costs);
+  const costNumber = (snake: string, camel: string): number | undefined => {
+    const value = rawCosts[snake] ?? rawCosts[camel];
+    return value == null || !Number.isFinite(Number(value)) ? undefined : Number(value);
+  };
+  return {
+    reportId: text(raw.report_id, "unknown"),
+    sessionId: text(raw.session_id, "unknown"),
+    serviceName: text(raw.service_name, "unknown"),
+    nodeId: text(raw.node_id, "local"),
+    startedAt: iso(raw.started_at),
+    stoppedAt: iso(raw.stopped_at),
+    durationSeconds: numeric(raw.duration_seconds),
+    sampleCount: numeric(raw.sample_count),
+    metrics: object(raw.metrics) as ResourceReport["metrics"],
+    costs: {
+      energyJoules: costNumber("energy_joules", "energyJoules"),
+      electricityCost: costNumber("electricity_cost", "electricityCost"),
+      computeCost: costNumber("compute_cost", "computeCost"),
+      totalCost: costNumber("total_cost", "totalCost"),
+      currency: typeof rawCosts.currency === "string" ? rawCosts.currency : null,
+      basis: text(rawCosts.basis) || undefined,
+    },
+    coverage: object(raw.coverage),
+  };
+}
+
+async function telemetryLatest(
+  service?: string,
+  signal?: AbortSignal,
+): Promise<{ session: TelemetrySession; sample: TelemetrySample }[]> {
+  const query = service ? `?service=${encodeURIComponent(service)}` : "";
+  const payload = await req<JsonObject>("GET", `/telemetry/latest${query}`, undefined, signal);
+  return list(payload.samples).map((item) => {
+    const raw = object(item);
+    const session = object(raw.session);
+    return {
+      session: {
+        sessionId: text(session.session_id, "unknown"),
+        serviceName: text(session.service_name, "unknown"),
+        nodeId: text(session.node_id, "local"),
+        status: text(session.status, "running"),
+        startedAt: iso(session.started_at),
+        stoppedAt: session.stopped_at == null ? undefined : iso(session.stopped_at),
+        sampleCount: numeric(session.sample_count),
+      },
+      sample: mapTelemetrySample(raw.sample),
+    };
+  });
+}
+
+async function resourceReports(service?: string, signal?: AbortSignal): Promise<ResourceReport[]> {
+  const query = service ? `?service=${encodeURIComponent(service)}` : "";
+  const payload = await req<JsonObject>("GET", `/telemetry/reports${query}`, undefined, signal);
+  return list(payload.reports).map(mapResourceReport);
+}
+
+async function serviceTelemetryAccounting(
+  service: string,
+  signal?: AbortSignal,
+): Promise<ServiceTelemetryAccounting> {
+  const payload = await req<JsonObject>(
+    "GET",
+    `/v2/services/${encodeURIComponent(service)}/telemetry/accounting`,
+    undefined,
+    signal,
+  );
+  return mapServiceTelemetryAccounting(payload);
+}
+
+function mapServiceTelemetryAccounting(value: unknown): ServiceTelemetryAccounting {
+  const raw = object(value);
+  const source = (entry: unknown): ServiceTelemetryAccounting["electricityPriceSource"] => {
+    const normalized = text(entry, "unconfigured");
+    return normalized === "service" || normalized === "global" ? normalized : "unconfigured";
+  };
+  const nullableNumber = (entry: unknown): number | null =>
+    entry == null || !Number.isFinite(Number(entry)) ? null : Number(entry);
+  return {
+    apiVersion: text(raw.api_version, "2"),
+    service: text(raw.service),
+    configPath: text(raw.config_path) || undefined,
+    electricityPricePerKwh: nullableNumber(raw.electricity_price_per_kwh),
+    computeCostPerNodeHour: nullableNumber(raw.compute_cost_per_node_hour),
+    electricityPriceSource: source(raw.electricity_price_source),
+    computeCostSource: source(raw.compute_cost_source),
+    configured: bool(raw.configured),
+    currency: typeof raw.currency === "string" ? raw.currency : null,
+    serviceOverrides: Object.fromEntries(
+      Object.entries(object(raw.service_overrides)).map(([key, entry]) => [
+        key,
+        nullableNumber(entry),
+      ]),
+    ),
+    globalDefaults: Object.fromEntries(
+      Object.entries(object(raw.global_defaults)).map(([key, entry]) => [
+        key,
+        nullableNumber(entry),
+      ]),
+    ),
+  };
+}
+
+async function updateServiceTelemetryAccounting(
+  service: string,
+  options: {
+    electricityPricePerKwh?: number | null;
+    computeCostPerNodeHour?: number | null;
+  },
+): Promise<ServiceTelemetryAccounting> {
+  const payload = await req<JsonObject>(
+    "POST",
+    `/v2/services/${encodeURIComponent(service)}/telemetry/accounting`,
+    {
+      accounting: {
+        ...(options.electricityPricePerKwh !== undefined
+          ? { electricity_price_per_kwh: options.electricityPricePerKwh }
+          : {}),
+        ...(options.computeCostPerNodeHour !== undefined
+          ? { compute_cost_per_node_hour: options.computeCostPerNodeHour }
+          : {}),
+      },
+    },
+  );
+  return mapServiceTelemetryAccounting(payload);
 }
 
 async function listNodes(signal?: AbortSignal): Promise<RiftNode[]> {
@@ -1315,6 +1479,10 @@ export const rift = {
     ),
 
   listServices,
+  telemetryLatest,
+  resourceReports,
+  serviceTelemetryAccounting,
+  updateServiceTelemetryAccounting,
   listDeploymentRecords,
   getService: async (id: string, signal?: AbortSignal) => {
     const services = await listServices(signal);

@@ -287,6 +287,10 @@ class RiftGatewayRuntime:
             "bytes_received": 0,
             "bytes_sent": 0,
             "latency_seconds_total": 0.0,
+            "tokens_input_observed": 0,
+            "tokens_output_observed": 0,
+            "tokens_total_observed": 0,
+            "requests_with_usage": 0,
             "status_codes": {},
             "backends": {},
             "last_request": None,
@@ -570,6 +574,7 @@ class RiftGatewayRuntime:
             "tokens": token_estimate,
             "error": error,
         }
+        observed_usage = token_estimate.get("observed") if isinstance(token_estimate, dict) else None
         with self._metrics_lock:
             self._metrics["requests_active"] = max(0, int(self._metrics["requests_active"]) - 1)
             success = 200 <= status < 400
@@ -580,6 +585,13 @@ class RiftGatewayRuntime:
             self._metrics["fallbacks_used"] += fallback_count
             self._metrics["bytes_sent"] += bytes_sent
             self._metrics["latency_seconds_total"] += latency_seconds
+            if isinstance(observed_usage, dict):
+                input_tokens = int(observed_usage.get("prompt_tokens") or observed_usage.get("input_tokens") or 0)
+                output_tokens = int(observed_usage.get("completion_tokens") or observed_usage.get("output_tokens") or 0)
+                self._metrics["tokens_input_observed"] += input_tokens
+                self._metrics["tokens_output_observed"] += output_tokens
+                self._metrics["tokens_total_observed"] += input_tokens + output_tokens
+                self._metrics["requests_with_usage"] += 1
             status_codes = self._metrics["status_codes"]
             status_codes[str(status)] = int(status_codes.get(str(status)) or 0) + 1
             if backend_service:
@@ -667,6 +679,19 @@ class RiftGatewayRuntime:
         word_floor = len(re.findall(r"\S+", text))
         character_estimate = math.ceil(len(text) / 3.0)
         return max(word_floor, character_estimate)
+
+    @staticmethod
+    def extract_usage(raw: bytes) -> JsonDict | None:
+        """Extract only OpenAI usage metadata; never retain prompt/completion content."""
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return None
+        fields = ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens")
+        return {key: int(usage[key]) for key in fields if key in usage and isinstance(usage[key], (int, float))}
 
 
 class RiftGatewayHandler(BaseHTTPRequestHandler):
@@ -802,6 +827,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
         self.runtime.begin_request(length)
         result: GatewayResponse | None = None
         bytes_sent = 0
+        observed_usage: JsonDict | None = None
         try:
             try:
                 result = self.runtime.proxy(
@@ -821,10 +847,11 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                     error=str(exc),
                 )
             if result.stream is not None:
-                bytes_sent = self._send_stream(result, request_id)
+                bytes_sent, observed_usage = self._send_stream(result, request_id)
             else:
                 response_body = result.body or b""
                 bytes_sent = len(response_body)
+                observed_usage = self.runtime.extract_usage(response_body)
                 self._send_bytes(
                     result.status,
                     response_body,
@@ -845,11 +872,15 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                     bytes_sent=bytes_sent,
                     backend_service=result.backend_service,
                     fallback_count=result.fallback_count,
-                    token_estimate=token_estimate,
+                    token_estimate=(
+                        {**token_estimate, "observed": observed_usage, "coverage": "measured"}
+                        if isinstance(token_estimate, dict) and observed_usage
+                        else token_estimate
+                    ),
                     error=result.error,
                 )
 
-    def _send_stream(self, result: GatewayResponse, request_id: str) -> int:
+    def _send_stream(self, result: GatewayResponse, request_id: str) -> tuple[int, JsonDict | None]:
         self.send_response(result.status)
         self.send_header("Content-Type", result.content_type)
         self.send_header("Cache-Control", "no-cache")
@@ -860,6 +891,8 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
         sent = 0
+        usage: JsonDict | None = None
+        metadata = bytearray()
         stream = result.stream
         try:
             while True:
@@ -869,11 +902,24 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 sent += len(chunk)
+                if len(metadata) < 256 * 1024:
+                    metadata.extend(chunk[: 256 * 1024 - len(metadata)])
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             stream.close()
-        return sent
+        # Streaming OpenAI responses may put usage on the final chunk. Parse
+        # only bounded metadata and discard all response content immediately.
+        for line in bytes(metadata).splitlines():
+            if b"data:" not in line:
+                continue
+            candidate = line.split(b"data:", 1)[1].strip()
+            if candidate == b"[DONE]":
+                continue
+            parsed = self.runtime.extract_usage(candidate)
+            if parsed:
+                usage = parsed
+        return sent, usage
 
     def _send_json(
         self,

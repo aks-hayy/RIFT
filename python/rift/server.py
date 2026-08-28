@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import csv
+import io
 import hashlib
 import os
 from pathlib import Path
@@ -436,6 +438,11 @@ class RiftServerRuntime:
         if path.startswith("/api/rift/v2/evaluations/"):
             run_id = path.rsplit("/", 1)[-1]
             return orchestrator.load_evaluation(run_id)
+        if path.startswith("/api/rift/v2/services/") and path.endswith("/telemetry/accounting"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7 or parts[3] != "services" or parts[5:] != ["telemetry", "accounting"]:
+                raise KeyError(path)
+            return orchestrator.service_telemetry_accounting(parts[4])
         if path in ("/api/rift/settings", "/api/rift/v2/settings"):
             return orchestrator.settings_snapshot()
         if path == "/api/rift/v2/adapters":
@@ -571,6 +578,47 @@ class RiftServerRuntime:
             return (nodes[0].get("hardware") or {}) if nodes else {}
         if path == "/api/rift/services":
             return orchestrator.status().get("services", {})
+        if path == "/api/rift/telemetry/latest":
+            return orchestrator.telemetry_latest(
+                service_name=((query or {}).get("service") or [None])[0],
+                node_id=((query or {}).get("node") or [None])[0],
+            )
+        if path == "/api/rift/telemetry/series":
+            def query_float(name: str) -> float | None:
+                value = ((query or {}).get(name) or [None])[0]
+                return float(value) if value not in (None, "") else None
+            return orchestrator.telemetry_series(
+                session_id=((query or {}).get("session_id") or [None])[0],
+                service_name=((query or {}).get("service") or [None])[0],
+                since=query_float("since"),
+                until=query_float("until"),
+            )
+        if path == "/api/rift/telemetry/sessions":
+            return orchestrator.telemetry_sessions(
+                service_name=((query or {}).get("service") or [None])[0],
+                node_id=((query or {}).get("node") or [None])[0],
+                limit=int(((query or {}).get("limit") or [100])[0] or 100),
+            )
+        if path == "/api/rift/telemetry/reports":
+            return orchestrator.telemetry_reports(
+                service_name=((query or {}).get("service") or [None])[0],
+                node_id=((query or {}).get("node") or [None])[0],
+                limit=int(((query or {}).get("limit") or [100])[0] or 100),
+            )
+        if path == "/api/rift/telemetry/signals":
+            return orchestrator.telemetry_signals(
+                service_name=((query or {}).get("service") or [None])[0],
+                session_id=((query or {}).get("session_id") or [None])[0],
+                limit=int(((query or {}).get("limit") or [100])[0] or 100),
+            )
+        if path.startswith("/api/rift/telemetry/sessions/"):
+            session_id = path.rsplit("/", 1)[-1]
+            result = orchestrator.telemetry_store.get_session(session_id)
+            if result is None:
+                raise KeyError(path)
+            return {"api_version": "1", "session": result}
+        if path.startswith("/api/rift/telemetry/reports/"):
+            return orchestrator.telemetry_report(path.rsplit("/", 1)[-1])
         if path == "/api/rift/metrics":
             return {"status": orchestrator.status(), "reports": orchestrator.reports()}
         if path == "/api/rift/reports":
@@ -613,6 +661,20 @@ class RiftServerRuntime:
         authorization: str | None = None,
         progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
     ) -> JsonDict:
+        if path in ("/api/rift/telemetry/ingest", "/api/rift/v2/telemetry/ingest"):
+            orchestrator = self.orchestrator_factory()
+            session_id = str(payload.get("session_id") or "")
+            samples = payload.get("samples")
+            if not session_id or not isinstance(samples, list):
+                raise ValueError("telemetry ingest requires session_id and samples")
+            if len(samples) > 1000:
+                raise ValueError("telemetry ingest batch is too large")
+            accepted = 0
+            for item in samples:
+                if isinstance(item, dict):
+                    orchestrator.telemetry_store.record_sample(session_id, item)
+                    accepted += 1
+            return {"api_version": "1", "session_id": session_id, "accepted": accepted, "acknowledged_at": time.time()}
         if path == "/api/rift/v2/mesh/enrollment-window":
             result = self.mesh_controller().open_enrollment_window(
                 ttl_seconds=int(payload.get("ttl_seconds") or 600)
@@ -682,6 +744,24 @@ class RiftServerRuntime:
                 reason=str(payload.get("reason") or "Operation cancelled by operator"),
             )
         orchestrator = self.orchestrator_factory()
+        if path.startswith("/api/rift/v2/services/") and path.endswith("/telemetry/accounting"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7 or parts[3] != "services" or parts[5:] != ["telemetry", "accounting"]:
+                raise KeyError(path)
+            accounting = payload.get("accounting")
+            if accounting is None:
+                accounting = payload
+            if not isinstance(accounting, dict):
+                raise ValueError("accounting must be an object")
+            updates = {
+                key: accounting[key]
+                for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour")
+                if key in accounting
+            }
+            return orchestrator.update_service_telemetry_accounting(
+                parts[4],
+                updates=updates,
+            )
         if path == "/api/rift/v2/recommendations":
             return orchestrator.engine.recommend_models(
                 task=str(payload.get("task") or "chat"),
@@ -1090,6 +1170,23 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, self.runtime.current_plan())
             return
         if parsed.path.startswith("/api/rift/"):
+            if parsed.path == "/api/rift/telemetry/events":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self._send_cors_headers()
+                self.end_headers()
+                self.close_connection = True
+                for _ in range(5):
+                    try:
+                        payload = self.runtime.orchestrator_factory().telemetry_latest()
+                        self.wfile.write(f"event: telemetry\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(2.0)
+                return
             if parsed.path == "/api/rift/metrics/prometheus":
                 body = self.runtime.orchestrator_factory().prometheus_metrics().encode("utf-8")
                 self.send_response(HTTPStatus.OK)
@@ -1098,6 +1195,24 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(body)
+                return
+            if parsed.path.startswith("/api/rift/telemetry/reports/") and parsed.path.endswith(".csv"):
+                try:
+                    report = self.runtime.orchestrator_factory().telemetry_report(parsed.path.rsplit("/", 1)[-1][:-4])["report"]
+                    output = io.StringIO()
+                    writer = csv.writer(output)
+                    writer.writerow(["metric", "average", "minimum", "maximum", "peak"])
+                    for name, values in (report.get("metrics") or {}).items():
+                        writer.writerow([name, values.get("average"), values.get("minimum"), values.get("maximum"), values.get("peak")])
+                    body = output.getvalue().encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/csv; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(body)
+                except KeyError:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"error": "telemetry report not found"})
                 return
             try:
                 self._send_json(
