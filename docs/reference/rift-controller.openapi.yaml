@@ -72,6 +72,11 @@ x-rift-implemented-v2-paths:
   - /v2/evaluations/{runId}
   - /v2/settings
   - /v2/model-sources
+  - /v2/benchmark-profiles
+  - /v2/benchmark-targets
+  - /v2/benchmark-plans
+  - /v2/benchmarks
+  - /v2/benchmarks/{runId}
 
 paths:
   # These are the live v2 resources used by the bundled dashboard. They are
@@ -1173,6 +1178,118 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Benchmark"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v2/benchmark-profiles:
+    get:
+      tags: [Performance]
+      operationId: getBenchmarkProfiles
+      summary: List the versioned benchmark profiles supported by the controller.
+      responses:
+        "200":
+          description: Substantial workload definitions and measurement requirements.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, profiles]
+                properties:
+                  schema_version: { type: string, example: rift.benchmarks/v1 }
+                  profiles:
+                    type: array
+                    items: { type: object, additionalProperties: true }
+
+  /v2/benchmark-targets:
+    get:
+      tags: [Performance]
+      operationId: listBenchmarkTargets
+      summary: List managed services and explicitly registered external targets.
+      responses:
+        "200":
+          description: Benchmarkable target inventory.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+    post:
+      tags: [Performance]
+      operationId: registerBenchmarkTarget
+      summary: Register an OpenAI-compatible endpoint using an environment credential reference.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, url, model]
+              properties:
+                id: { type: string }
+                url: { type: string, format: uri }
+                model: { type: string }
+                credential_ref: { type: string, pattern: '^env:[A-Za-z_][A-Za-z0-9_]*$' }
+      responses:
+        "200":
+          description: Registered target metadata; secret values are never persisted.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /v2/benchmark-plans:
+    post:
+      tags: [Performance]
+      operationId: compileBenchmarkPlan
+      summary: Resolve selected profiles into a deterministic, reviewable plan without inference requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "200":
+          description: Versioned plan with cases, profile order, limits, capabilities, and plan hash.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /v2/benchmarks:
+    get:
+      tags: [Performance]
+      operationId: listBenchmarkSuiteRuns
+      summary: List durable benchmark-suite results for a service.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Recent suite runs, newest first.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+    post:
+      tags: [Performance]
+      operationId: runBenchmarkSuite
+      summary: Execute one or more selected profiles as a durable background operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+
+  /v2/benchmarks/{runId}:
+    get:
+      tags: [Performance]
+      operationId: getBenchmarkSuiteRun
+      summary: Get a benchmark run, profile summaries, and artifact references.
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Durable suite result.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
         "404":
           $ref: "#/components/responses/NotFound"
 

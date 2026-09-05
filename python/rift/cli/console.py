@@ -510,6 +510,62 @@ class RiftConsole:
         if payload.get("report_path"):
             print(self._dim(f"Report: {payload['report_path']}"))
 
+    def _render_benchmark_suite(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "RIFT benchmark suite")
+        if payload.get("reason") and not payload.get("profile_results"):
+            self._render_result(payload, title=None)
+            return
+        if payload.get("run_id"):
+            self._key_values(
+                [
+                    ("Run ID", payload.get("run_id")),
+                    ("Target", payload.get("target")),
+                    ("Status", payload.get("status")),
+                    ("Profiles", ", ".join(str(item) for item in payload.get("profiles") or [])),
+                    ("Requests", f"{payload.get('completed_requests', 0)} / {payload.get('planned_requests', 0)}"),
+                    ("Duration", f"{float(payload.get('duration_seconds') or 0):.2f}s"),
+                ]
+            )
+        runs = payload.get("runs")
+        if isinstance(runs, list):
+            if runs:
+                print()
+                self._table(
+                    ["Run", "Target", "Profiles", "Status"],
+                    [[item.get("run_id"), item.get("target"), ", ".join(item.get("profiles") or []), item.get("status")] for item in runs],
+                )
+            else:
+                print(self._dim("No benchmark runs recorded yet."))
+            return
+        comparisons = payload.get("comparisons")
+        if isinstance(comparisons, list):
+            print()
+            self._table(
+                ["Profile", "Left tok/s", "Right tok/s", "Delta", "Quality Δ"],
+                [
+                    [
+                        item.get("profile"),
+                        self._format(item.get("left")),
+                        self._format(item.get("right")),
+                        self._format(item.get("delta")),
+                        self._format(item.get("quality_delta")),
+                    ]
+                    for item in comparisons
+                ],
+            )
+            return
+        profile_results = payload.get("profile_results")
+        if isinstance(profile_results, dict):
+            print()
+            rows = []
+            for profile, result in profile_results.items():
+                summary = (result or {}).get("summary") or {}
+                metrics = summary.get("metrics") or {}
+                rows.append([profile, (result or {}).get("status"), summary.get("completed_requests", 0), self._format(metrics.get("median_tokens_per_second")), self._format(metrics.get("p95_elapsed_seconds"))])
+            self._table(["Profile", "Status", "Requests", "Median tok/s", "P95 latency"], rows)
+            if payload.get("artifact_manifest"):
+                print(self._dim(f"Manifest: {payload['artifact_manifest']}"))
+
     def _render_tuning(self, payload: JsonDict, *, title: str | None = None) -> None:
         self._heading(title or "Profiled tuning result")
         profile = payload.get("profile") or "unknown"

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
 import time
-from typing import Any
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
 
-from rift.cluster import RiftClusterController, example_emulated_cluster
 from rift.adapters.conformance import BackendConformanceSuite
+from rift.cluster import RiftClusterController, example_emulated_cluster
 from rift.dashboard import launch_dashboard_detached, serve_dashboard
 from rift.gateway import serve_gateway
 from rift.node_agent import default_node_agent_config, serve_node_agent
@@ -20,7 +22,7 @@ from rift.node_bootstrap import NodeBootstrapClient, install_node_service
 from rift.orchestrator import ApplyPermissions, RiftOrchestrator
 from rift.providers import provider_lifecycle_gate
 from rift.rift import RiftEngine
-from rift.rift_yaml import write_yaml
+from rift.rift_yaml import read_yaml, write_yaml
 from rift.runtime_paths import RiftPaths
 from rift.tuning_engine import TuningStore
 
@@ -285,20 +287,25 @@ def execute(args: Any, console: RiftConsole) -> int:
         return 0
 
     if args.command == "benchmark":
-        if args.suite:
-            result = orchestrator.benchmark_suite(
-                service_name=args.service,
-                warmups=args.warmups,
-                repetitions=args.repeats,
-            )
-        else:
-            result = orchestrator.benchmark(
-                service_name=args.service,
-                prompt=args.prompt,
-                max_tokens=args.max_tokens,
-            )
-        console.render(result, view="benchmark")
-        return 0 if result.get("available", True) else 1
+        # ``rift service benchmark`` is intentionally kept on the legacy
+        # contract for tuning and rollout callers. The root command is the
+        # versioned, multi-profile suite.
+        if not hasattr(args, "benchmark_action"):
+            if args.suite:
+                result = orchestrator.benchmark_suite(
+                    service_name=args.service,
+                    warmups=args.warmups,
+                    repetitions=args.repeats,
+                )
+            else:
+                result = orchestrator.benchmark(
+                    service_name=args.service,
+                    prompt=args.prompt,
+                    max_tokens=args.max_tokens,
+                )
+            console.render(result, view="benchmark")
+            return 0 if result.get("available", True) else 1
+        return _benchmark_command(args, console, orchestrator)
 
     if args.command == "tune":
         action = getattr(args, "tune_action", None)
@@ -1070,9 +1077,10 @@ def _node(args: Any, console: RiftConsole) -> int:
         client.run_foreground()
         return 0
     if args.node_command == "stop":
-        from rift.node_enrollment import ManagedNodeStore
         import os
         import signal
+
+        from rift.node_enrollment import ManagedNodeStore
 
         store = ManagedNodeStore(Path(args.root).expanduser().resolve() if args.root else RiftPaths.from_environment().home)
         pid_path = store.node_dir / "node.pid"
@@ -1198,6 +1206,297 @@ def _system(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> 
         console.render(orchestrator.migrate(config_path=args.config, write=args.write), title="Schema migration")
         return 0
     raise ValueError("rift system requires a subcommand")
+
+
+def _benchmark_command(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
+    """Handle the profile-oriented root benchmark command."""
+
+    action = getattr(args, "benchmark_action", None)
+    run_ids = [str(value) for value in (getattr(args, "run_ids", None) or [])]
+    if action == "targets":
+        if not run_ids or run_ids[0] != "add":
+            console.render(orchestrator.benchmark_targets(), view="benchmark-suite", title="Benchmark targets")
+            return 0
+        target_id = str(getattr(args, "target_id", None) or (run_ids[1] if len(run_ids) > 1 else ""))
+        url = str(getattr(args, "url", None) or "")
+        model = str(getattr(args, "model", None) or "")
+        if not target_id or not url or not model:
+            console.error("`rift benchmark targets add` requires --target-id, --url, and --model")
+            return 2
+        result = orchestrator.register_benchmark_target(
+            target_id=target_id,
+            url=url,
+            model=model,
+            credential_ref=getattr(args, "credential_ref", None),
+        )
+        console.render(result, view="benchmark-suite", title="Benchmark target registered")
+        return 0
+    if action in {"list", "show", "compare", "export", "replay", "cancel"}:
+        if action == "list":
+            service = str(getattr(args, "service", None) or "").strip()
+            result = _list_benchmark_runs(orchestrator, service=service)
+            console.render(result, view="benchmark-suite", title="Benchmark runs")
+            return 0
+        if action == "show":
+            if not run_ids:
+                console.error("`rift benchmark show` requires a RUN_ID")
+                return 2
+            result = _load_benchmark_run(orchestrator, run_ids[0])
+            if result is None:
+                console.error(f"Benchmark run not found: {run_ids[0]}")
+                return 1
+            console.render(result, view="benchmark-suite", title=f"Benchmark {run_ids[0]}")
+            return 0 if result.get("status") in {"completed", "partial"} else 1
+        if action == "compare":
+            if len(run_ids) < 2:
+                console.error("`rift benchmark compare` requires two RUN_ID values")
+                return 2
+            left = _load_benchmark_run(orchestrator, run_ids[0])
+            right = _load_benchmark_run(orchestrator, run_ids[1])
+            if left is None or right is None:
+                console.error("Both benchmark runs must exist before comparing them.")
+                return 1
+            result = _compare_benchmark_runs(left, right)
+            console.render(result, view="benchmark-suite", title="Benchmark comparison")
+            return 0
+        if not run_ids:
+            console.error(f"`rift benchmark {action}` requires a RUN_ID")
+            return 2
+        run = _load_benchmark_run(orchestrator, run_ids[0])
+        if run is None:
+            console.error(f"Benchmark run not found: {run_ids[0]}")
+            return 1
+        if action == "export":
+            result = _export_benchmark_run(orchestrator, run, str(getattr(args, "format", "json")))
+            console.render(result, view="benchmark-suite", title="Benchmark export")
+            return 0
+        if action == "replay":
+            research = None
+            plan_file = run.get("plan_file")
+            if plan_file:
+                try:
+                    replay_plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
+                    research = (((replay_plan.get("profile_plans") or {}).get("research") or {}).get("protocol"))
+                except (OSError, json.JSONDecodeError):
+                    research = None
+            result = orchestrator.benchmark_profiles(
+                service_name=str(run.get("target") or "chat"),
+                profiles=tuple(run.get("profiles") or ("smoke",)),
+                research=research,
+            )
+            console.render(result, view="benchmark-suite", title="Benchmark replay")
+            return 0 if result.get("status") in {"completed", "partial"} else 1
+        # Cancellation is delegated to the controller operation endpoint. A
+        # completed local run cannot be cancelled and must remain immutable.
+        console.render({"available": False, "run_id": run_ids[0], "reason": "only active controller operations can be cancelled"}, view="benchmark-suite", title="Benchmark cancellation")
+        return 2
+
+    loaded: dict[str, Any] = {}
+    if getattr(args, "spec", None):
+        value = read_yaml(args.spec)
+        if not isinstance(value, dict):
+            raise ValueError("benchmark specification must contain an object")
+        loaded = dict(value)
+    service_name = str(
+        getattr(args, "service", None)
+        or loaded.get("target")
+        or loaded.get("service")
+        or ""
+    ).strip()
+    targets = orchestrator.benchmark_targets().get("targets") or []
+    if not service_name:
+        if console.json_output or not getattr(sys.stdin, "isatty", lambda: False)():
+            console.render(
+                {"available": False, "reason": "an explicit --service or --spec target is required in non-interactive mode", "targets": targets},
+                view="benchmark-suite",
+                title="Benchmark targets",
+            )
+            return 2
+        service_name = _select_benchmark_target(targets)
+        if not service_name:
+            return 2
+    if action == "plan":
+        profiles = _profiles_from_args(args, loaded)
+        research = _research_from_args(args, loaded)
+        options = _benchmark_options_from_args(args, loaded)
+        result = orchestrator.benchmark_plan(
+            service_name=service_name,
+            profiles=profiles,
+            research=research,
+            **options,
+        )
+        console.render(result, view="benchmark-suite", title="Resolved benchmark plan")
+        return 0
+    profiles = _profiles_from_args(args, loaded)
+    research = _research_from_args(args, loaded)
+    options = _benchmark_options_from_args(args, loaded)
+    result = orchestrator.benchmark_profiles(
+        service_name=service_name,
+        profiles=profiles,
+        research=research,
+        **options,
+        progress=None if console.json_output else _benchmark_progress(console),
+    )
+    console.render(result, view="benchmark-suite", title="Benchmark suite result")
+    return 0 if result.get("status") == "completed" else 3 if result.get("status") == "partial" else 1
+
+
+def _profiles_from_args(args: Any, loaded: Mapping[str, Any]) -> tuple[str, ...]:
+    if loaded.get("profiles") and getattr(args, "profiles", "smoke") == "smoke":
+        values = loaded["profiles"]
+    else:
+        values = str(getattr(args, "profiles", "smoke") or "smoke").split(",")
+    if isinstance(values, str):
+        values = values.split(",")
+    return tuple(str(value.get("id") if isinstance(value, dict) else value).strip().lower() for value in values if str(value).strip())
+
+
+def _research_from_args(args: Any, loaded: Mapping[str, Any]) -> dict[str, Any] | None:
+    value = loaded.get("research")
+    if not isinstance(value, dict):
+        value = {}
+    else:
+        value = dict(value)
+    study = getattr(args, "study", None)
+    if study:
+        value["recipe"] = study
+    return value or None
+
+
+def _benchmark_options_from_args(args: Any, loaded: Mapping[str, Any]) -> dict[str, Any]:
+    limits = loaded.get("limits") if isinstance(loaded.get("limits"), Mapping) else loaded
+    max_duration = getattr(args, "max_duration", None)
+    if max_duration is None:
+        max_duration = limits.get("max_duration_seconds")
+    max_concurrency = int(getattr(args, "max_concurrency", 8))
+    if max_concurrency == 8 and limits.get("max_concurrency") is not None:
+        max_concurrency = int(limits["max_concurrency"])
+    max_requests = int(getattr(args, "max_requests", 50_000))
+    if max_requests == 50_000 and limits.get("max_requests") is not None:
+        max_requests = int(limits["max_requests"])
+    quality_items = int(getattr(args, "quality_items", 200))
+    if quality_items == 200 and limits.get("quality_items") is not None:
+        quality_items = int(limits["quality_items"])
+    seed = int(getattr(args, "seed", 42))
+    if seed == 42 and limits.get("seed") is not None:
+        seed = int(limits["seed"])
+    retain_responses = not bool(getattr(args, "no_retain_responses", False))
+    if not getattr(args, "no_retain_responses", False) and limits.get("retain_responses") is not None:
+        retain_responses = bool(limits["retain_responses"])
+    return {
+        "max_concurrency": max_concurrency,
+        "max_duration_seconds": float(max_duration) if max_duration is not None else None,
+        "max_requests": max_requests,
+        "quality_items": quality_items,
+        "seed": seed,
+        "retain_responses": retain_responses,
+    }
+
+
+def _select_benchmark_target(targets: list[dict[str, Any]]) -> str | None:
+    print("\nRIFT Benchmark\n\nChoose a running service:\n")
+    available = [item for item in targets if item.get("benchmarkable")]
+    for index, item in enumerate(targets, 1):
+        marker = "Ready" if item.get("benchmarkable") else "Unavailable"
+        print(f"  {index:>2}  {item.get('name', item.get('id')):<20} {item.get('backend') or '-':<14} {marker}")
+    if not available:
+        print("\nNo benchmarkable services are registered.")
+        return None
+    try:
+        selected = input("\nService number [1]: ").strip() or "1"
+        index = int(selected) - 1
+    except (EOFError, ValueError):
+        print("Choose a valid service number.", file=sys.stderr)
+        return None
+    if index < 0 or index >= len(targets) or not targets[index].get("benchmarkable"):
+        print("That service is not benchmarkable.", file=sys.stderr)
+        return None
+    return str(targets[index].get("id") or "") or None
+
+
+def _benchmark_progress(console: RiftConsole):
+    def callback(profile: str, message: str, percent: float | None, details: dict[str, Any] | None) -> None:
+        if details and details.get("planned"):
+            console.apply_progress(profile, "running", {"completed": 0, "total": details["planned"]})
+        elif percent is not None and percent >= 99:
+            console.apply_progress(profile, "complete", {"completed": 1, "total": 1})
+    return callback
+
+
+def _benchmark_root(orchestrator: RiftOrchestrator) -> Path:
+    return orchestrator.rift_dir / "benchmarks"
+
+
+def _load_benchmark_run(orchestrator: RiftOrchestrator, run_id: str) -> dict[str, Any] | None:
+    safe_id = Path(run_id).name
+    if safe_id != run_id:
+        return None
+    path = _benchmark_root(orchestrator) / safe_id / "result.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _list_benchmark_runs(orchestrator: RiftOrchestrator, *, service: str = "") -> dict[str, Any]:
+    values: list[dict[str, Any]] = []
+    root = _benchmark_root(orchestrator)
+    if root.is_dir():
+        for path in sorted(root.glob("*/result.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            value = _load_benchmark_run(orchestrator, path.parent.name)
+            if value and (not service or str(value.get("target")) == service):
+                values.append({key: value.get(key) for key in ("run_id", "target", "profiles", "status", "started_unix_seconds", "duration_seconds")})
+    return {"schema_version": "rift.benchmarks/v1", "runs": values}
+
+
+def _compare_benchmark_runs(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    profiles = sorted(set(left.get("profile_results", {})) & set(right.get("profile_results", {})))
+    comparisons = []
+    for profile in profiles:
+        left_summary = ((left.get("profile_results", {}).get(profile) or {}).get("summary") or {})
+        right_summary = ((right.get("profile_results", {}).get(profile) or {}).get("summary") or {})
+        left_metric = ((left_summary.get("metrics") or {}).get("median_tokens_per_second"))
+        right_metric = ((right_summary.get("metrics") or {}).get("median_tokens_per_second"))
+        left_quality = left_summary.get("quality_score")
+        right_quality = right_summary.get("quality_score")
+        comparisons.append(
+            {
+                "profile": profile,
+                "left": left_metric,
+                "right": right_metric,
+                "delta": (right_metric - left_metric)
+                if isinstance(left_metric, (int, float)) and isinstance(right_metric, (int, float))
+                else None,
+                "left_quality_score": left_quality,
+                "right_quality_score": right_quality,
+                "quality_delta": (right_quality - left_quality)
+                if isinstance(left_quality, (int, float)) and isinstance(right_quality, (int, float))
+                else None,
+            }
+        )
+    return {"schema_version": "rift.benchmarks/v1", "left_run": left.get("run_id"), "right_run": right.get("run_id"), "comparisons": comparisons, "methodology": "descriptive; runs are not treated as paired unless the study protocol says so"}
+
+
+def _export_benchmark_run(orchestrator: RiftOrchestrator, run: dict[str, Any], format_name: str) -> dict[str, Any]:
+    root = _benchmark_root(orchestrator) / str(run.get("run_id"))
+    if format_name == "json":
+        return run
+    if format_name == "html":
+        path = root / "report.html"
+        body = "<html><head><meta charset='utf-8'><title>RIFT benchmark</title></head><body><pre>" + _html_escape(json.dumps(run, indent=2, sort_keys=True)) + "</pre></body></html>"
+        path.write_text(body, encoding="utf-8")
+        return {"run_id": run.get("run_id"), "format": "html", "path": str(path)}
+    path = root.with_suffix(".zip")
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in root.glob("*"):
+            if item.is_file():
+                archive.write(item, item.name)
+    return {"run_id": run.get("run_id"), "format": "bundle", "path": str(path)}
+
+
+def _html_escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 __all__ = ["execute"]

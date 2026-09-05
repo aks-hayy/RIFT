@@ -81,6 +81,7 @@ FILES = {
 
 class FakeHubHandler(BaseHTTPRequestHandler):
     range_headers = []
+    truncated_paths = set()
 
     def do_GET(self):  # noqa: N802
         parsed = urlparse(self.path)
@@ -113,11 +114,26 @@ class FakeHubHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_bytes(self, body):
-        self.send_response(200)
+        range_header = self.headers.get("Range") or ""
+        start = 0
+        if range_header.startswith("bytes="):
+            start_text = range_header.removeprefix("bytes=").split("-", 1)[0]
+            if start_text:
+                start = int(start_text)
+        payload = body[start:]
+        status = 206 if start else 200
+        self.send_response(status)
         self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(len(payload)))
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
         self.end_headers()
-        self.wfile.write(body)
+        if self.path.endswith("model.safetensors") and "model.safetensors" in self.truncated_paths:
+            self.truncated_paths.remove("model.safetensors")
+            self.wfile.write(payload[: max(1, len(payload) // 2)])
+            self.close_connection = True
+            return
+        self.wfile.write(payload)
 
 
 class FakeHubServer:
@@ -206,6 +222,23 @@ def test_snapshot_download_and_rift_wrapper():
         assert wrapped["rift_phase"] == "R18"
         assert wrapped["compatibility_advice"]["support_level"] == "NATIVE_RUN_CANDIDATE"
         assert wrapped["inspection"]["rift_product"] == "RIFT"
+
+
+def test_snapshot_download_resumes_after_incomplete_read():
+    with FakeHubServer() as endpoint, tempfile.TemporaryDirectory() as tmp:
+        FakeHubHandler.range_headers = []
+        FakeHubHandler.truncated_paths = {"model.safetensors"}
+        try:
+            client = hf_hub.HfHubClient(endpoint=endpoint)
+            output_dir = Path(tmp) / "resumed"
+            result = client.snapshot_download("org/model", local_dir=str(output_dir))
+            assert result["downloaded_bytes"] == sum(
+                len(FILES[name]) for name in ("config.json", "model.safetensors", "nested/tokenizer.json")
+            )
+            assert (output_dir / "model.safetensors").read_bytes() == FILES["model.safetensors"]
+            assert any(value != "bytes=0-" for value in FakeHubHandler.range_headers)
+        finally:
+            FakeHubHandler.truncated_paths = set()
 
 
 def main():

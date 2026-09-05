@@ -27,6 +27,16 @@ except ImportError:
 from .artifacts import ArtifactManifest
 from .benchmark_catalog import benchmark_site_catalog
 from .benchmarking import BenchmarkSuite
+from .benchmark_suite import (
+    BenchmarkSpec,
+    BenchmarkSuiteRunner,
+    ResearchProtocol,
+    bootstrap_confidence_interval,
+    compile_benchmark_plan,
+    factorial_effects,
+    paired_effect,
+    profile_catalog,
+)
 from .evidence import EvidenceEngine, EvidenceLevel, EvidenceRecord, aggregate_quality_evidence
 from .evidence_sources import BenchmarkEvidenceSource, JsonEvidenceSource
 from .gateway import GatewayPolicy, RiftGatewayRuntime
@@ -51,6 +61,9 @@ __all__ = [
     "ArtifactManifest",
     "BackendKind",
     "BenchmarkSuite",
+    "BenchmarkSpec",
+    "BenchmarkSuiteRunner",
+    "ResearchProtocol",
     "BenchmarkEvidenceSource",
     "DeploymentStrategy",
     "EvidenceEngine",
@@ -76,6 +89,11 @@ __all__ = [
     "HardwareAnalyzer",
     "aggregate_quality_evidence",
     "benchmark_site_catalog",
+    "bootstrap_confidence_interval",
+    "compile_benchmark_plan",
+    "factorial_effects",
+    "paired_effect",
+    "profile_catalog",
     "build_info",
     "cuda_device_count",
     "inspect_model",

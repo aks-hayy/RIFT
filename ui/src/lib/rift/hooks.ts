@@ -21,6 +21,8 @@ import type {
   ResourceReport,
   ServiceTelemetryAccounting,
   TuningRun,
+  BenchmarkProfile,
+  BenchmarkSuiteRun,
 } from "./types";
 
 export const keys = {
@@ -35,6 +37,8 @@ export const keys = {
   service: (id: string) => ["rift", "service", id] as const,
   revisions: (id: string) => ["rift", "revisions", id] as const,
   benchmarks: (id: string) => ["rift", "benchmarks", id] as const,
+  benchmarkProfiles: ["rift", "benchmark-profiles"] as const,
+  benchmarkRuns: (id: string) => ["rift", "benchmark-suite-runs", id] as const,
   incidents: ["rift", "incidents"] as const,
   timeline: ["rift", "timeline"] as const,
   logs: (service = "chat") => ["rift", "logs", service] as const,
@@ -312,6 +316,32 @@ export function useBenchmarks(serviceId: string | undefined) {
       queryKey: serviceId ? keys.benchmarks(serviceId) : ["rift", "benchmarks", "none"],
       queryFn: ({ signal }) => rift.listBenchmarks(serviceId!, signal),
       enabled: !!serviceId,
+      retry: false,
+    }),
+  );
+}
+
+export function useBenchmarkProfiles() {
+  return shape(
+    useQuery<BenchmarkProfile[]>({
+      queryKey: keys.benchmarkProfiles,
+      queryFn: ({ signal }) => rift.benchmarkProfiles(signal),
+      staleTime: 60_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useBenchmarkSuiteRuns(serviceId: string | undefined) {
+  return shape(
+    useQuery<BenchmarkSuiteRun[]>({
+      queryKey: serviceId
+        ? keys.benchmarkRuns(serviceId)
+        : ["rift", "benchmark-suite-runs", "none"],
+      queryFn: ({ signal }) => rift.listBenchmarkSuiteRuns(serviceId, signal),
+      enabled: !!serviceId,
+      staleTime: 2_000,
+      refetchInterval: 5_000,
       retry: false,
     }),
   );

@@ -521,6 +521,36 @@ export interface Benchmark {
   provenance?: DataProvenance;
 }
 
+export interface BenchmarkProfile {
+  id: string;
+  name: string;
+  version: string;
+  purpose: string;
+  plannedWorkload: string;
+  requirements: string[];
+  defaultWallTimeSeconds: number;
+}
+
+export interface BenchmarkSuiteRun {
+  runId: string;
+  target: string;
+  profiles: string[];
+  status: string;
+  completedRequests: number;
+  plannedRequests: number;
+  durationSeconds?: number;
+  profileResults: Record<
+    string,
+    {
+      status: string;
+      summary?: Record<string, unknown>;
+      observations?: Record<string, unknown>[];
+    }
+  >;
+  artifactManifest?: string;
+  planFile?: string;
+}
+
 export type IncidentSeverity = "info" | "warning" | "critical";
 export type IncidentStatus = "open" | "acknowledged" | "resolved";
 

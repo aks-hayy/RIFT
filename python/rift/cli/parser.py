@@ -264,6 +264,45 @@ def build_parser() -> argparse.ArgumentParser:
     status = _parser(commands, "status", "Show desired and observed service state")
     status.add_argument("--service", help="Show one service")
 
+    benchmark = _parser(
+        commands,
+        "benchmark",
+        "Run the versioned RIFT benchmark suite against a running service",
+        epilog=(
+            "Examples:\n"
+            "  rift benchmark\n"
+            "  rift benchmark --service chat --profiles smoke,quality,throughput\n"
+            "  rift benchmark --service chat --profiles research --study repeatability\n"
+            "  rift benchmark plan --spec study.json\n"
+            "  rift benchmark list --service chat\n"
+            "  rift benchmark show RUN_ID --follow"
+        ),
+    )
+    benchmark.add_argument(
+        "benchmark_action",
+        nargs="?",
+        choices=["plan", "list", "show", "compare", "export", "replay", "cancel", "targets"],
+        help="Inspect or manage a previously compiled benchmark run",
+    )
+    benchmark.add_argument("run_ids", nargs="*", metavar="RUN_ID")
+    benchmark.add_argument("--service", help="Managed service or registered external target")
+    benchmark.add_argument("--profiles", default="smoke", help="Comma-separated profiles (default: smoke)")
+    benchmark.add_argument("--study", choices=["repeatability", "paired", "factorial", "context_position", "prefix_reuse", "custom"])
+    benchmark.add_argument("--spec", help="JSON/YAML benchmark specification")
+    benchmark.add_argument("--format", choices=["json", "html", "bundle"], default="json")
+    benchmark.add_argument("--target-id", help="External target identifier for `benchmark targets add`")
+    benchmark.add_argument("--url", help="External OpenAI-compatible endpoint URL")
+    benchmark.add_argument("--model", help="External endpoint model identifier")
+    benchmark.add_argument("--credential-ref", help="Environment reference such as env:LAB_API_TOKEN")
+    benchmark.add_argument("--max-concurrency", type=int, default=8)
+    benchmark.add_argument("--max-duration", type=float, help="Stop after this many seconds and mark remaining profiles partial")
+    benchmark.add_argument("--max-requests", type=int, default=50_000, help="Global request ceiling across selected profiles")
+    benchmark.add_argument("--quality-items", type=int, default=200, help="Number of deterministic quality cases")
+    benchmark.add_argument("--seed", type=int, default=42, help="Seed recorded for randomized workloads")
+    benchmark.add_argument("--no-retain-responses", action="store_true", help="Do not persist response text in artifacts")
+    benchmark.add_argument("--yes", action="store_true", help="Accept the reviewed benchmark plan")
+    benchmark.add_argument("--follow", action="store_true", help="Follow an active run")
+
     dashboard = _parser(
         commands,
         "dashboard",

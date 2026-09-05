@@ -108,6 +108,7 @@ class RiftServerRuntime:
             "/api/rift/tune",
             "/api/rift/v2/tuning/runs",
             "/api/rift/v2/evaluations",
+            "/api/rift/v2/benchmarks",
         } or (
             path.startswith("/api/rift/v2/deployments/")
             and path.endswith("/actions")
@@ -620,6 +621,35 @@ class RiftServerRuntime:
                     except (OSError, json.JSONDecodeError):
                         continue
             return {"api_version": "2", "count": len(artifacts), "artifacts": artifacts}
+        if path == "/api/rift/v2/benchmark-profiles":
+            return orchestrator.benchmark_profiles_catalog()
+        if path == "/api/rift/v2/benchmark-targets":
+            return orchestrator.benchmark_targets()
+        if path == "/api/rift/v2/benchmarks":
+            root = Path(orchestrator.rift_dir) / "benchmarks"
+            service_filter = str(((query or {}).get("service") or [""])[0] or "")
+            runs: list[JsonDict] = []
+            if root.is_dir():
+                for item in sorted(root.glob("*/result.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+                    try:
+                        value = json.loads(item.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if isinstance(value, dict) and (not service_filter or str(value.get("target")) == service_filter):
+                        runs.append(value)
+            return {"schema_version": "rift.benchmarks/v1", "runs": runs[:100]}
+        if path.startswith("/api/rift/v2/benchmarks/"):
+            run_id = path.rsplit("/", 1)[-1]
+            if not run_id or Path(run_id).name != run_id:
+                raise KeyError(path)
+            result_path = Path(orchestrator.rift_dir) / "benchmarks" / run_id / "result.json"
+            try:
+                value = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise KeyError(path) from exc
+            if not isinstance(value, dict):
+                raise KeyError(path)
+            return value
         if path == "/api/rift/v2/capabilities":
             return {
                 "api_version": "2",
@@ -749,6 +779,64 @@ class RiftServerRuntime:
         cancel_check: Callable[[], bool] | None = None,
     ) -> JsonDict:
         path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
+        if path == "/api/rift/v2/benchmark-plans":
+            profiles = payload.get("profiles") or ["smoke"]
+            if isinstance(profiles, str):
+                profiles = [item.strip() for item in profiles.split(",") if item.strip()]
+            if not isinstance(profiles, list):
+                raise ValueError("profiles must be an array or comma-separated string")
+            research = payload.get("research")
+            if research is not None and not isinstance(research, dict):
+                raise ValueError("research must be an object")
+            limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else payload
+            return self.orchestrator_factory().benchmark_plan(
+                service_name=str(payload.get("service") or payload.get("target") or "chat"),
+                profiles=tuple(str(item) for item in profiles),
+                research=research,
+                max_concurrency=int(limits.get("max_concurrency") or 8),
+                seed=int(limits.get("seed") if limits.get("seed") is not None else 42),
+                max_duration_seconds=(
+                    float(limits["max_duration_seconds"])
+                    if limits.get("max_duration_seconds") is not None
+                    else None
+                ),
+                quality_items=int(limits.get("quality_items") or 200),
+                max_requests=int(limits.get("max_requests") or 50_000),
+                retain_responses=bool(limits.get("retain_responses", True)),
+            )
+        if path == "/api/rift/v2/benchmark-targets":
+            return self.orchestrator_factory().register_benchmark_target(
+                target_id=str(payload.get("id") or payload.get("target_id") or ""),
+                url=str(payload.get("url") or ""),
+                model=str(payload.get("model") or ""),
+                credential_ref=str(payload.get("credential_ref") or "") or None,
+            )
+        if path == "/api/rift/v2/benchmarks":
+            profiles = payload.get("profiles") or ["smoke"]
+            if isinstance(profiles, str):
+                profiles = [item.strip() for item in profiles.split(",") if item.strip()]
+            if not isinstance(profiles, list):
+                raise ValueError("profiles must be an array or comma-separated string")
+            research = payload.get("research")
+            if research is not None and not isinstance(research, dict):
+                raise ValueError("research must be an object")
+            limits = payload.get("limits") if isinstance(payload.get("limits"), dict) else payload
+            return self.orchestrator_factory().benchmark_profiles(
+                service_name=str(payload.get("service") or payload.get("target") or "chat"),
+                profiles=tuple(str(item) for item in profiles),
+                research=research,
+                max_concurrency=int(limits.get("max_concurrency") or 8),
+                seed=int(limits.get("seed") if limits.get("seed") is not None else 42),
+                max_duration_seconds=(
+                    float(limits["max_duration_seconds"])
+                    if limits.get("max_duration_seconds") is not None
+                    else None
+                ),
+                quality_items=int(limits.get("quality_items") or 200),
+                max_requests=int(limits.get("max_requests") or 50_000),
+                retain_responses=bool(limits.get("retain_responses", True)),
+                progress=progress,
+            )
         if path in ("/api/rift/telemetry/ingest", "/api/rift/v2/telemetry/ingest"):
             orchestrator = self.orchestrator_factory()
             session_id = str(payload.get("session_id") or "")
