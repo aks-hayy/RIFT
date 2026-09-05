@@ -1176,25 +1176,71 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
-  /tuning-runs:
+  /v2/tuning/profiles:
     get:
       tags: [Performance]
-      operationId: listTuningRuns
-      summary: List bounded tuning runs and regression decisions.
-      parameters:
-        - $ref: "#/components/parameters/Cursor"
-        - $ref: "#/components/parameters/Limit"
+      operationId: getTuningProfiles
+      summary: List autonomous tuning profiles supported by the controller.
       responses:
         "200":
-          description: Tuning run page.
+          description: Speed and cost profile definitions and measurement semantics.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/TuningRunPage"
+                type: object
+                required: [api_version, profiles]
+                properties:
+                  api_version: { type: string }
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, label, objective, metric]
+                      properties:
+                        id: { type: string, enum: [speed, cost] }
+                        label: { type: string }
+                        objective: { type: string }
+                        metric: { type: string }
+                        availability: { type: string }
+                        attribution: { type: string }
+
+  /v2/tuning/runs:
+    get:
+      tags: [Performance]
+      operationId: listTuningRuns
+      summary: List durable autonomous llama.cpp tuning runs and profile decisions.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: profile
+          in: query
+          schema: { type: string, enum: [speed, cost] }
+      responses:
+        "200":
+          description: Tuning run history.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, runs, count]
+                properties:
+                  api_version: { type: string }
+                  count: { type: integer }
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TuningRun"
     post:
       tags: [Performance]
       operationId: startTuningRun
-      summary: Benchmark bounded provider configurations and retain only a non-regressing winner.
+      summary: Start a durable autonomous speed or cost tuning operation.
+      description: |
+        The first implementation supports llama.cpp. Normal tuning preserves
+        model identity, weight quantization, K/V cache precision, context, and
+        concurrency. Candidate restarts require explicit allow_restart consent;
+        cost profiling requires usable GPU power telemetry.
       requestBody:
         required: true
         content:
@@ -1205,11 +1251,11 @@ paths:
         "202":
           $ref: "#/components/responses/OperationAccepted"
 
-  /tuning-runs/{runId}:
+  /v2/tuning/runs/{runId}:
     get:
       tags: [Performance]
       operationId: getTuningRun
-      summary: Get baseline, candidates, winner, rejected configurations, and rollback target.
+      summary: Get baseline, candidates, winner, explanations, events, and recommendation-only opportunities.
       parameters:
         - $ref: "#/components/parameters/RunId"
       responses:
@@ -2338,7 +2384,7 @@ components:
           type: boolean
         step:
           type: string
-          enum: [welcome, controller, nodes, model_source, workload, recommendation, plan, apply, complete]
+          enum: [welcome, controller, nodes, model_source, recommendation, plan, apply, complete]
         controller:
           oneOf:
             - $ref: "#/components/schemas/Controller"
@@ -3688,84 +3734,175 @@ components:
 
     TuningRequest:
       type: object
-      required: [deployment_id, objective]
+      required: [service, profile]
       properties:
-        deployment_id:
+        service:
           type: string
-          format: uuid
-        objective:
+          description: Active deployed service to profile.
+        profile:
           type: string
-          enum: [latency, throughput, balanced]
+          enum: [speed, cost]
+        allow_restart:
+          type: boolean
+          default: false
+          description: Explicitly authorize the maintenance restarts required to test candidates.
+        no_apply:
+          type: boolean
+          default: false
+          description: Measure and report the winner, then restore and keep the baseline active.
+        dry_run:
+          type: boolean
+          default: false
+          description: Enumerate candidates and locks without starting a tuning run.
         candidate_limit:
           type: integer
           minimum: 1
-          maximum: 20
-          default: 4
-        regression_limit_percent:
+          maximum: 24
+          default: 24
+        warmup_runs:
+          type: integer
+          minimum: 0
+          default: 1
+        repeats:
+          type: integer
+          minimum: 1
+          default: 3
+        startup_timeout_seconds:
+          type: number
+          exclusiveMinimum: 0
+          default: 180
+        prompt:
+          type: string
+        max_tokens:
+          type: integer
+          minimum: 1
+          default: 32
+        budget_seconds:
+          type: number
+          exclusiveMinimum: 0
+        target_tokens_per_second:
+          type: number
+          exclusiveMinimum: 0
+          default: 100
+        accuracy_tolerance:
           type: number
           minimum: 0
-          maximum: 100
-          default: 5
-        apply_winner:
+          default: 0.05
+        accuracy_case_tolerance:
+          type: number
+          minimum: 0
+          default: 0.15
+        retain_accuracy_responses:
           type: boolean
           default: false
+        kv_precision_search:
+          type: boolean
+          default: true
 
     TuningRun:
       type: object
-      required: [id, deployment_id, status, request, candidates, started_at]
+      required: [run_id, service, profile, backend, status]
       properties:
-        id:
+        run_id:
           type: string
-          format: uuid
-        deployment_id:
+        service:
           type: string
-          format: uuid
+        profile:
+          type: string
+          enum: [speed, cost]
+        backend:
+          type: string
+          enum: [llama.cpp]
         status:
           type: string
-          enum: [queued, benchmarking, evaluating, succeeded, failed, cancelled]
-        request:
-          $ref: "#/components/schemas/TuningRequest"
+          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+        outcome:
+          type: string
+          enum: [improved, no_improvement, unavailable, failed, cancelled, interrupted, preview]
+        applied:
+          type: boolean
         baseline:
-          oneOf:
-            - $ref: "#/components/schemas/BenchmarkSummary"
-            - type: "null"
+          type: object
+          additionalProperties: true
         candidates:
           type: array
           items:
             type: object
-            required: [provider_config, status]
-            properties:
-              provider_config:
-                type: object
-                additionalProperties: true
-              status:
-                type: string
-              benchmark:
-                oneOf:
-                  - $ref: "#/components/schemas/BenchmarkSummary"
-                  - type: "null"
-              rejection_reason:
-                type: [string, "null"]
-        winning_config:
+            additionalProperties: true
+        winner:
           type: [object, "null"]
           additionalProperties: true
-        started_at:
+        winner_launch_plan:
+          type: object
+          additionalProperties: true
+        precision_locks:
+          type: object
+          additionalProperties: true
+        selection:
+          type: object
+          additionalProperties: true
+        opportunities:
+          type: array
+          items:
+            $ref: "#/components/schemas/TuningOpportunity"
+        decision:
           type: string
-          format: date-time
-        completed_at:
-          type: [string, "null"]
-          format: date-time
+        report_path:
+          type: string
+        operation_id:
+          type: string
+        error:
+          type: string
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        target:
+          type: object
+          additionalProperties: true
+        accuracy:
+          type: object
+          additionalProperties: true
+        kv_precision_search:
+          type: boolean
+        rejected:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        apply_state:
+          type: object
+          additionalProperties: true
 
     TuningRunPage:
       type: object
-      required: [items, page]
+      required: [api_version, runs, count]
       properties:
-        items:
+        api_version:
+          type: string
+        count:
+          type: integer
+        runs:
           type: array
           items:
             $ref: "#/components/schemas/TuningRun"
-        page:
-          $ref: "#/components/schemas/PageMetadata"
+
+    TuningOpportunity:
+      type: object
+      required: [id, kind, status, tested, title, warning]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        status: { type: string, enum: [recommendation_only] }
+        tested: { type: boolean, const: false }
+        title: { type: string }
+        warning: { type: string }
+        profile: { type: string, enum: [speed, cost] }
+        locked_value: {}
+        locked_values:
+          type: object
+          additionalProperties: true
 
     Incident:
       type: object

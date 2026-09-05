@@ -132,6 +132,16 @@ class RiftEngine:
             if root is None
             else self.root / ".rift"
         )
+        # Some locked-down Windows workstations expose LOCALAPPDATA as a
+        # read-only location (common in CI and packaged desktop sandboxes).
+        # Keep the control plane usable by falling back to the checkout's
+        # operator runtime only when the default location cannot be created.
+        if runtime_root is None:
+            try:
+                self.runtime_root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.runtime_root = self.root / ".rift-runtime"
+                self.runtime_root.mkdir(parents=True, exist_ok=True)
         if InferenceEngine is None:
             self.native = ControlPlaneRuntime()
         else:

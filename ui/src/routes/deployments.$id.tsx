@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { z } from "zod";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, StatDot, SourceBadge } from "@/components/rift/primitives";
@@ -35,7 +35,7 @@ import type { Service } from "@/lib/rift/types";
 
 const searchSchema = z.object({
   tab: z
-    .enum(["overview", "playground", "performance", "logs", "configuration", "revisions"])
+    .enum(["overview", "playground", "performance", "tuning", "logs", "configuration", "revisions"])
     .catch("overview"),
 });
 
@@ -54,6 +54,7 @@ const TABS = [
   { id: "overview", label: "Overview" },
   { id: "playground", label: "Playground" },
   { id: "performance", label: "Performance" },
+  { id: "tuning", label: "Tuning" },
   { id: "logs", label: "Logs" },
   { id: "configuration", label: "Configuration" },
   { id: "revisions", label: "Revisions" },
@@ -140,11 +141,40 @@ function DeploymentDetail() {
         {service && tab === "overview" && <OverviewTab s={service} />}
         {service && tab === "playground" && <PlaygroundTab s={service} />}
         {service && tab === "performance" && <PerformanceTab s={service} />}
+        {service && tab === "tuning" && <DeploymentTuningTab service={service} />}
         {service && tab === "logs" && <LogsTab service={service} />}
         {service && tab === "configuration" && <ConfigurationTab s={service} />}
         {tab === "revisions" && <RevisionsTab id={id} />}
       </div>
     </AppShell>
+  );
+}
+
+function DeploymentTuningTab({ service }: { service: Service }) {
+  return (
+    <Panel title="Autonomous tuning">
+      <div className="max-w-2xl">
+        <div className="flex items-start gap-3">
+          <SlidersHorizontal className="size-5 text-primary mt-0.5" aria-hidden />
+          <div>
+            <h2 className="text-[15px] text-ink font-medium">
+              Tune {service.name} after deployment
+            </h2>
+            <p className="mt-1.5 text-[13px] text-ink-secondary">
+              Choose Speed or Cost in the tuning workspace. RIFT will benchmark bounded llama.cpp
+              settings, keep the model and precision contract locked, and show the evidence behind
+              the winner.
+            </p>
+            <Link
+              to="/tuning"
+              className="mt-4 inline-flex items-center h-9 px-3.5 rounded-[4px] bg-primary text-primary-foreground text-[13px] font-medium hover:bg-[color:var(--oxide-deep)]"
+            >
+              Open tuning workspace
+            </Link>
+          </div>
+        </div>
+      </div>
+    </Panel>
   );
 }
 

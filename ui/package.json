@@ -12,6 +12,7 @@
     "verify:recommendation-state": "node --experimental-strip-types scripts/verify-recommendation-state.mjs",
     "verify:benchmark-report": "node --experimental-strip-types scripts/verify-benchmark-report.mjs",
     "verify:live-actions": "node --experimental-strip-types scripts/verify-live-actions.mjs",
+    "verify:tuning-flow": "node --experimental-strip-types scripts/verify-tuning-flow.mjs",
     "verify:operation-state": "node --experimental-strip-types scripts/verify-operation-state.mjs",
     "verify:controller": "node scripts/verify-controller.mjs",
     "lint": "eslint .",

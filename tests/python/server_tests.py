@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[2]
 PYTHON_ROOT = ROOT / "python"
 sys.path.insert(0, str(PYTHON_ROOT))
 
+from rift.operations import OperationStore
+
 
 class FakeNativeEngine:
     def __init__(self, cuda_device_id=0):
@@ -287,8 +289,19 @@ def test_mesh_control_routes_use_one_persistent_controller():
     assert route["lease"]["service_id"] == "chat"
 
 
+def test_default_mesh_controller_uses_resolved_operation_runtime_root(tmp_path):
+    runtime = server_mod.RiftServerRuntime(
+        orchestrator_factory=lambda: type("Orchestrator", (), {"rift_dir": tmp_path / ".rift-runtime"})(),
+        operation_store=OperationStore(tmp_path / ".rift-runtime" / "operations"),
+    )
+
+    mesh = runtime.mesh_controller()
+
+    assert mesh.root == tmp_path / ".rift-runtime" / "mesh"
+    assert mesh.root.is_dir()
+
+
 def test_service_accounting_api_reads_and_updates_the_selected_service(tmp_path):
-    from rift.operations import OperationStore
     from rift.orchestrator import RiftOrchestrator
     from rift.rift_yaml import write_yaml
 

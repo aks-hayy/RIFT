@@ -94,8 +94,8 @@ function FleetTelemetryPanel() {
       aside={<span className="rift-mono text-[11px] text-ink-secondary">live · 2s</span>}
     >
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <KV label="Host CPU peak" value={`${max(cpu)}%`} />
-        <KV label="Host RAM pressure" value={`${max(ram)}%`} />
+        <KV label="Host CPU peak" value={cpu.length ? `${max(cpu)}%` : "unavailable"} />
+        <KV label="Host RAM pressure" value={ram.length ? `${max(ram)}%` : "unavailable"} />
         <KV label="GPU temperature" value={gpuTemp.length ? `${max(gpuTemp)}°C` : "unavailable"} />
         <KV
           label="Telemetry sources"

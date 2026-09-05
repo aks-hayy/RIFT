@@ -362,6 +362,83 @@ export interface OperationRecord {
   result?: Record<string, unknown>;
 }
 
+export type TuningProfile = "speed" | "cost";
+export type TuningOutcome =
+  | "queued"
+  | "running"
+  | "improved"
+  | "no_improvement"
+  | "unavailable"
+  | "failed"
+  | "permission_required"
+  | "cancelled"
+  | "interrupted"
+  | "preview";
+
+export interface TuningOpportunity {
+  id: string;
+  kind: string;
+  status: "recommendation_only";
+  tested: false;
+  title: string;
+  warning: string;
+  profile?: TuningProfile;
+  lockedValue?: unknown;
+  lockedValues?: Record<string, unknown>;
+}
+
+export interface TuningRun {
+  runId: string;
+  service: string;
+  profile: TuningProfile;
+  backend: string;
+  status: string;
+  outcome?: TuningOutcome;
+  applied: boolean;
+  createdAt: string;
+  updatedAt?: string;
+  baseline?: Record<string, unknown>;
+  winner?: Record<string, unknown> | null;
+  winnerLaunchPlan?: Record<string, unknown>;
+  selection?: Record<string, unknown>;
+  precisionLocks?: Record<string, unknown>;
+  candidates?: Array<Record<string, unknown>>;
+  opportunities?: TuningOpportunity[];
+  decision?: string;
+  reason?: string;
+  reportPath?: string;
+  operationId?: string;
+  error?: string;
+  events?: Array<{
+    eventId?: string;
+    stage: string;
+    message: string;
+    percent?: number | null;
+    createdAt?: string;
+    details?: Record<string, unknown>;
+  }>;
+  target?: {
+    value?: number;
+    reached?: boolean;
+    confidenceLowerBound?: number | null;
+    reason?: string;
+  };
+  accuracy?: {
+    passed?: boolean;
+    aggregateScore?: number | null;
+    worstCaseScore?: number | null;
+    tolerance?: number;
+    caseTolerance?: number;
+  };
+  kvPrecisionSearch?: boolean;
+  rejected?: Array<{
+    candidate?: Record<string, unknown>;
+    rejectionReason?: string;
+    reason?: string;
+  }>;
+  applyState?: { applied?: boolean; rolledBack?: boolean; state?: string; reason?: string };
+}
+
 export type EvaluationCaseStatus = "pass" | "fail" | "not_assessed" | "error";
 
 export interface EvaluationCaseResult {

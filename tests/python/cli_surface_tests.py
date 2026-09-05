@@ -123,6 +123,33 @@ def test_apply_progress_renders_stage_bar() -> None:
     assert "[OK]" in rendered
 
 
+def test_tune_parser_exposes_target_accuracy_and_kv_controls() -> None:
+    args = build_parser().parse_args([
+        "tune", "--profile", "speed", "--target-tokens-per-second", "100",
+        "--accuracy-tolerance", "0.05", "--accuracy-case-tolerance", "0.15",
+        "--retain-accuracy-responses", "--no-kv-precision-search",
+    ])
+    assert args.target_tokens_per_second == 100.0
+    assert args.accuracy_tolerance == 0.05
+    assert args.accuracy_case_tolerance == 0.15
+    assert args.retain_accuracy_responses is True
+    assert args.kv_precision_search is False
+
+
+def test_tune_parser_exposes_ngram_speculation_switch() -> None:
+    parser = build_parser()
+    assert parser.parse_args(["tune", "--no-ngram-speculation"]).ngram_speculation is False
+    assert parser.parse_args(["tune", "--ngram-speculation"]).ngram_speculation is True
+
+
+def test_tune_parser_rejects_invalid_target_and_tolerances() -> None:
+    import pytest
+    parser = build_parser()
+    for option, value in (("--target-tokens-per-second", "0"), ("--target-tokens-per-second", "nan"), ("--accuracy-tolerance", "-0.1"), ("--accuracy-tolerance", "inf"), ("--accuracy-case-tolerance", "-1")):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["tune", option, value])
+
+
 def main() -> None:
     test_apply_accepts_explicit_permissions_and_config()
     test_plan_list_and_apply_plan_selection_options()
@@ -131,6 +158,8 @@ def main() -> None:
     test_state_backup_and_restore_require_explicit_restore_confirmation()
     test_recommendation_render_prints_plan_handoff()
     test_apply_progress_renders_stage_bar()
+    test_tune_parser_exposes_target_accuracy_and_kv_controls()
+    test_tune_parser_rejects_invalid_target_and_tolerances()
     print("cli_surface_tests: PASS")
 
 
