@@ -39,6 +39,16 @@ from .system_profile import HardwareAnalyzer
 from .state_store import StateStore
 from .runtime_paths import RiftPaths
 from .telemetry import ResourcePolicy, TelemetryStore, TelemetrySupervisor
+from .tuning_engine import (
+    CostMeasurement,
+    GpuEnergySampler,
+    SpeedMeasurement,
+    TuningContract,
+    TuningStore,
+    candidate_is_allowed,
+    select_profile_winner,
+)
+from .tuning_accuracy import AccuracySuite, score_accuracy_suite
 
 
 JsonDict = dict[str, Any]
@@ -73,6 +83,16 @@ class RiftOrchestrator:
             self.rift_dir = RiftPaths.from_environment(cwd=self.root).home
         else:
             self.rift_dir = self.root / ".rift"
+        # Keep the standard CLI usable in locked-down environments where the
+        # platform default runtime directory cannot be created.  Explicit
+        # runtime roots still fail loudly so callers do not lose control of
+        # their requested state location.
+        if runtime_root is None:
+            try:
+                self.rift_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                self.rift_dir = self.root / ".rift-runtime"
+                self.rift_dir.mkdir(parents=True, exist_ok=True)
         self.state_store = StateStore(
             self.rift_dir / "state.db",
             legacy_path=self.rift_dir / "state.json",
@@ -135,7 +155,7 @@ class RiftOrchestrator:
     def close(self) -> None:
         if not self._telemetry_ephemeral:
             return
-        if self._telemetry_supervisor is not None:
+        if getattr(self, "_telemetry_supervisor", None) is not None:
             self._telemetry_supervisor.close()
         if self._telemetry_store is not None:
             self._telemetry_store.close()
@@ -2544,6 +2564,26 @@ class RiftOrchestrator:
             if service is None:
                 results.append({"service": name, "available": False, "reason": "service not found"})
                 continue
+            tuning_active = service.get("tuning_active")
+            if isinstance(tuning_active, dict) and tuning_active:
+                # Candidate restarts intentionally pass through unhealthy or
+                # starting phases.  Keep the recovery/evaluation supervisor
+                # from racing the profiled run; the tuning transaction owns
+                # restoration and will remove this marker in its finally block.
+                results.append(
+                    {
+                        "service": name,
+                        "available": True,
+                        "status": "tuning",
+                        "monitoring": {
+                            "suppressed": True,
+                            "reason": "profiled tuning maintenance window",
+                            "run_id": tuning_active.get("run_id"),
+                            "profile": tuning_active.get("profile"),
+                        },
+                    }
+                )
+                continue
             monitoring = dict(service.get("monitoring") or self._default_monitoring_policy())
             if not bool(monitoring.get("enabled", True)):
                 results.append(
@@ -2977,10 +3017,42 @@ class RiftOrchestrator:
             return None
 
     def telemetry_latest(self, *, service_name: str | None = None, node_id: str | None = None) -> JsonDict:
+        # A finished/deleted service can leave an older telemetry session in
+        # the durable database when the controller was interrupted.  The
+        # latest endpoint is a live view, so only expose sessions that still
+        # belong to a running managed service with a live process.
+        state = self.read_state()
+        services = state.get("services") or {}
+        live_services: set[str] = set()
+        if isinstance(services, dict):
+            for name, service in services.items():
+                if not isinstance(service, dict):
+                    continue
+                desired = str(service.get("desired_state") or "").lower()
+                status = str(service.get("status") or "").lower()
+                if desired and desired not in {"running", "started"}:
+                    continue
+                if status in {"stopped", "deleted", "failed", "destroyed"}:
+                    continue
+                pid_value = (service.get("runtime") or {}).get("pid")
+                if pid_value not in (None, ""):
+                    try:
+                        if not self._process_alive(int(pid_value)):
+                            continue
+                    except (TypeError, ValueError, OSError):
+                        continue
+                live_services.add(str(name))
+        if service_name is not None:
+            live_services &= {service_name}
+        if not live_services:
+            return {"api_version": "1", "updated_at": time.time(), "samples": []}
+
         sessions = self.telemetry_store.list_sessions(service_name=service_name, node_id=node_id, limit=100)["sessions"]
         latest: list[JsonDict] = []
         for session in sessions:
             if str(session.get("status") or "") != "running":
+                continue
+            if str(session.get("service_name") or "") not in live_services:
                 continue
             series = self.telemetry_store.series(str(session["session_id"]), limit=1)["samples"]
             if series:
@@ -4550,6 +4622,1381 @@ class RiftOrchestrator:
             self._write_json(self._timestamped("reports", f"{service_name}-benchmark"), result)
         return result
 
+    def recover_interrupted_tuning(self) -> JsonDict:
+        """Recover a tuning maintenance window left by a controller restart.
+
+        The tuning marker is intentionally durable so monitoring can suppress
+        recovery while candidates are being restarted.  If the controller
+        disappears before the worker's ``finally`` block runs, startup owns
+        the transaction: restore the recorded baseline, validate readiness,
+        mark the run interrupted, and clear the marker before reconciliation
+        is allowed to resume.
+        """
+
+        state = self.read_state()
+        services = state.get("services") or {}
+        if not isinstance(services, dict):
+            return {"recovered": [], "failed": []}
+        store = TuningStore(self.rift_dir / "tuning.db")
+        recovered: list[str] = []
+        failed: list[str] = []
+        changed = False
+        for service_name, value in services.items():
+            service = value if isinstance(value, dict) else None
+            marker = service.get("tuning_active") if service is not None else None
+            if not isinstance(marker, dict) or not marker:
+                continue
+            run_id = str(marker.get("run_id") or "").strip()
+            run: JsonDict | None = None
+            if run_id:
+                try:
+                    run = store.get_run(run_id)
+                except KeyError:
+                    run = None
+            status = str((run or {}).get("status") or "RUNNING").upper()
+            if status not in {"QUEUED", "RUNNING"}:
+                # A terminal run may have been persisted just before a crash;
+                # its deployment decision is authoritative, but the marker is
+                # still stale and must not suppress monitoring forever.
+                service.pop("tuning_active", None)
+                changed = True
+                continue
+
+            baseline = ((run or {}).get("baseline") or {}) if run else {}
+            baseline_plan = dict(baseline.get("launch_plan") or {})
+            if not baseline_plan:
+                baseline_plan = dict(service.get("last_known_good_launch_plan") or {})
+            if not baseline_plan:
+                baseline_plan = dict(service.get("launch_plan") or {})
+            backend = str(service.get("backend") or "")
+            provider = self.providers.get(backend)
+            restore: JsonDict = {"ready": False, "reason": "baseline launch plan unavailable"}
+            try:
+                if provider is None:
+                    restore["reason"] = f"provider {backend!r} is not registered"
+                else:
+                    current_plan = dict(service.get("launch_plan") or {})
+                    if baseline_plan and self._fingerprint(current_plan) == self._fingerprint(baseline_plan):
+                        restore = {"ready": True, "reused_running_baseline": True}
+                    elif baseline_plan:
+                        restore = self._replace_service_runtime(
+                            state=state,
+                            service_name=str(service_name),
+                            service=service,
+                            provider=provider,
+                            launch_plan=baseline_plan,
+                            startup_timeout_seconds=180.0,
+                        )
+                service["launch_plan"] = baseline_plan or service.get("launch_plan")
+                service["desired_state"] = "running"
+                service["status"] = "healthy" if restore.get("ready") else "degraded"
+                if restore.get("ready") and baseline_plan:
+                    service["last_known_good_launch_plan"] = baseline_plan
+                service.pop("tuning_active", None)
+                changed = True
+                recovered.append(run_id or str(service_name))
+                if run_id:
+                    store.update_run(
+                        run_id,
+                        {
+                            "status": "INTERRUPTED",
+                            "outcome": "interrupted",
+                            "applied": False,
+                            "baseline_restored": bool(restore.get("ready")),
+                            "restore": restore,
+                            "decision": "Controller restart interrupted the maintenance window; the baseline was restored before monitoring resumed.",
+                        },
+                    )
+                    store.append_event(
+                        run_id,
+                        {
+                            "stage": "recovered",
+                            "message": "controller restart recovered the tuning maintenance window",
+                            "details": restore,
+                        },
+                    )
+                if not restore.get("ready"):
+                    failed.append(run_id or str(service_name))
+            except Exception as exc:
+                failed.append(run_id or str(service_name))
+                service.pop("tuning_active", None)
+                service["status"] = "degraded"
+                changed = True
+                if run_id:
+                    store.update_run(
+                        run_id,
+                        {
+                            "status": "INTERRUPTED",
+                            "outcome": "interrupted",
+                            "applied": False,
+                            "baseline_restored": False,
+                            "error": str(exc),
+                            "decision": "Controller restart interrupted tuning and baseline restoration failed; monitoring resumed in degraded state.",
+                        },
+                    )
+
+        if changed:
+            self.write_state(state)
+        return {"recovered": recovered, "failed": failed}
+
+    def profiled_tune_service(
+        self,
+        *,
+        service_name: str,
+        profile: str,
+        write: bool = True,
+        allow_restart: bool = False,
+        no_apply: bool = False,
+        dry_run: bool = False,
+        candidate_limit: int = 24,
+        warmup_runs: int = 1,
+        repeats: int = 3,
+        startup_timeout_seconds: float = 180.0,
+        prompt: str = "Reply briefly: what is one benefit of local inference?",
+        max_tokens: int = 32,
+        budget_seconds: float | None = None,
+        target_tokens_per_second: float = 100.0,
+        accuracy_tolerance: float = 0.05,
+        accuracy_case_tolerance: float = 0.15,
+        retain_accuracy_responses: bool = False,
+        kv_precision_search: bool = True,
+        ngram_speculation: bool | None = None,
+        accuracy_runner: Callable[[JsonDict, AccuracySuite], JsonDict] | None = None,
+        measurement_runner: Callable[[JsonDict, str], JsonDict] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        operation_id: str | None = None,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
+    ) -> JsonDict:
+        """Run the autonomous, profile-aware llama.cpp tuning workflow.
+
+        The legacy plan/live tuner remains available through ``tune_service``.
+        This path adds a durable run journal, immutable model/precision locks,
+        paired reliability gates, and a monitoring-safe maintenance marker.
+        ``measurement_runner`` is intentionally injectable for deterministic
+        controller tests; production runs use the local benchmark and energy
+        sampler below.
+        """
+
+        profile = str(profile or "").strip().lower()
+        if profile not in {"speed", "cost"}:
+            raise ValueError("profile must be speed or cost")
+        if candidate_limit <= 0:
+            raise ValueError("candidate_limit must be positive")
+        if warmup_runs < 0 or repeats <= 0:
+            raise ValueError("warmup_runs cannot be negative and repeats must be positive")
+        if startup_timeout_seconds <= 0.0:
+            raise ValueError("startup_timeout_seconds must be positive")
+        if max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+        if target_tokens_per_second <= 0 or accuracy_tolerance < 0 or accuracy_case_tolerance < 0:
+            raise ValueError("target and accuracy tolerances must be valid")
+        if not allow_restart and not dry_run:
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "permission_required",
+                "service": service_name,
+                "profile": profile,
+                "reason": "profiled tuning uses a maintenance window and requires --allow-restart",
+                "required_permission": "allow_restart",
+            }
+
+        state = self.read_state()
+        service = (state.get("services") or {}).get(service_name)
+        if not isinstance(service, dict):
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "unavailable",
+                "service": service_name,
+                "profile": profile,
+                "reason": "service is not deployed",
+            }
+        backend = str(service.get("backend") or "")
+        if backend != "llama.cpp":
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "unavailable",
+                "service": service_name,
+                "profile": profile,
+                "reason": "profiled tuning v1 supports llama.cpp only",
+                "backend": backend,
+            }
+        provider = self.providers.get(backend)
+        if provider is None:
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "unavailable",
+                "service": service_name,
+                "profile": profile,
+                "reason": "service provider is not registered",
+            }
+        observation = self._service_observation(service_name, service)
+        if not observation.get("healthy"):
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "unavailable",
+                "service": service_name,
+                "profile": profile,
+                "reason": "service must be healthy before profiled tuning",
+                "observation": observation,
+            }
+
+        baseline_plan = dict(service.get("launch_plan") or {})
+        # Launch-plan summaries retain optional controls as ``None`` for
+        # serialization, but those are not valid values to pass back through
+        # a provider's command builder (for example ``int(None)`` for
+        # llama.cpp's polling flags).  Keep only concrete launch values in
+        # the profiled baseline; the provider will supply defaults for any
+        # omitted optional controls while the tuning contract preserves the
+        # immutable model/context/precision fields.
+        baseline_tuning = {
+            key: value
+            for key, value in dict(baseline_plan.get("tuning") or {}).items()
+            if value is not None
+        }
+        if ngram_speculation is not None:
+            baseline_tuning["ngram_speculation"] = bool(ngram_speculation)
+            if not ngram_speculation:
+                for key in ("spec_type", "spec_ngram_mod_n_min", "spec_ngram_mod_n_max", "spec_ngram_mod_n_match"):
+                    if baseline_tuning.get(key) == "ngram-mod" or key != "spec_type":
+                        baseline_tuning.pop(key, None)
+            # Pass the explicit switch into provider candidate generation too.
+            # Older launch summaries default this display-only marker to true
+            # when no speculative flag is present; without this copy, the
+            # provider would discard every ordinary candidate while the user
+            # had speculation disabled.
+            baseline_plan["tuning"] = dict(baseline_tuning)
+        hardware = self.engine.hardware_profile()
+        model_path = self._model_path_from_launch_plan(baseline_plan)
+        if not model_path:
+            model = service.get("model") or {}
+            model_path = str(model.get("local_path") or model.get("selected_file") or "")
+        if not model_path:
+            return {
+                "available": False,
+                "applied": False,
+                "outcome": "unavailable",
+                "service": service_name,
+                "profile": profile,
+                "reason": "deployed service has no recoverable model path",
+            }
+        model_sha256 = None
+        model_file = Path(model_path)
+        if model_file.is_file():
+            try:
+                digest = hashlib.sha256()
+                with model_file.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                model_sha256 = digest.hexdigest()
+            except OSError:
+                model_sha256 = None
+        model_metadata = service.get("model") or {}
+        serving = service.get("serving") or {}
+        context_length = int(
+            baseline_plan.get("context_length")
+            or serving.get("context_length")
+            or 4096
+        )
+        concurrency = int(
+            baseline_plan.get("concurrency")
+            or serving.get("concurrency")
+            or 1
+        )
+        locked = {
+            "model_path": model_path,
+            "context_length": context_length,
+            "concurrency": concurrency,
+        }
+        if model_sha256:
+            locked["model_sha256"] = model_sha256
+        else:
+            # A deployed path can be remote or temporarily unreadable.  Keep
+            # artifact identity as an explicit unverifiable lock so tuning
+            # cannot silently substitute a different model.
+            locked["model_sha256"] = "unavailable"
+        weight_quantization = str(
+            model_metadata.get("quantization")
+            or model_metadata.get("weight_quantization")
+            or baseline_tuning.get("weight_quantization")
+            or "unknown"
+        )
+        # Keep the lock explicit even when an older deployment did not record
+        # its quantization metadata.  ``unknown`` is safer than silently
+        # allowing a backend candidate to imply a precision change.
+        locked["weight_quantization"] = weight_quantization
+        for cache_key in ("cache_type_k", "cache_type_v"):
+            if cache_key in baseline_tuning:
+                locked[cache_key] = baseline_tuning[cache_key] or "f16"
+            elif cache_key in serving:
+                locked[cache_key] = serving[cache_key] or "f16"
+            else:
+                # llama.cpp defaults both K and V cache tensors to f16.  Make
+                # that implicit precision explicit in the contract and in
+                # every candidate so a tuning run cannot change it by
+                # omission.
+                locked[cache_key] = "f16"
+        contract = TuningContract.from_mapping(
+            {
+                "service": service_name,
+                "profile": profile,
+                "model_path": model_path,
+                "context_length": context_length,
+                "concurrency": concurrency,
+                "kv_precision_search": bool(kv_precision_search),
+                "ngram_speculation": bool(baseline_tuning.get("ngram_speculation", True)),
+                **locked,
+            }
+        )
+        if dry_run:
+            candidates = [baseline_tuning]
+            try:
+                candidates.extend(
+                    self._provider_tuning_space(
+                        provider,
+                        launch_plan=baseline_plan,
+                        hardware=hardware,
+                        contract=contract,
+                    )
+                )
+            except Exception as exc:
+                return {
+                    "api_version": "1",
+                    "service": service_name,
+                    "profile": profile,
+                    "backend": backend,
+                    "mode": "profiled_preview",
+                    "outcome": "unavailable",
+                    "available": False,
+                    "applied": False,
+                    "precision_locks": contract.to_dict()["locked"],
+                    "reason": f"could not enumerate backend tuning candidates: {exc}",
+                }
+            unique_candidates: list[JsonDict] = []
+            seen_candidates: set[str] = set()
+            for tuning in candidates:
+                item = dict(tuning or {})
+                if not candidate_is_allowed(contract, item):
+                    continue
+                key = json.dumps(item, sort_keys=True, default=str)
+                if key in seen_candidates:
+                    continue
+                seen_candidates.add(key)
+                unique_candidates.append(self._candidate_config(item, contract))
+                if len(unique_candidates) >= candidate_limit:
+                    break
+            return {
+                "api_version": "1",
+                "service": service_name,
+                "profile": profile,
+                "backend": backend,
+                "mode": "profiled_preview",
+                "outcome": "preview",
+                "available": True,
+                "applied": False,
+                "precision_locks": contract.to_dict()["locked"],
+                "candidates": unique_candidates,
+                "opportunities": self._tuning_opportunities(contract, profile),
+                "decision": "Preview only. No process was restarted and no state was changed.",
+            }
+        store = TuningStore(self.rift_dir / "tuning.db")
+        run = store.create_run(
+            {
+                "service": service_name,
+                "profile": profile,
+                "backend": backend,
+                "status": "RUNNING",
+                "candidate_limit": candidate_limit,
+                "warmup_runs": warmup_runs,
+                "repeats": repeats,
+                "budget_seconds": budget_seconds,
+                "operation_id": operation_id,
+                "precision_locks": contract.to_dict()["locked"],
+            }
+        )
+        run_id = str(run["run_id"])
+        started = time.time()
+        baseline_restored = False
+        report: JsonDict = {
+            "api_version": "1",
+            "run_id": run_id,
+            "service": service_name,
+            "profile": profile,
+            "backend": backend,
+            "mode": "profiled",
+            "created_unix_seconds": int(started),
+            "candidate_limit": candidate_limit,
+            "warmup_runs": warmup_runs,
+            "repeats": repeats,
+            "budget_seconds": budget_seconds,
+            "target": {"tokens_per_second": float(target_tokens_per_second), "reached": False},
+            "capabilities": dict((baseline_plan.get("capabilities") or {})),
+            "baseline": {"tuning": baseline_tuning, "launch_plan": baseline_plan},
+            "precision_locks": contract.to_dict()["locked"],
+            "candidates": [],
+            "applied": False,
+            "no_apply": bool(no_apply),
+            "opportunities": self._tuning_opportunities(contract, profile),
+        }
+
+        service["tuning_active"] = {
+            "run_id": run_id,
+            "profile": profile,
+            "started_unix_seconds": started,
+            "maintenance_window": True,
+        }
+        self.write_state(state)
+        store.append_event(run_id, {"stage": "started", "message": "maintenance window opened"})
+
+        def emit_progress(
+            stage: str,
+            message: str,
+            percent: float | None = None,
+            details: JsonDict | None = None,
+        ) -> None:
+            if progress is not None:
+                progress(stage, message, percent, details)
+            store.append_event(
+                run_id,
+                {"stage": stage, "message": message, "percent": percent, "details": details or {}},
+            )
+
+        emit_progress("baseline", "Measuring the untouched deployment baseline", 10.0)
+
+        class _TuningCancelled(Exception):
+            pass
+
+        class _ProfileUnavailable(Exception):
+            pass
+
+        def checkpoint() -> None:
+            if cancel_check is not None and cancel_check():
+                raise _TuningCancelled()
+
+        def restore_baseline() -> JsonDict:
+            nonlocal baseline_restored
+            current_plan = dict(service.get("launch_plan") or {})
+            if self._fingerprint(current_plan) != self._fingerprint(baseline_plan):
+                restored = self._replace_service_runtime(
+                    state=state,
+                    service_name=service_name,
+                    service=service,
+                    provider=provider,
+                    launch_plan=baseline_plan,
+                    startup_timeout_seconds=startup_timeout_seconds,
+                )
+            else:
+                restored = {"ready": True, "reused_running_baseline": True}
+            service["launch_plan"] = baseline_plan
+            service["status"] = "healthy" if restored.get("ready") else "degraded"
+            service["desired_state"] = "running"
+            if restored.get("ready"):
+                service["last_known_good_launch_plan"] = baseline_plan
+            baseline_restored = bool(restored.get("ready"))
+            return restored
+
+        accuracy_suite = AccuracySuite.default()
+
+        def accuracy_for(plan: JsonDict) -> JsonDict | None:
+            """Capture deterministic responses and score them against baseline."""
+            if accuracy_runner is not None:
+                return dict(accuracy_runner(plan, accuracy_suite) or {})
+            benchmark = getattr(provider, "benchmark", None)
+            if not callable(benchmark):
+                return None
+            responses: JsonDict = {}
+            for case in accuracy_suite.cases:
+                raw = dict(benchmark(
+                    base_url=str(plan.get("api_base") or ""), prompt=case.prompt,
+                    # Quality probes are separate from throughput probes. Give
+                    # code/refusal cases enough room to finish so a baseline is
+                    # not rejected merely because the benchmark token cap was
+                    # intentionally short.
+                    max_tokens=max(128, int(max_tokens)), seed=17, temperature=0.0, ignore_eos=False,
+                ) or {})
+                responses[case.id] = raw
+            return responses
+
+        try:
+            checkpoint()
+            tuning_candidates = [baseline_tuning]
+            tuning_candidates.extend(
+                self._provider_tuning_space(
+                    provider,
+                    launch_plan=baseline_plan,
+                    hardware=hardware,
+                    contract=contract,
+                )
+            )
+            unique: list[JsonDict] = []
+            seen: set[str] = set()
+            for tuning in tuning_candidates:
+                item = dict(tuning or {})
+                if not candidate_is_allowed(contract, item):
+                    continue
+                key = json.dumps(item, sort_keys=True, default=str)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(item)
+                if len(unique) >= candidate_limit:
+                    break
+
+            if not unique:
+                raise RuntimeError("provider returned no candidates preserving the tuning contract")
+
+            baseline_plan_normalized = self._rebuild_launch_plan(
+                provider=provider,
+                service=service,
+                launch_plan=baseline_plan,
+                hardware=hardware,
+                tuning=unique[0],
+            )
+            if ngram_speculation is not None:
+                baseline_plan = baseline_plan_normalized
+            # A CLI/config speculation override changes the baseline itself,
+            # not just the candidate list. Ensure the live process is replaced
+            # before measuring it; otherwise an inherited optimized server
+            # could make the "off" baseline accidentally include speculation.
+            if self._fingerprint(service.get("launch_plan") or {}) != self._fingerprint(baseline_plan_normalized):
+                baseline_startup = self._replace_service_runtime(
+                    state=state,
+                    service_name=service_name,
+                    service=service,
+                    provider=provider,
+                    launch_plan=baseline_plan_normalized,
+                    startup_timeout_seconds=startup_timeout_seconds,
+                )
+                if not baseline_startup.get("ready"):
+                    raise RuntimeError("requested baseline configuration failed its readiness check")
+                service["launch_plan"] = baseline_plan_normalized
+            baseline_measurement_raw = self._profile_measurement(
+                provider=provider,
+                launch_plan=baseline_plan_normalized,
+                profile=profile,
+                observation=observation,
+                service_name=service_name,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                warmup_runs=warmup_runs,
+                repeats=repeats,
+                measurement_runner=measurement_runner,
+            )
+            baseline_measurement = self._profile_metric(profile, baseline_measurement_raw)
+            if baseline_measurement is None:
+                report.update(
+                    {
+                        "available": False,
+                        "outcome": "unavailable",
+                        "reason": "GPU energy telemetry is unavailable for the cost profile"
+                        if profile == "cost"
+                        else "baseline benchmark did not produce a valid measurement",
+                    }
+                )
+                restore_baseline()
+                raise _ProfileUnavailable()
+            report["candidates"].append(
+                {
+                    "index": 0,
+                    "kind": "baseline",
+                    "config": self._candidate_config(unique[0], contract),
+                    "tuning": unique[0],
+                    "launch_plan": baseline_plan_normalized,
+                    "measurement": baseline_measurement.to_dict(),
+                    "raw_measurement": baseline_measurement_raw,
+                    "status": "baseline",
+                    "target": dict(report["target"]),
+                    "capabilities": dict(baseline_plan_normalized.get("capabilities") or {}),
+                }
+            )
+            baseline_accuracy_raw = accuracy_for(baseline_plan_normalized)
+            baseline_accuracy = None
+            if baseline_accuracy_raw is not None and all(case.id in baseline_accuracy_raw for case in accuracy_suite.cases):
+                baseline_accuracy = score_accuracy_suite(
+                    accuracy_suite, baseline_accuracy_raw, baseline_accuracy_raw,
+                    aggregate_tolerance=accuracy_tolerance, case_tolerance=accuracy_case_tolerance,
+                )
+                report["baseline"]["accuracy"] = baseline_accuracy.to_dict(retain_accuracy_responses)
+                report["baseline"]["capabilities"] = dict(baseline_plan_normalized.get("capabilities") or {})
+                report["candidates"][0]["accuracy"] = report["baseline"]["accuracy"]
+            report["baseline"]["target"] = dict(report["target"])
+            report["baseline"].setdefault("accuracy", {"status": "not_evaluated", "passed": False})
+            report["baseline"].setdefault("capabilities", dict(baseline_plan_normalized.get("capabilities") or {}))
+            if baseline_accuracy is None or not baseline_accuracy.passed:
+                report.update({"available": False, "outcome": "unavailable", "applied": False,
+                               "reason": "deterministic accuracy baseline unavailable or failed"})
+                restore_baseline()
+                raise _ProfileUnavailable()
+            store.append_event(run_id, {"stage": "baseline_measured"})
+
+            for index, tuning in enumerate(unique[1:], start=1):
+                checkpoint()
+                if budget_seconds is not None and time.time() - started >= float(budget_seconds):
+                    break
+                emit_progress(
+                    "candidate",
+                    f"Testing candidate {index} of {max(1, len(unique) - 1)}",
+                    min(90.0, 15.0 + index / max(1, len(unique) - 1) * 70.0),
+                    {"index": index, "run_id": run_id},
+                )
+                candidate_plan = self._rebuild_launch_plan(
+                    provider=provider,
+                    service=service,
+                    launch_plan=baseline_plan,
+                    hardware=hardware,
+                    tuning=tuning,
+                )
+                entry: JsonDict = {
+                    "index": index,
+                    "kind": "candidate",
+                    "config": self._candidate_config(tuning, contract),
+                    "tuning": tuning,
+                    "launch_plan": candidate_plan,
+                }
+                replacement = self._replace_service_runtime(
+                    state=state,
+                    service_name=service_name,
+                    service=service,
+                    provider=provider,
+                    launch_plan=candidate_plan,
+                    startup_timeout_seconds=startup_timeout_seconds,
+                )
+                entry["startup"] = replacement
+                if not replacement.get("ready"):
+                    entry.update({"status": "failed", "reason": "candidate did not become ready"})
+                    report["candidates"].append(entry)
+                    continue
+                try:
+                    measurement_raw = self._profile_measurement(
+                        provider=provider,
+                        launch_plan=candidate_plan,
+                        profile=profile,
+                        observation={**observation, "api_base": candidate_plan.get("api_base")},
+                        service_name=service_name,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        warmup_runs=warmup_runs,
+                        repeats=repeats,
+                        measurement_runner=measurement_runner,
+                    )
+                except Exception as exc:
+                    # A single runtime/HTTP failure must reject only this
+                    # candidate.  Candidate search is intentionally bounded
+                    # and sequential, so later configurations can still be
+                    # launched and measured after an unsupported flag or
+                    # transient backend error.
+                    entry.update({
+                        "status": "failed",
+                        "reason": f"candidate measurement failed: {exc}",
+                    })
+                    report["candidates"].append(entry)
+                    store.append_event(run_id, {
+                        "stage": "candidate_failed",
+                        "index": index,
+                        "reason": entry["reason"],
+                    })
+                    continue
+                measurement = self._profile_metric(profile, measurement_raw)
+                if measurement is None:
+                    entry.update({"status": "failed", "reason": "candidate measurement unavailable"})
+                    report["candidates"].append(entry)
+                    continue
+                entry.update(
+                    {
+                        "measurement": measurement.to_dict(),
+                        "raw_measurement": measurement_raw,
+                        "status": "measured",
+                        "capabilities": dict(candidate_plan.get("capabilities") or {}),
+                    }
+                )
+                entry.setdefault("accuracy", {"status": "not_evaluated", "passed": False})
+                entry["target"] = dict(report["target"])
+                report["candidates"].append(entry)
+                store.append_event(run_id, {"stage": "candidate_measured", "index": index})
+
+            # Throughput/latency screen first; only a bounded top shortlist
+            # incurs deterministic quality calls.  Keep enough candidates to
+            # avoid letting one aggressive (but inaccurate) cache/batch
+            # combination hide the next-best configuration that would pass
+            # the quality gate.
+            measured = [item for item in report["candidates"][1:] if item.get("measurement") and item.get("status") == "measured"]
+            for candidate in report["candidates"]:
+                candidate.setdefault("accuracy", {"status": "not_evaluated", "passed": False})
+                candidate.setdefault("target", dict(report["target"]))
+                candidate.setdefault("capabilities", dict((candidate.get("launch_plan") or {}).get("capabilities") or {}))
+            if profile == "speed":
+                measured.sort(key=lambda item: float((item.get("measurement") or {}).get("tokens_per_second") or 0.0), reverse=True)
+                ranking_metric = "tokens_per_second"
+            else:
+                measured.sort(key=lambda item: float((item.get("measurement") or {}).get("gpu_joules_per_request") or float("inf")))
+                ranking_metric = "gpu_joules_per_request"
+            shortlist = measured[: min(8, len(measured))]
+            report["accuracy_shortlist"] = [item.get("config") for item in shortlist]
+            report["accuracy_shortlist_cap"] = min(8, len(measured))
+            report["shortlist_ranking_metric"] = ranking_metric
+            for item in shortlist:
+                try:
+                    # Candidate measurement is sequential: the next
+                    # candidate restart stops the previous process.  Bring
+                    # each shortlisted candidate back before probing quality;
+                    # otherwise the probe would hit a stale port and turn a
+                    # valid performance result into a false connection
+                    # failure.
+                    quality_startup = self._replace_service_runtime(
+                        state=state,
+                        service_name=service_name,
+                        service=service,
+                        provider=provider,
+                        launch_plan=dict(item["launch_plan"]),
+                        startup_timeout_seconds=startup_timeout_seconds,
+                    )
+                    item["quality_startup"] = quality_startup
+                    if not quality_startup.get("ready"):
+                        raise RuntimeError("candidate did not become ready for quality probe")
+                    service["launch_plan"] = dict(item["launch_plan"])
+                    candidate_accuracy_raw = accuracy_for(item["launch_plan"])
+                except Exception as exc:
+                    # A malformed response or transient backend HTTP error is
+                    # a candidate-quality failure, not a reason to abort the
+                    # whole tuning transaction. Keep the candidate visible in
+                    # the report and let the baseline/other candidates proceed.
+                    item["status"] = "rejected_accuracy"
+                    item["reason"] = f"candidate accuracy probe failed: {exc}"
+                    item["accuracy"] = {
+                        "status": "probe_error",
+                        "passed": False,
+                        "error": str(exc),
+                    }
+                    item["target"] = dict(report["target"])
+                    continue
+                candidate_accuracy = score_accuracy_suite(
+                    accuracy_suite, baseline_accuracy_raw or {}, candidate_accuracy_raw or {},
+                    aggregate_tolerance=accuracy_tolerance, case_tolerance=accuracy_case_tolerance,
+                )
+                item["accuracy"] = candidate_accuracy.to_dict(retain_accuracy_responses)
+                if retain_accuracy_responses:
+                    item["accuracy_raw"] = candidate_accuracy_raw
+                if not candidate_accuracy.passed:
+                    item["status"] = "rejected_accuracy"
+                    item["reason"] = "candidate failed deterministic accuracy gate"
+                else:
+                    item["improvement_interval"] = self._profile_improvement_interval(
+                        profile, baseline_measurement, self._profile_metric(profile, item["measurement"]),
+                        baseline_raw=baseline_measurement_raw, candidate_raw=item.get("raw_measurement") or {},
+                    )
+                item["target"] = dict(report["target"])
+
+            selection_candidates = [
+                {
+                    "config": item.get("config") or {},
+                    "measurement": item.get("measurement") or {},
+                    "improvement_interval": item.get("improvement_interval"),
+                }
+                for item in report["candidates"][1:]
+                if item.get("measurement")
+                and item.get("status") != "rejected_accuracy"
+                and item.get("improvement_interval") is not None
+            ]
+            selection = select_profile_winner(
+                profile,
+                baseline=baseline_measurement,
+                candidates=selection_candidates,
+            )
+            report["selection"] = selection
+            selected = selection.get("selected")
+            # A validated target is itself a promotion objective, even when
+            # confidence intervals overlap the baseline.
+            validated_targets = [
+                item for item in report["candidates"][1:]
+                if item.get("status") == "measured"
+                and float((item.get("measurement") or {}).get("tokens_per_second") or 0.0) >= target_tokens_per_second
+                and (item.get("accuracy") or {}).get("passed", False)
+            ]
+            if validated_targets:
+                validated_targets.sort(key=lambda item: float((item.get("measurement") or {}).get("tokens_per_second") or 0.0), reverse=True)
+                target_entry = validated_targets[0]
+                selected = next((item for item in selection_candidates if item.get("config") == target_entry.get("config")), None) or {"config": target_entry.get("config"), "objective_improvement": 0.0}
+                report["target"]["reached"] = True
+            for candidate in report["candidates"]:
+                candidate["target"] = dict(report["target"])
+            if not selected:
+                restore = restore_baseline()
+                report.update(
+                    {
+                        "available": True,
+                        "outcome": "no_improvement",
+                        "applied": False,
+                        "baseline_restored": baseline_restored,
+                        "restore": restore,
+                        "decision": "No candidate had a reliably positive improvement interval after profile guardrails.",
+                    }
+                )
+            elif profile == "speed" and not report["target"].get("reached"):
+                restore = restore_baseline()
+                report.update({"available": True, "outcome": "no_improvement", "applied": False,
+                               "baseline_restored": baseline_restored, "restore": restore,
+                               "decision": "No accuracy-passing candidate reached the target throughput."})
+            else:
+                winner_entry = next(
+                    item
+                    for item in report["candidates"]
+                    if item.get("config") == selected.get("config")
+                )
+                selected = {
+                    **selected,
+                    "accuracy": winner_entry.get("accuracy"),
+                    "target": dict(report.get("target") or {}),
+                    "capabilities": dict(winner_entry.get("capabilities") or {}),
+                }
+                winning_plan = dict(winner_entry["launch_plan"])
+                # Cancellation is a transaction boundary: do not begin final
+                # promotion after the operation has been cancelled.
+                checkpoint()
+                if no_apply:
+                    restore = restore_baseline()
+                    report.update(
+                        {
+                            "available": True,
+                            "outcome": "improved",
+                            "applied": False,
+                            "winner": selected,
+                            "winner_launch_plan": winning_plan,
+                            "baseline_restored": baseline_restored,
+                            "restore": restore,
+                            "decision": "A winner was measured, but --no-apply kept the baseline deployment active.",
+                        }
+                    )
+                else:
+                    final_startup = self._replace_service_runtime(
+                        state=state,
+                        service_name=service_name,
+                        service=service,
+                        provider=provider,
+                        launch_plan=winning_plan,
+                        startup_timeout_seconds=startup_timeout_seconds,
+                    )
+                    if not final_startup.get("ready"):
+                        raise RuntimeError("winning configuration failed its final readiness check")
+                    final_accuracy_raw = accuracy_for(winning_plan)
+                    if baseline_accuracy_raw is not None:
+                        final_accuracy = score_accuracy_suite(
+                            accuracy_suite, baseline_accuracy_raw, final_accuracy_raw or {},
+                            aggregate_tolerance=accuracy_tolerance, case_tolerance=accuracy_case_tolerance,
+                        )
+                        report["final_accuracy"] = final_accuracy.to_dict(retain_accuracy_responses)
+                        if not final_accuracy.passed:
+                            raise RuntimeError("winning configuration failed final accuracy validation")
+                    final_measurement_raw = self._profile_measurement(
+                        provider=provider, launch_plan=winning_plan, profile=profile,
+                        observation={**observation, "api_base": winning_plan.get("api_base")},
+                        service_name=service_name, prompt=prompt, max_tokens=max_tokens,
+                        warmup_runs=0, repeats=max(1, repeats), measurement_runner=measurement_runner,
+                    )
+                    final_measurement = self._profile_metric(profile, final_measurement_raw)
+                    final_confidence = self._profile_confidence_interval(
+                        profile, final_measurement, final_measurement_raw,
+                    )
+                    final_speed_lower_bound = float(final_confidence.get("lower_bound") or 0.0)
+                    if final_measurement is None or (
+                        profile == "speed"
+                        and report["target"].get("reached")
+                        and (
+                            (final_measurement.tokens_per_second or 0.0) < target_tokens_per_second
+                            or not final_confidence.get("available")
+                            or final_speed_lower_bound < target_tokens_per_second
+                        )
+                    ):
+                        raise RuntimeError("winning configuration failed final throughput validation")
+                    report["final_measurement"] = {
+                        **final_measurement.to_dict(),
+                        "confidence_interval": final_confidence,
+                    }
+                    final_improvement_interval = self._profile_improvement_interval(
+                        profile,
+                        baseline_measurement,
+                        final_measurement,
+                        baseline_raw=baseline_measurement_raw,
+                        candidate_raw=final_measurement_raw,
+                    )
+                    report["final_improvement_interval"] = final_improvement_interval
+                    if final_improvement_interval[0] <= 0.0:
+                        restore = restore_baseline()
+                        report.update(
+                            {
+                                "available": True,
+                                "outcome": "no_improvement",
+                                "applied": False,
+                                "baseline_restored": baseline_restored,
+                                "restore": restore,
+                                "decision": "The promotion retest did not show a reliably positive improvement over the baseline; the baseline was restored.",
+                            }
+                        )
+                        raise _ProfileUnavailable()
+                    if profile == "speed":
+                        report["target"]["validated_tokens_per_second"] = final_measurement.tokens_per_second
+                        report["target"]["confidence_lower_bound"] = final_speed_lower_bound
+                    report["target"]["validated"] = True
+                    selected["target"] = dict(report["target"])
+                    report["winner"] = selected
+                    # A cancellation can arrive while the final process is
+                    # becoming ready.  Restore the baseline in the handler
+                    # before exposing a terminal CANCELLED state.
+                    checkpoint()
+                    service["launch_plan"] = winning_plan
+                    service["last_known_good_launch_plan"] = winning_plan
+                    service["status"] = "healthy"
+                    service["desired_state"] = "running"
+                    history = service.setdefault("tuning_history", [])
+                    history.append(
+                        {
+                            "run_id": run_id,
+                            "created_unix_seconds": int(started),
+                            "profile": profile,
+                            "winning_config": winner_entry.get("tuning") or {},
+                            "objective_improvement": selected.get("objective_improvement"),
+                        }
+                    )
+                    del history[: max(0, len(history) - 50)]
+                    report.update(
+                        {
+                            "available": True,
+                            "outcome": "improved",
+                            "applied": True,
+                            "winner": selected,
+                            "winner_launch_plan": winning_plan,
+                            "final_startup": final_startup,
+                            "decision": self._tuning_decision_text(profile, baseline_measurement, selected),
+                        }
+                    )
+            self.write_state(state)
+            emit_progress("complete", "Profiled tuning finished", 100.0, {"outcome": report.get("outcome")})
+            store.update_run(run_id, {"status": "SUCCEEDED", **report})
+        except _ProfileUnavailable:
+            store.update_run(run_id, {"status": "SUCCEEDED", **report})
+        except _TuningCancelled:
+            restore = restore_baseline()
+            report.update(
+                {
+                    "available": True,
+                    "outcome": "cancelled",
+                    "applied": False,
+                    "baseline_restored": baseline_restored,
+                    "restore": restore,
+                    "decision": "The run was cancelled at a safe checkpoint; the baseline deployment was restored.",
+                }
+            )
+            store.update_run(run_id, {"status": "CANCELLED", **report})
+        except Exception as exc:
+            restore = restore_baseline()
+            report.update(
+                {
+                    "available": True,
+                    "outcome": "failed",
+                    "applied": False,
+                    "error": str(exc),
+                    "baseline_restored": baseline_restored,
+                    "restore": restore,
+                }
+            )
+            store.update_run(run_id, {"status": "FAILED", **report})
+        finally:
+            service.pop("tuning_active", None)
+            self.write_state(state)
+            store.append_event(run_id, {"stage": "finished", "outcome": report.get("outcome")})
+
+        # Keep the durable/API shape stable across every terminal outcome.
+        target = dict(report.get("target") or {})
+        target.setdefault("value", target.get("tokens_per_second"))
+        report["target"] = target
+        report["accuracy"] = report.get("final_accuracy") or report.get("baseline", {}).get("accuracy")
+        report["kv_precision_search"] = bool(contract.kv_precision_search)
+        report["rejected"] = [
+            {"candidate": item.get("config"), "rejection_reason": item.get("reason")}
+            for item in report.get("candidates", [])
+            if item.get("status", "").startswith("rejected") or item.get("reason")
+        ]
+        report["apply_state"] = {
+            "applied": bool(report.get("applied")),
+            "rolled_back": bool(report.get("baseline_restored")) and not bool(report.get("applied")),
+            "state": "applied" if report.get("applied") else ("rolled_back" if report.get("baseline_restored") else "baseline_kept"),
+        }
+        store.update_run(run_id, report)
+
+        if write:
+            target = self._timestamped("reports", f"{service_name}-profiled-tuning-{profile}")
+            self._write_json(target, report)
+            report["report_path"] = str(target)
+            # The persisted run is updated after the report path is known so
+            # API/CLI history can deep-link directly to the immutable report.
+            store.update_run(run_id, {"report_path": str(target)})
+        return report
+
+    @staticmethod
+    def _candidate_config(tuning: JsonDict, contract: TuningContract) -> JsonDict:
+        result = dict(tuning)
+        for key, value in contract.locked.items():
+            result.setdefault(key, value)
+        return result
+
+    def _profile_measurement(
+        self,
+        *,
+        provider: Any,
+        launch_plan: JsonDict,
+        profile: str,
+        observation: JsonDict,
+        service_name: str | None = None,
+        prompt: str,
+        max_tokens: int,
+        warmup_runs: int,
+        repeats: int,
+        measurement_runner: Callable[[JsonDict, str], JsonDict] | None,
+    ) -> JsonDict:
+        if measurement_runner is not None:
+            return dict(measurement_runner(launch_plan, profile) or {})
+        if profile == "cost":
+            return self._profile_cost_measurement(
+                provider=provider,
+                launch_plan=launch_plan,
+                observation=observation,
+                service_name=service_name,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                warmup_runs=warmup_runs,
+                repeats=repeats,
+            )
+        result = self._benchmark_series(
+            provider,
+            api_base=str(launch_plan.get("api_base") or observation.get("api_base") or ""),
+            prompt=prompt,
+            max_tokens=max_tokens,
+            warmup_runs=warmup_runs,
+            repeats=repeats,
+            ignore_eos=(profile == "speed"),
+            seed=17 if profile == "speed" else None,
+            temperature=0.0 if profile == "speed" else None,
+        )
+        samples = result.get("samples") or []
+        elapsed = [
+            float(item.get("elapsed_seconds"))
+            for item in samples
+            if item.get("elapsed_seconds") not in (None, "")
+        ]
+        tokens = [
+            int(item.get("generated_tokens_estimate") or item.get("generated_tokens") or 0)
+            for item in samples
+        ]
+        output: JsonDict = {
+            **result,
+            "latency_seconds": float(result.get("median_elapsed_seconds") or result.get("p95_elapsed_seconds") or 0.0),
+            "tokens_per_second": float(result.get("median_tokens_per_second") or 0.0),
+            "ttft_seconds": result.get("median_first_token_seconds"),
+            "tokens": sum(tokens),
+            "failures": int(result.get("failure_count") or 0),
+            "requests": len(samples),
+            "replicates": elapsed,
+        }
+        return output
+
+    def _profile_cost_measurement(
+        self,
+        *,
+        provider: Any,
+        launch_plan: JsonDict,
+        observation: JsonDict,
+        service_name: str | None,
+        prompt: str,
+        max_tokens: int,
+        warmup_runs: int,
+        repeats: int,
+        ignore_eos: bool = True,
+    ) -> JsonDict:
+        """Measure GPU energy per request with one isolated sampler per request."""
+
+        api_base = str(launch_plan.get("api_base") or observation.get("api_base") or "")
+        if not api_base:
+            raise ValueError("api_base is required for cost profiling")
+        for _ in range(warmup_runs):
+            provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False)
+        samples: list[JsonDict] = []
+        energy_results: list[JsonDict] = []
+        for _ in range(repeats):
+            sampler = GpuEnergySampler()
+            cpu_before = self._tuning_process_cpu_seconds(service_name)
+            sampler.start()
+            try:
+                sample = dict(provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False) or {})
+            finally:
+                energy_results.append(sampler.stop())
+            cpu_after = self._tuning_process_cpu_seconds(service_name)
+            samples.append(sample)
+            if cpu_before is not None and cpu_after is not None:
+                sample["process_cpu_seconds_delta"] = max(0.0, cpu_after - cpu_before)
+        summary = summarize_samples(samples)
+        energy_replicates = [
+            float(item.get("gpu_joules") or 0.0)
+            for item in energy_results
+            if bool(item.get("available")) and float(item.get("gpu_joules") or 0.0) > 0.0
+        ]
+        available = len(energy_replicates) == len(samples) and bool(energy_replicates)
+        cpu_deltas = [
+            float(item["process_cpu_seconds_delta"])
+            for item in samples
+            if item.get("process_cpu_seconds_delta") is not None
+        ]
+        return {
+            **summary,
+            "latency_seconds": float(summary.get("median_elapsed_seconds") or summary.get("p95_elapsed_seconds") or 0.0),
+            "ttft_seconds": summary.get("median_first_token_seconds"),
+            "tokens": sum(
+                int(item.get("generated_tokens_estimate") or item.get("generated_tokens") or 0)
+                for item in samples
+            ),
+            "failures": int(summary.get("failure_count") or 0),
+            "requests": len(samples),
+            "cpu_seconds": sum(cpu_deltas) if len(cpu_deltas) == len(samples) else 0.0,
+            "cpu_available": len(cpu_deltas) == len(samples) and bool(cpu_deltas),
+            "replicates": energy_replicates,
+            "energy_available": available,
+            "gpu_joules": sum(energy_replicates) if available else None,
+            "energy": {
+                "available": available,
+                "method": "nvidia-smi power.draw integration per request",
+                "scope": "gpu_device",
+                "attribution": "aggregate_device_power",
+                "attribution_limit": "includes other workloads sharing the GPU",
+                "requests": energy_results,
+            },
+            "samples": samples,
+        }
+
+    def _tuning_process_cpu_seconds(self, service_name: str | None) -> float | None:
+        """Read cumulative service CPU seconds from the current telemetry segment."""
+
+        if not service_name or getattr(self, "_telemetry_supervisor", None) is None:
+            return None
+        try:
+            sample = self.telemetry_supervisor.sample_once(service_name)
+            value = sample.get("process_cpu_seconds") if isinstance(sample, dict) else None
+            return float(value) if value is not None and math.isfinite(float(value)) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _profile_metric(profile: str, raw: JsonDict) -> SpeedMeasurement | CostMeasurement | None:
+        if profile == "speed":
+            metric = SpeedMeasurement.from_mapping(raw)
+            return (
+                metric
+                if metric.latency_seconds > 0.0
+                and metric.tokens > 0
+                and (metric.tokens_per_second or 0.0) > 0.0
+                and metric.failures == 0
+                else None
+            )
+        if not bool(raw.get("energy_available", raw.get("gpu_joules") is not None)):
+            return None
+        metric = CostMeasurement.from_mapping(raw)
+        return (
+            metric
+            if metric.gpu_joules > 0.0 and metric.requests > 0 and metric.latency_seconds > 0.0 and metric.failures == 0
+            else None
+        )
+
+    @staticmethod
+    def _profile_confidence_interval(
+        profile: str,
+        metric: SpeedMeasurement | CostMeasurement | None,
+        raw: JsonDict,
+    ) -> JsonDict:
+        """Return a transparent 95% confidence interval for the final metric.
+
+        Live llama.cpp measurements expose per-request samples.  Injected
+        measurement runners used by controller tests may instead expose the
+        elapsed-time ``replicates`` list, so that shape is supported as well.
+        A missing replicate series is reported as unavailable rather than
+        being presented as confidence evidence.
+        """
+
+        def finite(value: Any) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return number if math.isfinite(number) else None
+
+        if metric is None:
+            return {
+                "available": False,
+                "level": 0.95,
+                "method": "normal_approximation",
+                "sample_count": 0,
+            }
+        samples = raw.get("samples") if isinstance(raw, dict) else None
+        values: list[float] = []
+        if profile == "speed":
+            for sample in samples or []:
+                if not isinstance(sample, dict):
+                    continue
+                elapsed = finite(sample.get("elapsed_seconds"))
+                tokens = finite(sample.get("generated_tokens_estimate") or sample.get("generated_tokens"))
+                throughput = finite(
+                    sample.get("decode_tokens_per_second")
+                    or sample.get("tokens_per_second_estimate")
+                    or sample.get("tokens_per_second")
+                )
+                if throughput is None and elapsed and elapsed > 0.0 and tokens and tokens > 0.0:
+                    throughput = tokens / elapsed
+                if throughput is not None and throughput > 0.0:
+                    values.append(throughput)
+            if not values:
+                elapsed_replicates = [
+                    finite(value) for value in (raw.get("replicates") or [])
+                ]
+                elapsed_replicates = [
+                    value for value in elapsed_replicates if value is not None and value > 0.0
+                ]
+                tokens = finite(raw.get("tokens")) or 0.0
+                if elapsed_replicates and tokens > 0.0:
+                    per_request_tokens = tokens / len(elapsed_replicates)
+                    values = [per_request_tokens / elapsed for elapsed in elapsed_replicates]
+            point = float(metric.tokens_per_second or 0.0)
+            metric_name = "tokens_per_second"
+        else:
+            for value in (raw.get("replicates") or []):
+                number = finite(value)
+                if number is not None and number > 0.0:
+                    values.append(number)
+            point = float(metric.gpu_joules_per_request)
+            metric_name = "gpu_joules_per_request"
+
+        if len(values) < 2:
+            return {
+                "available": False,
+                "level": 0.95,
+                "method": "normal_approximation",
+                "metric": metric_name,
+                "sample_count": len(values),
+                "point_estimate": point,
+                "lower_bound": point if values else 0.0,
+                "upper_bound": point if values else 0.0,
+            }
+        average = statistics.mean(values)
+        degrees_of_freedom = len(values) - 1
+        # Two-sided 95% Student-t critical values for small replicate sets;
+        # the normal approximation is adequate once df exceeds 30.
+        student_t_critical = {
+            1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+            6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+            11: 2.201, 12: 2.179, 13: 2.160, 14: 2.145, 15: 2.131,
+            16: 2.120, 17: 2.110, 18: 2.101, 19: 2.093, 20: 2.086,
+            21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064, 25: 2.060,
+            26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+        }
+        critical = student_t_critical.get(degrees_of_freedom, 1.96)
+        margin = critical * statistics.stdev(values) / math.sqrt(len(values))
+        return {
+            "available": True,
+            "level": 0.95,
+            "method": "student_t_95" if degrees_of_freedom <= 30 else "normal_approximation",
+            "metric": metric_name,
+            "sample_count": len(values),
+            "point_estimate": point,
+            "lower_bound": max(0.0, round(average - margin, 6)),
+            "upper_bound": max(0.0, round(average + margin, 6)),
+        }
+
+    @staticmethod
+    def _profile_improvement_interval(
+        profile: str,
+        baseline: SpeedMeasurement | CostMeasurement,
+        candidate: SpeedMeasurement | CostMeasurement,
+        *,
+        baseline_raw: JsonDict,
+        candidate_raw: JsonDict,
+    ) -> list[float]:
+        if profile == "speed":
+            baseline_value = float(baseline.tokens_per_second or 0.0)
+            candidate_value = float(candidate.tokens_per_second or 0.0)
+        else:
+            baseline_value = float(baseline.gpu_joules_per_request or 0.0)
+            candidate_value = float(candidate.gpu_joules_per_request or 0.0)
+        if baseline_value <= 0.0 or candidate_value <= 0.0:
+            return [-1.0, -1.0]
+        point = (
+            candidate_value / baseline_value - 1.0
+            if profile == "speed"
+            else baseline_value / candidate_value - 1.0
+        )
+        baseline_replicates = [float(value) for value in baseline_raw.get("replicates") or [] if float(value) > 0]
+        candidate_replicates = [float(value) for value in candidate_raw.get("replicates") or [] if float(value) > 0]
+        if profile in {"speed", "cost"} and baseline_replicates and candidate_replicates:
+            if profile == "speed":
+                baseline_tokens = max(1, baseline.tokens)
+                candidate_tokens = max(1, candidate.tokens)
+                values = [
+                    (candidate_tokens / b) / (baseline_tokens / a) - 1.0
+                    for a, b in zip(baseline_replicates, candidate_replicates)
+                    if a > 0 and b > 0
+                ]
+            else:
+                values = [a / b - 1.0 for a, b in zip(baseline_replicates, candidate_replicates) if b > 0]
+        else:
+            values = [point]
+        # A provider may report aggregate latency alongside a synthetic or
+        # unavailable per-request replicate list.  Keep the aggregate point
+        # estimate in that case instead of manufacturing a zero interval.
+        if values and abs(statistics.mean(values)) < 1e-12 and abs(point) > 1e-12:
+            values = [point]
+        if len(values) < 2:
+            return [round(point, 6), round(point, 6)]
+        average = statistics.mean(values)
+        margin = 1.96 * statistics.stdev(values) / math.sqrt(len(values))
+        return [round(average - margin, 6), round(average + margin, 6)]
+
+    @staticmethod
+    def _tuning_decision_text(
+        profile: str,
+        baseline: SpeedMeasurement | CostMeasurement,
+        selected: JsonDict,
+    ) -> str:
+        improvement = float(selected.get("objective_improvement") or 0.0) * 100.0
+        metric = "throughput" if profile == "speed" else "GPU joules/request"
+        direction = "higher" if profile == "speed" else "lower"
+        return f"Selected the feasible llama.cpp candidate with {improvement:.2f}% {direction} {metric} than baseline."
+
+    @staticmethod
+    def _tuning_opportunities(contract: TuningContract, profile: str) -> list[JsonDict]:
+        return [
+            {
+                "id": "weight-quantization",
+                "kind": "weight_quantization",
+                "status": "recommendation_only",
+                "tested": False,
+                "profile": profile,
+                "title": "Try a different weight quantization",
+                "warning": "Changing quantization changes the model artifact and may reduce accuracy; it requires a separate model download and deployment.",
+                "locked_value": contract.locked.get("weight_quantization"),
+            },
+            {
+                "id": "kv-cache-precision",
+                "kind": "kv_cache_precision",
+                "status": "recommendation_only",
+                "tested": False,
+                "profile": profile,
+                "title": "Try lower-precision K/V cache",
+                "warning": "Changing K/V cache precision can affect long-context quality; every selected candidate is accuracy-screened before application.",
+                "locked_values": {
+                    "cache_type_k": contract.locked.get("cache_type_k"),
+                    "cache_type_v": contract.locked.get("cache_type_v"),
+                },
+            },
+        ]
+
     def tune_service(
         self,
         *,
@@ -4956,18 +6403,40 @@ class RiftOrchestrator:
         max_tokens: int,
         warmup_runs: int,
         repeats: int,
+        ignore_eos: bool = True,
+        seed: int | None = None,
+        temperature: float | None = None,
     ) -> JsonDict:
         if not api_base:
             raise ValueError("api_base is required for live benchmarking")
+
+        def benchmark_once() -> JsonDict:
+            benchmark_kwargs = {
+                "base_url": api_base,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "ignore_eos": ignore_eos,
+            }
+            if seed is not None:
+                benchmark_kwargs["seed"] = seed
+            if temperature is not None:
+                benchmark_kwargs["temperature"] = temperature
+            try:
+                return dict(provider.benchmark(**benchmark_kwargs) or {})
+            except TypeError as exc:
+                # Keep the legacy live-tuning path compatible with third-party
+                # adapters that predate optional sampling controls.
+                if not any(name in str(exc) for name in ("ignore_eos", "seed", "temperature")):
+                    raise
+                benchmark_kwargs.pop("seed", None)
+                benchmark_kwargs.pop("temperature", None)
+                benchmark_kwargs.pop("ignore_eos", None)
+                return dict(provider.benchmark(**benchmark_kwargs) or {})
+
         warmups = []
         for _ in range(warmup_runs):
-            warmups.append(
-                provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens)
-            )
-        samples = [
-            provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens)
-            for _ in range(repeats)
-        ]
+            warmups.append(benchmark_once())
+        samples = [benchmark_once() for _ in range(repeats)]
         summary = summarize_samples(samples)
         median_throughput = float(summary.get("median_tokens_per_second") or 0.0)
         return {
@@ -5064,9 +6533,18 @@ class RiftOrchestrator:
         *,
         launch_plan: JsonDict,
         hardware: JsonDict,
+        contract: TuningContract | None = None,
     ) -> list[JsonDict]:
         tuning = getattr(provider, "tuning_space", None)
         if callable(tuning):
+            if contract is not None:
+                try:
+                    return tuning(launch_plan=launch_plan, hardware=hardware, contract=contract)
+                except TypeError as exc:
+                    # Third-party providers written against the pre-contract
+                    # lifecycle still participate in legacy/plan-only tuning.
+                    if "contract" not in str(exc):
+                        raise
             return tuning(launch_plan=launch_plan, hardware=hardware)
         return provider.tune_candidates(launch_plan=launch_plan, hardware=hardware)
 
@@ -5096,6 +6574,17 @@ class RiftOrchestrator:
         old_pid = int(old_pid_value) if old_pid_value not in (None, "") else None
         old_runtime = dict(service.get("runtime") or {})
         old_launch_plan = dict(service.get("launch_plan") or {})
+        telemetry_was_active = False
+        if getattr(self, "_telemetry_supervisor", None) is not None:
+            try:
+                telemetry_was_active = self.telemetry_store.active_session(service_name) is not None
+                if telemetry_was_active:
+                    # Close the old PID segment before killing its process so
+                    # monitoring never attributes post-restart samples to a
+                    # dead runtime.
+                    self.telemetry_supervisor.stop_service(service_name)
+            except Exception:
+                telemetry_was_active = False
         old_container_termination = self._stop_container(old_launch_plan, old_runtime)
         termination = {"pid": old_pid, "stopped": True, "status": "not_running"}
         if old_pid is not None and self._process_alive(old_pid):
@@ -5132,6 +6621,17 @@ class RiftOrchestrator:
         )
         if readiness.get("ready"):
             service["status"] = "healthy"
+            if telemetry_was_active:
+                try:
+                    self._telemetry_start_service(
+                        service_name,
+                        service,
+                        backend=str(service.get("backend") or getattr(provider, "name", "unknown")),
+                    )
+                except Exception:
+                    # Telemetry is deliberately not a launch dependency.  A
+                    # failed segment start is reported by the next reconcile.
+                    pass
         else:
             service["status"] = "unhealthy"
             new_pid_value = launched.get("pid")
@@ -5479,7 +6979,9 @@ class RiftOrchestrator:
         }
 
     def _fingerprint(self, payload: Any) -> str:
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=self._json_default).encode("utf-8")
+        ).hexdigest()
 
     def _plan_hash(self, plan: JsonDict) -> str:
         content = {
@@ -5501,7 +7003,12 @@ class RiftOrchestrator:
     def _write_json(self, path: Path, payload: JsonDict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(f".{time.time_ns()}.tmp")
-        encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        encoded = json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+            default=self._json_default,
+        ).encode("utf-8")
         try:
             with temporary.open("wb") as stream:
                 stream.write(encoded)
@@ -5513,6 +7020,22 @@ class RiftOrchestrator:
                 temporary.unlink()
             except OSError:
                 pass
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        """Convert runtime-only values into stable JSON report values.
+
+        Backend capability probes intentionally use sets for membership checks,
+        while persisted reports and API artifacts must remain strict JSON. Keep
+        the conversion here at the persistence boundary so in-memory contracts
+        retain their efficient native types and reports remain deterministic.
+        """
+
+        if isinstance(value, set):
+            return sorted(value, key=str)
+        if isinstance(value, Path):
+            return str(value)
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
     def _write_yaml_atomic(self, path: Path, payload: JsonDict) -> None:
         """Replace a configuration file only after the complete document is written."""

@@ -108,10 +108,31 @@ def test_state_store_serializes_legacy_mirror_writes_across_readers():
         assert json.loads(legacy.read_text(encoding="utf-8"))["marker"] == "concurrent"
 
 
+def test_state_store_serializes_capability_sets_as_arrays():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        database = root / "state.db"
+        legacy = root / "state.json"
+        state = {
+            "schema_version": 2,
+            "services": {},
+            "capabilities": {"flags": {"threads", "batch-size", "flash-attn"}},
+        }
+        store = StateStore(database, legacy_path=legacy)
+        store.write(state)
+        assert json.loads(legacy.read_text(encoding="utf-8"))["capabilities"]["flags"] == [
+            "batch-size", "flash-attn", "threads"
+        ]
+        assert store.read()["capabilities"]["flags"] == [
+            "batch-size", "flash-attn", "threads"
+        ]
+
+
 def main():
     test_state_store_imports_legacy_json_and_writes_sqlite_authoritatively()
     test_state_store_rejects_stale_revision_and_restores_backup()
     test_state_store_serializes_legacy_mirror_writes_across_readers()
+    test_state_store_serializes_capability_sets_as_arrays()
     print("RIFT state store tests passed")
 
 

@@ -78,6 +78,24 @@ def make_fake_ggufs(root: Path) -> Path:
     return models
 
 
+def test_plan_hash_is_stable_after_persistence_normalizes_sets(tmp_path):
+    orchestrator = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    plan = {
+        "services": {
+            "chat": {
+                "provider_detection": {
+                    "capabilities": {"flags": {"threads", "gpu-layers", "ctx-size"}}
+                }
+            }
+        }
+    }
+
+    before_persistence = orchestrator._plan_hash(plan)
+    persisted = json.loads(json.dumps(plan, default=orchestrator._json_default))
+
+    assert orchestrator._plan_hash(persisted) == before_persistence
+
+
 class FakeInstallableProvider:
     name = "llama.cpp"
 

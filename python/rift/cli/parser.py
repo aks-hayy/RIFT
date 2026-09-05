@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 
 from .console import _enable_terminal_color
@@ -38,6 +39,20 @@ class RiftArgumentParser(argparse.ArgumentParser):
             f"\x1b[38;5;67mhardware-aware deployment / operations / recovery\x1b[0m\n"
             f"\x1b[38;5;27m{rule}\x1b[0m\n\n{text}"
         )
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return parsed
 
 
 def _subcommands(
@@ -157,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="List saved plans or clear generated plan artifacts",
     )
     plan.add_argument("--config", default="rift.yaml")
-    plan.add_argument("--task", default="chat", help="Workload used to rank model candidates")
+    plan.add_argument("--task", default="chat", help="Task used to rank model candidates")
     plan.add_argument(
         "--huggingface",
         "--hf",
@@ -280,6 +295,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_model_group(commands)
     _add_backend_group(commands)
+    _add_tuning_command(commands)
     _add_service_group(commands)
     _add_cluster_group(commands)
     _add_node_group(commands)
@@ -427,16 +443,7 @@ def _add_service_group(commands) -> None:
     benchmark.add_argument("--warmups", type=int, default=1)
     benchmark.add_argument("--repeats", type=int, default=3)
     tune = _parser(sub, "tune", "Search bounded backend settings and reject regressions")
-    tune.add_argument("--service", default="chat")
-    tune.add_argument("--config", default="rift.yaml")
-    tune.add_argument("--live", action="store_true")
-    tune.add_argument("--allow-restart", action="store_true")
-    tune.add_argument("--candidate-limit", type=int, default=4)
-    tune.add_argument("--warmups", type=int, default=1)
-    tune.add_argument("--repeats", type=int, default=2)
-    tune.add_argument("--startup-timeout", type=float, default=180.0)
-    tune.add_argument("--prompt", default="Reply briefly: what is one benefit of local inference?")
-    tune.add_argument("--max-tokens", type=int, default=32)
+    _add_tune_options(tune)
     monitor = _parser(sub, "monitor", "Observe health and optionally reconcile failures")
     monitor.add_argument("--service")
     monitor.add_argument("--interval", type=float, default=5.0)
@@ -449,6 +456,7 @@ def _add_service_group(commands) -> None:
     rollback = _parser(sub, "rollback", "Restart from the last known-good launch snapshot")
     rollback.add_argument("--service", default="chat")
     rollback.add_argument("--allow-launch", action="store_true")
+    rollback.add_argument("--force", action="store_true")
     incidents = _parser(sub, "incidents", "List persisted incident reports")
     incidents.add_argument("--limit", type=int, default=50)
     logs = _parser(sub, "logs", "Read a managed service log tail")
@@ -471,6 +479,64 @@ def _add_service_group(commands) -> None:
     gateway.add_argument("--host")
     gateway.add_argument("--port", type=int)
     gateway.add_argument("--fallback-service", dest="fallback_services", action="append")
+
+
+def _add_tune_options(tune) -> None:
+    tune.add_argument("--service", default="chat")
+    tune.add_argument("--config", default="rift.yaml")
+    tune.add_argument("--profile", choices=("speed", "cost"), help="Autonomous tuning objective")
+    tune.add_argument("--budget", default="60m", help="Experiment budget, for example 60m or 1h")
+    tune.add_argument("--live", action="store_true")
+    tune.add_argument("--allow-restart", action="store_true")
+    tune.add_argument("--no-apply", action="store_true", help="Validate and report without promoting the winner")
+    tune.add_argument("--detach", action="store_true", help="Submit a profiled run and return immediately")
+    tune.add_argument("--dry-run", action="store_true", help="Preview scope and feasibility without starting experiments")
+    tune.add_argument("--yes", action="store_true", help="Confirm the reviewed maintenance window")
+    tune.add_argument("--controller-url", help="Controller URL for a persistent profiled run")
+    tune.add_argument("--candidate-limit", type=int, default=4)
+    tune.add_argument("--warmups", type=int, default=1)
+    tune.add_argument("--repeats", type=int, default=2)
+    tune.add_argument("--startup-timeout", type=float, default=180.0)
+    tune.add_argument("--prompt", default="Reply briefly: what is one benefit of local inference?")
+    tune.add_argument("--max-tokens", type=int, default=32)
+    tune.add_argument("--target-tokens-per-second", type=_positive_float, default=100.0)
+    tune.add_argument("--accuracy-tolerance", type=_nonnegative_float, default=0.05)
+    tune.add_argument("--accuracy-case-tolerance", type=_nonnegative_float, default=0.15)
+    tune.add_argument("--retain-accuracy-responses", action="store_true")
+    tune.add_argument("--kv-precision-search", dest="kv_precision_search", action="store_true", default=True)
+    tune.add_argument("--no-kv-precision-search", dest="kv_precision_search", action="store_false")
+    speculation = tune.add_mutually_exclusive_group()
+    speculation.add_argument(
+        "--ngram-speculation", dest="ngram_speculation", action="store_true", default=None,
+        help="Enable built-in n-gram speculation candidates for this run",
+    )
+    speculation.add_argument(
+        "--no-ngram-speculation", dest="ngram_speculation", action="store_false",
+        help="Disable built-in n-gram speculation for this run",
+    )
+
+
+def _add_tuning_command(commands) -> None:
+    tune = _parser(
+        commands,
+        "tune",
+        "Autonomously optimize a deployed service for speed or GPU-energy cost",
+        epilog=(
+            "Examples:\n"
+            "  rift tune --service chat --profile speed --allow-restart --yes\n"
+            "  rift tune --service chat --profile cost --dry-run\n"
+            "  rift tune status RUN_ID"
+        ),
+    )
+    _add_tune_options(tune)
+    tune.set_defaults(candidate_limit=24, repeats=3)
+    tune.add_argument(
+        "tune_action",
+        nargs="?",
+        choices=("status", "watch", "report", "cancel", "apply", "rollback", "profiles", "opportunities"),
+        help="Inspect or manage a profiled tuning run; omit to start one",
+    )
+    tune.add_argument("run_id", nargs="?", help="Run ID for a tune action")
 
 
 def _add_cluster_group(commands) -> None:

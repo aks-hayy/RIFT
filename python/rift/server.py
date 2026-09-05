@@ -6,6 +6,7 @@ import json
 import csv
 import io
 import hashlib
+import math
 import os
 from pathlib import Path
 import threading
@@ -23,6 +24,7 @@ from .orchestrator import ApplyPermissions, RiftOrchestrator
 from .operations import OperationStore
 from .runtime_paths import RiftPaths
 from .rift import RiftEngine
+from .tuning_engine import TuningStore
 
 
 JsonDict = dict[str, Any]
@@ -30,6 +32,16 @@ EngineFactory = Callable[[], RiftEngine]
 OrchestratorFactory = Callable[[], RiftOrchestrator]
 ClusterFactory = Callable[[], RiftClusterController]
 MeshControllerFactory = Callable[[], MeshController]
+
+
+def _json_default(value: Any) -> Any:
+    """Serialize probed runtime capability values for HTTP responses."""
+
+    if isinstance(value, set):
+        return sorted(value, key=str)
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 @dataclass
@@ -58,6 +70,7 @@ class RiftServerRuntime:
     _background_locks_guard: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        configured_orchestrator = None
         if self.operation_store is None:
             runtime_root = None
             try:
@@ -72,9 +85,20 @@ class RiftServerRuntime:
             )
             self.operation_store = OperationStore(operations_root)
         self.operation_store.mark_running_interrupted()
+        if configured_orchestrator is not None:
+            recover = getattr(configured_orchestrator, "recover_interrupted_tuning", None)
+            if callable(recover):
+                try:
+                    recover()
+                except Exception:
+                    # Startup recovery must never prevent the control plane
+                    # from coming up; the affected service remains subject to
+                    # the normal degraded-state reconciliation path.
+                    pass
 
     @staticmethod
     def is_background_operation(path: str) -> bool:
+        path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
         return (
             path.startswith("/api/rift/v2/plans/")
             and path.endswith("/apply")
@@ -82,6 +106,7 @@ class RiftServerRuntime:
             "/api/rift/benchmark",
             "/api/rift/benchmark-suite",
             "/api/rift/tune",
+            "/api/rift/v2/tuning/runs",
             "/api/rift/v2/evaluations",
         } or (
             path.startswith("/api/rift/v2/deployments/")
@@ -114,13 +139,23 @@ class RiftServerRuntime:
                 class OperationCancelled(Exception):
                     """Internal signal for a safe cancellation checkpoint."""
 
+                normalized_path = path.replace(
+                    "/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1
+                )
+                tuning_operation = normalized_path == "/api/rift/v2/tuning/runs"
+
                 def progress(
                     stage: str,
                     message: str,
                     percent: float | None,
                     details: JsonDict | None = None,
                 ) -> None:
-                    if cancel_event.is_set():
+                    # Profiled tuning receives the cancellation event directly
+                    # and owns restoration at its checkpoints.  Raising here
+                    # would bypass that handler and turn a user cancellation
+                    # into a generic FAILED run.  Legacy operations retain the
+                    # worker-level short-circuit behavior.
+                    if cancel_event.is_set() and not tuning_operation:
                         raise OperationCancelled()
                     self.operation_store.update(
                         request_id,
@@ -158,11 +193,16 @@ class RiftServerRuntime:
                         percent=None,
                         details={"resource_key": resource_key},
                     )
+                    control_kwargs: dict[str, Any] = {
+                        "authorization": authorization,
+                        "progress": progress,
+                    }
+                    if tuning_operation:
+                        control_kwargs["cancel_check"] = cancel_event.is_set
                     result = self.control_post(
                         path,
-                        payload,
-                        authorization=authorization,
-                        progress=progress,
+                        {**payload, "operation_id": operation_id},
+                        **control_kwargs,
                     )
                 finally:
                     resource_lock.release()
@@ -235,7 +275,18 @@ class RiftServerRuntime:
     def mesh_controller(self) -> MeshController:
         if self._mesh_controller is None:
             if self.mesh_controller_factory is MeshController:
-                self._mesh_controller = MeshController(root=RiftPaths.from_environment().home / "mesh")
+                # Use the same resolved runtime root as the operation store and
+                # orchestrator.  On locked-down Windows installs the
+                # orchestrator may fall back from the platform data directory
+                # to `.rift-runtime`; resolving the mesh root independently
+                # would make mesh routes fail with a permission error.
+                operations_root = getattr(self.operation_store, "root", None)
+                runtime_root = (
+                    Path(operations_root).parent
+                    if operations_root is not None
+                    else RiftPaths.from_environment().home
+                )
+                self._mesh_controller = MeshController(root=runtime_root / "mesh")
             else:
                 self._mesh_controller = self.mesh_controller_factory()
         return self._mesh_controller
@@ -393,6 +444,7 @@ class RiftServerRuntime:
         }
 
     def control_get(self, path: str, query: dict[str, list[str]] | None = None) -> JsonDict:
+        path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
         if path == "/api/rift/v2/mesh/enrollment-window":
             return self.mesh_controller().enrollment_window_status()
         if path == "/api/rift/v2/mesh/enrollments":
@@ -438,6 +490,40 @@ class RiftServerRuntime:
         if path.startswith("/api/rift/v2/evaluations/"):
             run_id = path.rsplit("/", 1)[-1]
             return orchestrator.load_evaluation(run_id)
+        if path == "/api/rift/v2/tuning/profiles":
+            return {
+                "api_version": "1",
+                "profiles": [
+                    {
+                        "id": "speed",
+                        "label": "Speed",
+                        "objective": "Maximize measured generated tokens per second while preserving the locked deployment contract and rejecting latency regressions.",
+                        "metric": "median generated tokens/second",
+                    },
+                    {
+                        "id": "cost",
+                        "label": "Cost",
+                        "objective": "Minimize measured GPU energy per request while bounding latency and CPU regressions.",
+                        "metric": "GPU joules/request",
+                        "availability": "Requires usable GPU power telemetry during each candidate run.",
+                        "attribution": "Aggregate device power; other workloads sharing the GPU are included.",
+                    },
+                ],
+            }
+        if path == "/api/rift/v2/tuning/runs":
+            runs = TuningStore(orchestrator.rift_dir / "tuning.db").list_runs(
+                limit=int(((query or {}).get("limit") or [50])[0] or 50)
+            )
+            service_filter = str(((query or {}).get("service") or [""])[0] or "").strip()
+            profile_filter = str(((query or {}).get("profile") or [""])[0] or "").strip().lower()
+            if service_filter:
+                runs = [item for item in runs if str(item.get("service") or "") == service_filter]
+            if profile_filter:
+                runs = [item for item in runs if str(item.get("profile") or "").lower() == profile_filter]
+            return {"api_version": "1", "runs": runs, "count": len(runs)}
+        if path.startswith("/api/rift/v2/tuning/runs/"):
+            run_id = path.rsplit("/", 1)[-1]
+            return TuningStore(orchestrator.rift_dir / "tuning.db").get_run(run_id)
         if path.startswith("/api/rift/v2/services/") and path.endswith("/telemetry/accounting"):
             parts = path.strip("/").split("/")
             if len(parts) != 7 or parts[3] != "services" or parts[5:] != ["telemetry", "accounting"]:
@@ -660,7 +746,9 @@ class RiftServerRuntime:
         *,
         authorization: str | None = None,
         progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> JsonDict:
+        path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
         if path in ("/api/rift/telemetry/ingest", "/api/rift/v2/telemetry/ingest"):
             orchestrator = self.orchestrator_factory()
             session_id = str(payload.get("session_id") or "")
@@ -1017,6 +1105,48 @@ class RiftServerRuntime:
                 max_tokens=min(128, int(payload.get("max_tokens") or 48)),
                 concurrency=int(payload.get("concurrency") or 1),
             )
+        if path == "/api/rift/v2/tuning/runs":
+            profile = str(payload.get("profile") or "").strip().lower()
+            if profile not in {"speed", "cost"}:
+                raise ValueError("profile must be speed or cost")
+            target = float(payload.get("target_tokens_per_second", 100.0))
+            tolerance = float(payload.get("accuracy_tolerance", 0.05))
+            case_tolerance = float(payload.get("accuracy_case_tolerance", 0.15))
+            if not math.isfinite(target) or target <= 0:
+                raise ValueError("target_tokens_per_second must be positive")
+            if not math.isfinite(tolerance) or not math.isfinite(case_tolerance) or tolerance < 0 or case_tolerance < 0:
+                raise ValueError("accuracy tolerances must be nonnegative")
+            return orchestrator.profiled_tune_service(
+                service_name=str(payload.get("service") or "chat"),
+                profile=profile,
+                allow_restart=bool(payload.get("allow_restart", False)),
+                no_apply=bool(payload.get("no_apply", False)),
+                dry_run=bool(payload.get("dry_run", False)),
+                candidate_limit=int(payload.get("candidate_limit") or 24),
+                warmup_runs=int(payload.get("warmup_runs") or 1),
+                repeats=int(payload.get("repeats") or 3),
+                startup_timeout_seconds=float(payload.get("startup_timeout_seconds") or 180.0),
+                prompt=str(payload.get("prompt") or "Reply briefly: what is one benefit of local inference?"),
+                max_tokens=int(payload.get("max_tokens") or 32),
+                target_tokens_per_second=target,
+                accuracy_tolerance=tolerance,
+                accuracy_case_tolerance=case_tolerance,
+                retain_accuracy_responses=bool(payload.get("retain_accuracy_responses", False)),
+                kv_precision_search=bool(payload.get("kv_precision_search", True)),
+                ngram_speculation=(
+                    bool(payload["ngram_speculation"])
+                    if "ngram_speculation" in payload and payload.get("ngram_speculation") is not None
+                    else None
+                ),
+                budget_seconds=(
+                    float(payload["budget_seconds"])
+                    if payload.get("budget_seconds") is not None
+                    else None
+                ),
+                cancel_check=cancel_check,
+                operation_id=(str(payload.get("operation_id")) if payload.get("operation_id") else None),
+                progress=progress,
+            )
         if path == "/api/rift/tune":
             return orchestrator.tune_service(
                 service_name=str(payload.get("service") or "chat"),
@@ -1181,7 +1311,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
                 for _ in range(5):
                     try:
                         payload = self.runtime.orchestrator_factory().telemetry_latest()
-                        self.wfile.write(f"event: telemetry\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8"))
+                        self.wfile.write(f"event: telemetry\ndata: {json.dumps(payload, separators=(',', ':'), default=_json_default)}\n\n".encode("utf-8"))
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
                         break
@@ -1279,7 +1409,14 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
                         },
                     )
                     return
-                if self.runtime.is_background_operation(parsed.path):
+                tuning_preview = (
+                    parsed.path.replace(
+                        "/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1
+                    )
+                    == "/api/rift/v2/tuning/runs"
+                    and bool(payload.get("dry_run", False))
+                )
+                if self.runtime.is_background_operation(parsed.path) and not tuning_preview:
                     result = self.runtime.start_background_operation(
                         parsed.path,
                         payload,
@@ -1448,7 +1585,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
         self._send_sse([payload, final])
 
     def _send_sse(self, payloads: list[JsonDict]) -> None:
-        chunks = [f"data: {json.dumps(payload, sort_keys=True)}\n\n" for payload in payloads]
+        chunks = [f"data: {json.dumps(payload, sort_keys=True, default=_json_default)}\n\n" for payload in payloads]
         chunks.append("data: [DONE]\n\n")
         body = "".join(chunks).encode("utf-8")
         self.send_response(HTTPStatus.OK.value)
@@ -1480,7 +1617,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8")) if raw else {}
 
     def _send_json(self, status: HTTPStatus, payload: JsonDict) -> None:
-        body = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+        body = json.dumps(payload, indent=2, sort_keys=True, default=_json_default).encode("utf-8")
         self.send_response(status.value)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))

@@ -9,6 +9,7 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
+import { Route as TuningRouteImport } from './routes/tuning'
 import { Route as SetupRouteImport } from './routes/setup'
 import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as OperationsRouteImport } from './routes/operations'
@@ -21,6 +22,11 @@ import { Route as DeploymentsIndexRouteImport } from './routes/deployments.index
 import { Route as NodesIdRouteImport } from './routes/nodes.$id'
 import { Route as DeploymentsIdRouteImport } from './routes/deployments.$id'
 
+const TuningRoute = TuningRouteImport.update({
+  id: '/tuning',
+  path: '/tuning',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const SetupRoute = SetupRouteImport.update({
   id: '/setup',
   path: '/setup',
@@ -85,6 +91,7 @@ export interface FileRoutesByFullPath {
   '/operations': typeof OperationsRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
+  '/tuning': typeof TuningRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments/': typeof DeploymentsIndexRoute
@@ -96,6 +103,7 @@ export interface FileRoutesByTo {
   '/operations': typeof OperationsRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
+  '/tuning': typeof TuningRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments': typeof DeploymentsIndexRoute
@@ -110,6 +118,7 @@ export interface FileRoutesById {
   '/operations': typeof OperationsRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
+  '/tuning': typeof TuningRoute
   '/deployments/$id': typeof DeploymentsIdRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments/': typeof DeploymentsIndexRoute
@@ -125,6 +134,7 @@ export interface FileRouteTypes {
     | '/operations'
     | '/settings'
     | '/setup'
+    | '/tuning'
     | '/deployments/$id'
     | '/nodes/$id'
     | '/deployments/'
@@ -136,6 +146,7 @@ export interface FileRouteTypes {
     | '/operations'
     | '/settings'
     | '/setup'
+    | '/tuning'
     | '/deployments/$id'
     | '/nodes/$id'
     | '/deployments'
@@ -149,6 +160,7 @@ export interface FileRouteTypes {
     | '/operations'
     | '/settings'
     | '/setup'
+    | '/tuning'
     | '/deployments/$id'
     | '/nodes/$id'
     | '/deployments/'
@@ -163,10 +175,18 @@ export interface RootRouteChildren {
   OperationsRoute: typeof OperationsRoute
   SettingsRoute: typeof SettingsRoute
   SetupRoute: typeof SetupRoute
+  TuningRoute: typeof TuningRoute
 }
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
+    '/tuning': {
+      id: '/tuning'
+      path: '/tuning'
+      fullPath: '/tuning'
+      preLoaderRoute: typeof TuningRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/setup': {
       id: '/setup'
       path: '/setup'
@@ -281,6 +301,7 @@ const rootRouteChildren: RootRouteChildren = {
   OperationsRoute: OperationsRoute,
   SettingsRoute: SettingsRoute,
   SetupRoute: SetupRoute,
+  TuningRoute: TuningRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

@@ -151,6 +151,22 @@ def test_service_accounting_rejects_invalid_rates(tmp_path):
         orchestrator.close()
 
 
+def test_latest_telemetry_ignores_orphaned_sessions_after_service_removal(tmp_path):
+    from rift.orchestrator import RiftOrchestrator
+
+    orchestrator = RiftOrchestrator(root=tmp_path)
+    try:
+        session = orchestrator.telemetry_store.start_session("deleted-service", pid=os.getpid())
+        orchestrator.telemetry_store.record_sample(
+            session["session_id"],
+            {"observed_at": 100.0, "cpu_percent": 12.0},
+        )
+
+        assert orchestrator.telemetry_latest()["samples"] == []
+    finally:
+        orchestrator.close()
+
+
 def test_supervisor_persists_live_samples():
     from rift.telemetry.lifecycle import TelemetrySupervisor
     from rift.telemetry.store import TelemetryStore

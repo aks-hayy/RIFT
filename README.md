@@ -295,11 +295,110 @@ service becomes healthy, using two candidates, one warmup, and three measured
 repetitions per candidate. The baseline remains authoritative when tuning is
 unavailable or a candidate fails.
 
+For autonomous, profile-aware tuning of an already deployed `llama.cpp` service,
+use the profiled command. It keeps the model artifact and weight quantization
+locked. K/V cache precision can be explored only as a bounded, quality-gated
+experiment; it is never changed silently. Context length and concurrency remain
+fixed. Restarts are a reviewed maintenance action, so `--yes` and
+`--allow-restart` are required:
+
+```powershell
+rift tune --service chat --profile speed --dry-run
+rift tune --service chat --profile speed --allow-restart --yes
+rift tune --service chat --profile cost --allow-restart --yes --no-apply
+rift tune profiles
+rift tune status
+rift tune report RUN_ID --json
+```
+
+Speed maximizes measured generated tokens per second while rejecting latency regressions. Cost minimizes GPU joules per request
+and requires usable GPU power telemetry; it is explicitly GPU-only in this
+release. A run writes a durable journal under the RIFT runtime home and reports
+the baseline, every candidate, reliability interval, winning configuration, and
+the reason it contributed to the selected profile. Weight-quantization changes
+remain recommendation-only. K/V precision can be included in the bounded search
+when enabled, but it is quality-screened and only applied if the full promotion
+gate passes. Backend startup,
+HTTP, and quality-probe failures are isolated to the candidate and recorded as
+rejections, so one bad flag cannot crash the tuning transaction.
+
+#### RIFT automatic-tuning results (llama.cpp)
+
+Automatic tuning is easiest to understand as a before-and-after experiment.
+RIFT first runs the model with a deliberately ordinary, conservative
+llama.cpp configuration. It then restarts the service between bounded
+experiments, measures real requests, checks the output-quality suite, and
+re-tests the winner before applying it. The model file and weight
+quantization stay locked, so a speed-up cannot quietly trade away the model.
+
+The fresh verification below used natural-language coding-assistant requests on
+the local workstation GPU. Both models use the same `Q4_K_M` weights,
+8,192-token context, one request stream, and n-gram speculation disabled. Speed
+is generated tokens per second; cost is GPU joules per request (lower is
+better). Every promoted result scored 1.00 on six deterministic quality cases.
+
+![Fresh RIFT llama.cpp profile verification](docs/images/llama-cpp-profiled-tuning-reverification.svg)
+
+| Model/profile | Baseline | Final or best passing measurement | Result |
+| --- | ---: | ---: | --- |
+| Qwen2.5 3B · Speed | 72.6386 tok/s | 81.5624 tok/s | **Promoted: +12.29%** |
+| Qwen2.5 3B · Cost | 44.6906 GPU J/req | 31.4054 GPU J/req | **Promoted: −29.73%** |
+| Qwen2.5 7B · Speed | 32.3785 tok/s | 44.4110 tok/s | **Promoted: +37.16%** |
+| Qwen2.5 7B · Cost | 79.4569 GPU J/req | 78.4110 GPU J/req | Baseline retained |
+
+The Cost profile is an energy experiment, not a one-flag switch. RIFT warms the
+service, runs the same natural-language request repeatedly, integrates GPU
+`power.draw` telemetry from `nvidia-smi`, and reports GPU joules per completed
+request. It also records latency, failures, and process CPU time, so a cheaper
+configuration cannot quietly become unusable.
+The reading is aggregate device power, so a busy shared GPU can add noise; RIFT
+keeps that limitation visible in the evidence.
+
+The bounded llama.cpp search tested these parameter families:
+
+- K/V cache precision: `f16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, selected mixed
+  pairs, and precision-plus-batch combinations.
+- Batching and CPU execution: batch sizes `128/256/512/1024/2048`,
+  micro-batches capped at `128`, and thread/thread-batch values spanning one,
+  half the physical cores, all physical cores, and logical processors.
+- Attention and scheduling: Flash Attention `on/off/auto`, polling and
+  batch-polling values, continuous batching, and parallel slots.
+- Runtime controls: unified KV cache, KV offload, operation offload, repacking,
+  host-memory use, load mode (`auto`, `mmap`, `mlock`, `mmap+mlock`), priority,
+  CPU affinity, and platform-supported NUMA.
+
+RIFT probes the installed llama-server first and includes a parameter family
+only when that binary advertises the flag. Unsupported or startup-failing
+variants are recorded and skipped, so the search stays grounded in the actual
+backend and machine.
+
+The model file, `Q4_K_M` weight quantization, context, concurrency, and GPU
+layer placement were held constant. Every candidate had to start cleanly, pass
+the six-case quality suite, avoid a material latency/CPU regression, and show a
+positive 95% improvement interval. RIFT then re-tested the selected candidate
+before promotion. That final gate is why the 7B cost baseline was retained when
+its apparent 1.32% saving was not statistically conclusive.
+
+The complete evidence, commands, hashes, confidence bounds, candidate
+rejections, and raw runtime report IDs are in
+[the re-verification record](docs/evidence/llama-cpp-profiled-tuning-reverification.md).
+The JSON journals remain under `.rift-runtime/reports/` on the machine that ran
+the experiment.
+
+At present, llama.cpp is the only backend with RIFT's full, tailor-made
+profiled tuning path (including real restarts, GPU-energy measurement, quality
+gates, and rollback). vLLM and the other backends have baseline tuning hooks;
+their deeper backend-specific implementations are next.
+
+Use `--ngram-speculation` or `--no-ngram-speculation` to make the n-gram choice
+explicit when tuning. It remains an opt-in scenario-specific acceleration, not
+part of the general-purpose results above.
+
 ## Focused Commands
 
 ```text
 Core workflow
-  init, start, discover, plan, apply, status, dashboard, stop, doctor
+  init, start, discover, plan, apply, status, dashboard, stop, doctor, tune
 
 Model operations
   rift model recommend|pull|inspect|verify
@@ -309,6 +408,7 @@ Provider operations
 
 Service operations
   rift service benchmark|tune|logs|restart|rollback|gateway
+  rift tune profiles|status|watch|report|cancel
 
 Cluster operations
   rift cluster discover|plan|apply|status|drain|destroy

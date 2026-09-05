@@ -20,6 +20,7 @@ import type {
   EvaluationRun,
   ResourceReport,
   ServiceTelemetryAccounting,
+  TuningRun,
 } from "./types";
 
 export const keys = {
@@ -44,6 +45,9 @@ export const keys = {
   settings: ["rift", "settings"] as const,
   evaluations: (id: string) => ["rift", "evaluations", id] as const,
   operations: ["rift", "operations"] as const,
+  tuningRuns: (service?: string, profile?: string) =>
+    ["rift", "tuning", "runs", service ?? "all", profile ?? "all"] as const,
+  tuningRun: (id: string) => ["rift", "tuning", "run", id] as const,
   telemetryLatest: (service?: string) => ["rift", "telemetry", "latest", service ?? "all"] as const,
   telemetryReports: (service?: string) =>
     ["rift", "telemetry", "reports", service ?? "all"] as const,
@@ -333,6 +337,39 @@ export function useOperations() {
       queryFn: ({ signal }) => rift.listOperations(signal),
       staleTime: 500,
       refetchInterval: 1_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useTuningRuns(options: { service?: string; profile?: "speed" | "cost" } = {}) {
+  return shape(
+    useQuery({
+      queryKey: keys.tuningRuns(options.service, options.profile),
+      queryFn: ({ signal }) => rift.listTuningRuns(options, signal),
+      staleTime: 2_000,
+      refetchInterval: 5_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useActiveTuningRun(runs: TuningRun[] | undefined) {
+  const active = runs?.find((run) => ["QUEUED", "RUNNING"].includes(run.status.toUpperCase()));
+  return useTuningRun(active?.runId);
+}
+
+export function useTuningRun(id: string | undefined) {
+  return shape(
+    useQuery({
+      queryKey: id ? keys.tuningRun(id) : ["rift", "tuning", "run", "none"],
+      queryFn: ({ signal }) => rift.getTuningRun(id!, signal),
+      enabled: !!id,
+      staleTime: 1_000,
+      refetchInterval: (query) => {
+        const status = String(query.state.data?.status ?? "").toUpperCase();
+        return status === "RUNNING" || status === "QUEUED" ? 1_000 : false;
+      },
       retry: false,
     }),
   );

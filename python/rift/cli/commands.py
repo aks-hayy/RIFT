@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any
+import urllib.error
+import urllib.request
+import uuid
 
 from rift.cluster import RiftClusterController, example_emulated_cluster
 from rift.adapters.conformance import BackendConformanceSuite
@@ -18,6 +22,7 @@ from rift.providers import provider_lifecycle_gate
 from rift.rift import RiftEngine
 from rift.rift_yaml import write_yaml
 from rift.runtime_paths import RiftPaths
+from rift.tuning_engine import TuningStore
 
 from .console import RiftConsole
 
@@ -296,22 +301,150 @@ def execute(args: Any, console: RiftConsole) -> int:
         return 0 if result.get("available", True) else 1
 
     if args.command == "tune":
-        result = orchestrator.tune_service(
-            service_name=args.service,
-            config_path=args.config,
-            live=args.live,
-            allow_restart=args.allow_restart,
-            candidate_limit=args.candidate_limit,
-            warmup_runs=args.warmups,
-            repeats=args.repeats,
-            startup_timeout_seconds=args.startup_timeout,
-            prompt=args.prompt,
-            max_tokens=args.max_tokens,
-        )
-        console.render(result, view="benchmark", title="Tuning result")
-        if args.live and not result.get("applied"):
-            return 2 if result.get("required_permission") else 1
-        return 0
+        action = getattr(args, "tune_action", None)
+        if action in {"profiles", "status", "watch", "report", "opportunities"}:
+            if action == "profiles":
+                result = {
+                    "profiles": [
+                        {
+                            "id": "speed",
+                            "objective": "Maximize measured generated tokens per second while rejecting latency regressions and preserving model precision.",
+                            "metric": "median generated tokens/second",
+                        },
+                        {
+                            "id": "cost",
+                            "objective": "Minimize GPU joules per request with latency and CPU guardrails.",
+                            "metric": "GPU joules/request",
+                        },
+                    ]
+                }
+            else:
+                store = TuningStore(orchestrator.rift_dir / "tuning.db")
+                run_id = str(getattr(args, "run_id", None) or "").strip()
+                if action == "watch" and not run_id:
+                    console.error("`rift tune watch` requires a RUN_ID")
+                    return 2
+                if run_id:
+                    result = store.get_run(run_id)
+                    if action == "watch":
+                        deadline = time.time() + 15 * 60
+                        while str(result.get("status") or "").upper() in {"QUEUED", "RUNNING"} and time.time() < deadline:
+                            if not console.json_output:
+                                console.apply_progress(
+                                    "tuning",
+                                    str(result.get("status") or "running"),
+                                    {"run_id": run_id, "profile": result.get("profile")},
+                                )
+                            time.sleep(1.0)
+                            result = store.get_run(run_id)
+                    if action == "opportunities":
+                        result = {
+                            "run_id": run_id,
+                            "opportunities": result.get("opportunities") or [],
+                        }
+                else:
+                    result = {"runs": store.list_runs(limit=50)}
+            console.render(
+                result,
+                view="tuning" if action in {"status", "watch", "report"} else "result",
+                title=f"Tuning {action}",
+            )
+            return 0
+        if action == "cancel":
+            run_id = str(getattr(args, "run_id", None) or "").strip()
+            if not run_id or not args.controller_url:
+                console.error("`rift tune cancel` requires RUN_ID and --controller-url")
+                return 2
+            run = TuningStore(orchestrator.rift_dir / "tuning.db").get_run(run_id)
+            operation_id = str(run.get("operation_id") or "").strip()
+            if not operation_id:
+                console.error("This tuning run has no live controller operation to cancel.")
+                return 2
+            result = _controller_post(
+                args.controller_url,
+                f"/api/rift/v2/operations/{operation_id}/cancel",
+                {"reason": "Cancelled profiled tuning from CLI"},
+            )
+            console.render(result, view="tuning", title="Tuning cancelled")
+            return 0
+        if action in {"apply", "rollback"}:
+            console.error(
+                f"`rift tune {action}` requires the controller API in this release.",
+                hint="Use `rift tune --controller-url http://127.0.0.1:8777 ...` for a persistent run.",
+            )
+            return 2
+        if not args.profile:
+            result = orchestrator.tune_service(
+                service_name=args.service,
+                config_path=args.config,
+                live=args.live,
+                allow_restart=args.allow_restart,
+                candidate_limit=args.candidate_limit,
+                warmup_runs=args.warmups,
+                repeats=args.repeats,
+                startup_timeout_seconds=args.startup_timeout,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+            )
+            console.render(result, view="benchmark", title="Tuning result")
+            if args.live and not result.get("applied"):
+                return 2 if result.get("required_permission") else 1
+            return 0
+        if not args.yes and not args.dry_run:
+            console.warning("No profiled tuning was started. Explicit maintenance confirmation is required.")
+            print("Review the scope, then rerun with `--yes` to permit candidate restarts.")
+            return 2
+        budget_seconds = _parse_budget_seconds(args.budget)
+        if args.detach:
+            if not args.controller_url:
+                console.error(
+                    "--detach requires --controller-url so the run can be persisted by a controller."
+                )
+                return 2
+            result = _submit_profiled_tuning(args, budget_seconds)
+        else:
+            result = orchestrator.profiled_tune_service(
+                service_name=args.service,
+                profile=args.profile,
+                allow_restart=args.allow_restart,
+                no_apply=args.no_apply,
+                candidate_limit=max(1, min(24, args.candidate_limit)),
+                warmup_runs=args.warmups,
+                repeats=args.repeats,
+                startup_timeout_seconds=args.startup_timeout,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                budget_seconds=budget_seconds,
+                target_tokens_per_second=args.target_tokens_per_second,
+                accuracy_tolerance=args.accuracy_tolerance,
+                accuracy_case_tolerance=args.accuracy_case_tolerance,
+                retain_accuracy_responses=args.retain_accuracy_responses,
+                kv_precision_search=args.kv_precision_search,
+                ngram_speculation=args.ngram_speculation,
+            ) if not args.dry_run else orchestrator.profiled_tune_service(
+                service_name=args.service,
+                profile=args.profile,
+                allow_restart=False,
+                dry_run=True,
+                write=False,
+                candidate_limit=max(1, min(24, args.candidate_limit)),
+                warmup_runs=args.warmups,
+                repeats=args.repeats,
+                startup_timeout_seconds=args.startup_timeout,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                budget_seconds=budget_seconds,
+                target_tokens_per_second=args.target_tokens_per_second,
+                accuracy_tolerance=args.accuracy_tolerance,
+                accuracy_case_tolerance=args.accuracy_case_tolerance,
+                retain_accuracy_responses=args.retain_accuracy_responses,
+                kv_precision_search=args.kv_precision_search,
+                ngram_speculation=args.ngram_speculation,
+            )
+        console.render(result, view="tuning", title="Profiled tuning result")
+        if result.get("required_permission"):
+            return 2
+        return 0 if result.get("available", True) else 1
 
     if args.command == "stop":
         if not args.yes:
@@ -354,6 +487,76 @@ def execute(args: Any, console: RiftConsole) -> int:
     if args.command == "system":
         return _system(args, console, orchestrator)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _parse_budget_seconds(value: str | None) -> float:
+    """Parse the human-facing tune budget (e.g. ``60m`` or ``1h``)."""
+
+    raw = str(value or "60m").strip().lower()
+    units = {"s": 1.0, "m": 60.0, "h": 3600.0}
+    suffix = raw[-1:] if raw else "m"
+    number = raw[:-1] if suffix in units else raw
+    try:
+        seconds = float(number) * units.get(suffix, 60.0)
+    except ValueError as exc:
+        raise ValueError("budget must be a positive duration such as 30s, 60m, or 1h") from exc
+    if seconds <= 0.0:
+        raise ValueError("budget must be positive")
+    return seconds
+
+
+def _submit_profiled_tuning(args: Any, budget_seconds: float) -> dict[str, Any]:
+    base = str(args.controller_url or "").rstrip("/")
+    payload = {
+        "service": args.service,
+        "profile": args.profile,
+        "allow_restart": bool(args.allow_restart),
+        "no_apply": bool(args.no_apply),
+        "dry_run": bool(args.dry_run),
+        "candidate_limit": max(1, min(24, args.candidate_limit)),
+        "warmup_runs": args.warmups,
+        "repeats": args.repeats,
+        "startup_timeout_seconds": args.startup_timeout,
+        "prompt": args.prompt,
+        "max_tokens": args.max_tokens,
+        "budget_seconds": budget_seconds,
+        "target_tokens_per_second": args.target_tokens_per_second,
+        "accuracy_tolerance": args.accuracy_tolerance,
+        "accuracy_case_tolerance": args.accuracy_case_tolerance,
+        "retain_accuracy_responses": args.retain_accuracy_responses,
+        "kv_precision_search": args.kv_precision_search,
+        "ngram_speculation": args.ngram_speculation,
+    }
+    return _controller_post(
+        base,
+        "/api/rift/v2/tuning/runs",
+        payload,
+        request_id=f"rift-tune-{uuid.uuid4().hex}",
+    )
+
+
+def _controller_post(
+    controller_url: str,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    base = str(controller_url or "").rstrip("/")
+    request = urllib.request.Request(
+        f"{base}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            **({"X-Request-ID": request_id} if request_id else {}),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"could not call profiled tuning controller at {base}: {exc}") from exc
 
 
 def _select_apply_plan(

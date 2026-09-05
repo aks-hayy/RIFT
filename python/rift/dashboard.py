@@ -420,6 +420,7 @@ def _create_static_server(host: str, port: int, control_api_url: str) -> Threadi
         "/nodes": "/nodes.html",
         "/models": "/models.html",
         "/operations": "/operations.html",
+        "/tuning": "/tuning.html",
         "/settings": "/settings.html",
     }
 

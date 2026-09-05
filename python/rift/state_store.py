@@ -19,6 +19,16 @@ JsonDict = dict[str, Any]
 _MIRROR_WRITE_LOCK = threading.Lock()
 
 
+def _json_default(value: Any) -> Any:
+    """Encode runtime capability values in the JSON state representations."""
+
+    if isinstance(value, set):
+        return sorted(value, key=str)
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 class StateConflictError(RuntimeError):
     """Raised when a caller writes against an obsolete state revision."""
 
@@ -50,7 +60,7 @@ class StateStore:
             ).fetchone()
             if row is None:
                 state = self._read_legacy()
-                payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
+                payload = json.dumps(state, sort_keys=True, separators=(",", ":"), default=_json_default)
                 connection.execute(
                     "INSERT INTO control_state(id, revision, updated_unix_seconds, payload) VALUES(1, 1, ?, ?)",
                     (time.time(), payload),
@@ -68,7 +78,7 @@ class StateStore:
     def write(self, state: JsonDict, *, expected_revision: int | None = None) -> int:
         if not isinstance(state, dict):
             raise ValueError("RIFT state must be an object")
-        payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        payload = json.dumps(state, sort_keys=True, separators=(",", ":"), default=_json_default)
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -205,7 +215,7 @@ class StateStore:
             temporary = self.legacy_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
             try:
                 with temporary.open("w", encoding="utf-8") as handle:
-                    handle.write(json.dumps(mirror, indent=2, sort_keys=True))
+                    handle.write(json.dumps(mirror, indent=2, sort_keys=True, default=_json_default))
                     handle.flush()
                     os.fsync(handle.fileno())
                 last_error: OSError | None = None

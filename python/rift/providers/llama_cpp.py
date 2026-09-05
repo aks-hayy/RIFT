@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import platform
 from pathlib import Path
@@ -16,12 +17,14 @@ from urllib.request import Request, urlopen
 import zipfile
 
 from ..adapters.contracts import ADAPTER_API_VERSION, AdapterManifest, BackendCapability
+from ..tuning_engine import TuningContract, generate_llama_candidates
 from .base import ProviderLifecycleMixin
 
 JsonDict = dict[str, Any]
 
 
 class LlamaCppProvider(ProviderLifecycleMixin):
+    _capability_cache: dict[tuple[str, str], JsonDict] = {}
     name = "llama.cpp"
     release_api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
     release_history_api_url = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=20"
@@ -527,10 +530,17 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             or self.detect(search_root=tuning.get("search_root")).get("executable")
             or "llama-server"
         )
+        capabilities = self.probe_tuning_capabilities(str(executable))
+        supported_flags = {str(item).lower().replace("_", "-") for item in capabilities.get("flags", ())}
+
+        def supports(name: str) -> bool:
+            return name in supported_flags or not capabilities.get("probed", False)
         gpu_layers = int(tuning.get("gpu_layers", 999))
         batch = int(tuning.get("batch", 512))
         ubatch = int(tuning.get("ubatch", 128))
         threads = int(tuning.get("threads", max(1, (os.cpu_count() or 4) // 2)))
+        threads_batch = int(tuning.get("threads_batch", threads))
+        parallel = int(tuning.get("parallel", concurrency))
         args = [
             str(executable),
             "-m",
@@ -549,11 +559,80 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             str(ubatch),
             "--threads",
             str(threads),
+            "--threads-batch",
+            str(threads_batch),
+            "--parallel",
+            str(parallel),
         ]
-        if bool(tuning.get("mlock", False)):
+        if capabilities.get("probed", False):
+            for option in ("--threads-batch", "--parallel"):
+                if option not in supported_flags:
+                    while option in args:
+                        index = args.index(option)
+                        del args[index : index + 2]
+        if "flash_attn" in tuning and supports("flash-attn"):
+            args.extend(["--flash-attn", str(tuning["flash_attn"])])
+        if "poll" in tuning and supports("poll"):
+            args.extend(["--poll", str(int(tuning["poll"]))])
+        if "poll_batch" in tuning and supports("poll-batch"):
+            args.extend(["--poll-batch", str(int(tuning["poll_batch"]))])
+        if "cache_type_k" in tuning and supports("cache-type-k"):
+            args.extend(["--cache-type-k", str(tuning["cache_type_k"])])
+        if "cache_type_v" in tuning and supports("cache-type-v"):
+            args.extend(["--cache-type-v", str(tuning["cache_type_v"])])
+        if "continuous_batching" in tuning and supports("cont-batching"):
+            args.append("--cont-batching" if bool(tuning["continuous_batching"]) else "--no-cont-batching")
+        if bool(tuning.get("mlock", False)) and supports("mlock"):
             args.append("--mlock")
-        if bool(tuning.get("no_mmap", False)):
+        if bool(tuning.get("no_mmap", False)) and supports("no-mmap"):
             args.append("--no-mmap")
+        def boolean_flag(key: str, positive: str, negative: str | None = None) -> None:
+            if key not in tuning or not supports(positive):
+                return
+            value = bool(tuning[key])
+            flag = positive if value else negative
+            if flag:
+                args.append("--" + flag)
+
+        boolean_flag("kv_unified", "kv-unified", "no-kv-unified")
+        boolean_flag("kv_offload", "kv-offload", "no-kv-offload")
+        boolean_flag("no_host", "no-host", None)
+        boolean_flag("repack", "repack", "no-repack")
+        boolean_flag("op_offload", "op-offload", "no-op-offload")
+        for key, flag in (("load_mode", "load-mode"), ("prio", "prio"),
+                          ("cpu_mask", "cpu-mask"), ("cpu_range", "cpu-range"),
+                          ("cpu_strict", "cpu-strict"), ("numa", "numa"),
+                          ("device", "device"), ("tensor_split", "tensor-split"),
+                          ("split_mode", "split-mode"), ("main_gpu", "main-gpu"),
+                          ("n_cpu_ffn", "n-cpu-ffn"), ("fit", "fit"),
+                          ("fit_target", "fit-target"), ("fit_ctx", "fit-ctx")):
+            if key in tuning and tuning[key] is not None and supports(flag):
+                args.extend(["--" + flag, str(tuning[key])])
+        for key, flag in (
+            ("spec_type", "spec-type"),
+            ("spec_draft_model", "spec-draft-model"),
+            ("spec_draft_n_max", "spec-draft-n-max"),
+            ("spec_draft_n_min", "spec-draft-n-min"),
+            ("spec_draft_p_min", "spec-draft-p-min"),
+            ("spec_draft_p_split", "spec-draft-p-split"),
+            ("spec_draft_ngl", "spec-draft-ngl"),
+            ("spec_draft_device", "spec-draft-device"),
+            ("spec_ngram_mod_n_min", "spec-ngram-mod-n-min"),
+            ("spec_ngram_mod_n_max", "spec-ngram-mod-n-max"),
+            ("spec_ngram_mod_n_match", "spec-ngram-mod-n-match"),
+        ):
+            # ``ngram_speculation`` is a user-facing switch, not a llama.cpp
+            # flag.  False must remove inherited speculative arguments from a
+            # previously optimized launch plan; draft-model speculation remains
+            # independently controllable through its explicit draft settings.
+            if (
+                tuning.get("ngram_speculation") is False
+                and (key == "spec_type" and tuning.get(key) == "ngram-mod"
+                     or key.startswith("spec_ngram_mod_"))
+            ):
+                continue
+            if key in tuning and tuning[key] is not None and supports(flag):
+                args.extend(["--" + flag, str(tuning[key])])
         return {
             "backend": self.name,
             "model_path": str(model_path),
@@ -570,11 +649,120 @@ class LlamaCppProvider(ProviderLifecycleMixin):
                 "batch": batch,
                 "ubatch": ubatch,
                 "threads": threads,
+                "threads_batch": threads_batch,
+                "parallel": parallel,
+                "flash_attn": tuning.get("flash_attn", "auto"),
+                "poll": tuning.get("poll"),
+                "poll_batch": tuning.get("poll_batch"),
+                "cache_type_k": tuning.get("cache_type_k"),
+                "cache_type_v": tuning.get("cache_type_v"),
+                "continuous_batching": tuning.get("continuous_batching"),
                 "mlock": bool(tuning.get("mlock", False)),
                 "no_mmap": bool(tuning.get("no_mmap", False)),
+                "kv_unified": tuning.get("kv_unified"),
+                "kv_offload": tuning.get("kv_offload"),
+                "no_host": tuning.get("no_host"),
+                "repack": tuning.get("repack"),
+                "load_mode": tuning.get("load_mode"),
+                "op_offload": tuning.get("op_offload"),
+                "prio": tuning.get("prio"),
+                "cpu_mask": tuning.get("cpu_mask"),
+                "cpu_range": tuning.get("cpu_range"),
+                "cpu_strict": tuning.get("cpu_strict"),
+                "numa": tuning.get("numa"),
+                "device": tuning.get("device"),
+                "tensor_split": tuning.get("tensor_split"),
+                "split_mode": tuning.get("split_mode"),
+                "main_gpu": tuning.get("main_gpu"),
+                "n_cpu_ffn": tuning.get("n_cpu_ffn"),
+                "fit": tuning.get("fit"),
+                "fit_target": tuning.get("fit_target"),
+                "fit_ctx": tuning.get("fit_ctx"),
+                "spec_type": tuning.get("spec_type"),
+                "spec_draft_model": tuning.get("spec_draft_model"),
+                "spec_draft_n_max": tuning.get("spec_draft_n_max"),
+                "spec_draft_n_min": tuning.get("spec_draft_n_min"),
+                "spec_draft_p_min": tuning.get("spec_draft_p_min"),
+                "spec_draft_p_split": tuning.get("spec_draft_p_split"),
+                "spec_draft_ngl": tuning.get("spec_draft_ngl"),
+                "spec_draft_device": tuning.get("spec_draft_device"),
+                "spec_ngram_mod_n_min": tuning.get("spec_ngram_mod_n_min"),
+                "spec_ngram_mod_n_max": tuning.get("spec_ngram_mod_n_max"),
+                "spec_ngram_mod_n_match": tuning.get("spec_ngram_mod_n_match"),
+                "ngram_speculation": bool(tuning.get("ngram_speculation", True)),
                 "search_root": tuning.get("search_root"),
             },
+            "capabilities": capabilities,
         }
+
+    @staticmethod
+    def _parse_tuning_capabilities(help_text: str) -> JsonDict:
+        """Parse llama-server help deterministically into launch capabilities."""
+        flags: set[str] = set()
+        cache_types: dict[str, list[str]] = {}
+        known_types = ("f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q5_k", "q5_k_m", "q5_k_s")
+        pending_cache: str | None = None
+        for line in str(help_text or "").splitlines():
+            names = re.findall(r"(?<![\w-])--([a-zA-Z][a-zA-Z0-9-]*)", line)
+            for name in names:
+                flags.add(name.lower())
+            option_match = re.search(r"--cache-type-([kv])\b", line.lower())
+            if option_match:
+                pending_cache = f"cache_type_{option_match.group(1)}"
+            elif names:
+                pending_cache = None
+            for suffix in ("k", "v"):
+                if f"cache-type-{suffix}" in line.lower():
+                    values = [value for value in known_types if re.search(rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])", line.lower())]
+                    if values:
+                        cache_types[f"cache_type_{suffix}"] = values
+                    elif f"cache-type-{suffix}" in flags:
+                        cache_types[f"cache_type_{suffix}"] = ["f16"]
+            if pending_cache and "cache-type-" not in line.lower():
+                values = [value for value in known_types if re.search(rf"(?<![a-z0-9]){re.escape(value)}(?![a-z0-9])", line.lower())]
+                if values:
+                    cache_types[pending_cache] = values
+                    # The option declaration often contains only its default
+                    # (f16), followed by an ``allowed values`` continuation.
+                    # Consume the continuation and clear the pending key so a
+                    # later default/help line cannot overwrite the full list.
+                    if len(values) > 1 or "allowed values" in line.lower():
+                        pending_cache = None
+        return {
+            "flags": flags,
+            "cache_types": cache_types,
+            **{key: list(values) for key, values in cache_types.items()},
+        }
+
+    @classmethod
+    def probe_tuning_capabilities(cls, executable: str) -> JsonDict:
+        """Probe one exact executable, caching by path identity/version metadata."""
+        path = str(executable)
+        try:
+            stat = Path(path).stat()
+            identity = f"{stat.st_mtime_ns}:{stat.st_size}"
+        except OSError:
+            identity = "missing"
+        key = (path, identity)
+        if key in cls._capability_cache:
+            return copy.deepcopy(cls._capability_cache[key])
+        try:
+            result = subprocess.run([path, "--help"], capture_output=True, text=True, timeout=5, check=False)
+            text = (result.stdout or "") + "\n" + (result.stderr or "")
+            if result.returncode != 0 and not text.strip():
+                raise OSError(f"help probe exited {result.returncode}")
+            capabilities = cls._parse_tuning_capabilities(text)
+            capabilities["probed"] = True
+            capabilities["executable"] = path
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            capabilities = {
+                "flags": {"batch-size", "ubatch-size", "threads", "threads-batch", "parallel", "flash-attn", "poll", "poll-batch", "cache-type-k", "cache-type-v", "cont-batching", "mlock", "no-mmap", "kv-unified", "no-kv-unified", "kv-offload", "no-kv-offload", "no-host", "repack", "no-repack", "load-mode", "op-offload", "no-op-offload", "prio", "cpu-mask", "cpu-range", "cpu-strict", "numa", "device", "tensor-split"},
+                "cache_types": {}, "cache_type_k": list(("f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q5_k", "q5_k_m", "q5_k_s")),
+                "cache_type_v": list(("f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1", "q5_k", "q5_k_m", "q5_k_s")),
+                "probed": False, "executable": path,
+            }
+        cls._capability_cache[key] = copy.deepcopy(capabilities)
+        return copy.deepcopy(capabilities)
 
     def launch(self, launch_plan: JsonDict, *, log_path: str | None = None) -> JsonDict:
         args = [str(arg) for arg in launch_plan.get("command") or []]
@@ -639,6 +827,9 @@ class LlamaCppProvider(ProviderLifecycleMixin):
         prompt: str,
         max_tokens: int,
         timeout_seconds: float = 60.0,
+        seed: int | None = None,
+        temperature: float | None = None,
+        ignore_eos: bool = False,
     ) -> JsonDict:
         payload = {
             "model": "rift-managed",
@@ -646,6 +837,12 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if seed is not None:
+            payload["seed"] = int(seed)
+        if temperature is not None:
+            payload["temperature"] = float(temperature)
+        if ignore_eos:
+            payload["ignore_eos"] = True
         data = json.dumps(payload).encode("utf-8")
         request = Request(
             f"{base_url.rstrip('/')}/v1/chat/completions",
@@ -696,7 +893,27 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             "time_to_first_token_seconds_estimate": first_token_latency,
             "backend_timings": timings,
             "response_preview": raw[:1000],
+            "response_text": self._response_text(parsed),
+            "text": self._response_text(parsed),
+            "finish_reason": self._finish_reason(parsed),
         }
+
+    @staticmethod
+    def _response_text(payload: JsonDict) -> str:
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return ""
+        choice = choices[0]
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else choice
+        return str(message.get("content") or message.get("text") or "")
+
+    @staticmethod
+    def _finish_reason(payload: JsonDict) -> str | None:
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            value = choices[0].get("finish_reason")
+            return str(value) if value is not None else None
+        return None
 
     def _count_generated_tokens(self, raw: str) -> int:
         try:
@@ -714,26 +931,63 @@ class LlamaCppProvider(ProviderLifecycleMixin):
                 text = str(message.get("content") or "")
         return max(1, len(re.findall(r"\S+", text))) if text else 0
 
-    def tune_candidates(self, *, launch_plan: JsonDict, hardware: JsonDict) -> list[JsonDict]:
+    def tuning_space(
+        self,
+        *,
+        launch_plan: JsonDict,
+        hardware: JsonDict,
+        contract: JsonDict | TuningContract | None = None,
+    ) -> list[JsonDict]:
         baseline = dict(launch_plan.get("tuning") or {})
-        total_vram = int(hardware.get("total_vram_bytes") or 0)
-        batches = [256, 512, 768] if total_vram <= 10 * 1024**3 else [512, 1024, 1536]
-        candidates = []
-        for batch in batches:
-            candidate = dict(baseline)
-            candidate["batch"] = batch
-            candidate["ubatch"] = min(int(candidate.get("ubatch", 128)), batch)
-            candidates.append(candidate)
-        cpu_threads = os.cpu_count() or 4
-        for threads in sorted({max(1, cpu_threads // 4), max(1, cpu_threads // 2), cpu_threads}):
-            candidate = dict(baseline)
-            candidate["threads"] = threads
-            candidates.append(candidate)
-        unique: list[JsonDict] = []
-        seen = set()
-        for candidate in candidates:
-            key = tuple(sorted(candidate.items()))
-            if key not in seen:
-                seen.add(key)
-                unique.append(candidate)
-        return unique
+        serving = launch_plan.get("serving") or {}
+        serving_context = int(
+            launch_plan.get("context_length")
+            or serving.get("context_length")
+            or 4096
+        )
+        concurrency = int(launch_plan.get("concurrency") or 1)
+        model_path = str(launch_plan.get("model_path") or "model.gguf")
+        if isinstance(contract, TuningContract):
+            resolved_contract = contract
+        else:
+            contract_value = dict(contract or {})
+            contract_value.update(
+                {
+                    "service": str(contract_value.get("service") or "unknown"),
+                    "profile": str(contract_value.get("profile") or "speed"),
+                    "model_path": str(contract_value.get("model_path") or model_path),
+                    "context_length": int(contract_value.get("context_length") or serving_context),
+                    "concurrency": int(contract_value.get("concurrency") or concurrency),
+                }
+            )
+            for key in ("model_sha256", "weight_quantization", "cache_type_k", "cache_type_v"):
+                if contract_value.get(key) is None:
+                    contract_value.pop(key, None)
+            resolved_contract = TuningContract.from_mapping(contract_value)
+        executable = str(baseline.get("executable") or launch_plan.get("executable") or "")
+        if not executable:
+            search_root = str(
+                baseline.get("search_root")
+                or launch_plan.get("search_root")
+                or ""
+            )
+            if search_root:
+                detected = self.detect(search_root=search_root)
+                executable = str(detected.get("executable") or "")
+        executable = executable or "llama-server"
+        capabilities = launch_plan.get("capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = self.probe_tuning_capabilities(executable)
+        generation_capabilities = capabilities if capabilities.get("probed", False) else None
+        candidates = generate_llama_candidates(
+            baseline=baseline,
+            contract=resolved_contract,
+            physical_cores=max(1, int(hardware.get("physical_cores") or (os.cpu_count() or 4))),
+            logical_processors=max(1, int(hardware.get("logical_processors") or (os.cpu_count() or 4))),
+            total_vram_bytes=int(hardware.get("total_vram_bytes") or 0),
+            capabilities=generation_capabilities,
+        )
+        return candidates
+
+    def tune_candidates(self, *, launch_plan: JsonDict, hardware: JsonDict) -> list[JsonDict]:
+        return self.tuning_space(launch_plan=launch_plan, hardware=hardware)

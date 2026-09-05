@@ -510,6 +510,64 @@ class RiftConsole:
         if payload.get("report_path"):
             print(self._dim(f"Report: {payload['report_path']}"))
 
+    def _render_tuning(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "Profiled tuning result")
+        profile = payload.get("profile") or "unknown"
+        outcome = payload.get("outcome") or payload.get("status") or "unknown"
+        self._key_values(
+            [
+                ("Profile", profile),
+                ("Outcome", outcome),
+                ("Applied", "yes" if payload.get("applied") else "no — baseline kept"),
+                ("Run ID", payload.get("run_id") or "-"),
+            ]
+        )
+        if payload.get("decision"):
+            print()
+            print(self._paint("Decision", "38;5;39;1"))
+            print(str(payload["decision"]))
+        winner = payload.get("winner") or {}
+        config = winner.get("config") if isinstance(winner, dict) else None
+        if isinstance(config, dict):
+            print()
+            print(self._paint("Winning configuration", "38;5;39;1"))
+            self._key_values([(str(key), self._format(value)) for key, value in sorted(config.items())])
+        candidates = payload.get("candidates") or []
+        if isinstance(candidates, list) and candidates:
+            print()
+            rows = []
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                measurement = item.get("measurement") or {}
+                metric_value = (
+                    measurement.get("tokens_per_second")
+                    if str(profile).lower() == "speed"
+                    else measurement.get("gpu_joules_per_request")
+                )
+                rows.append(
+                    [
+                        item.get("index", "-"),
+                        item.get("status", "-"),
+                        self._format(metric_value or "-"),
+                        self._format(item.get("improvement_interval") or "-"),
+                    ]
+                )
+            self._table(["#", "STATUS", "METRIC", "IMPROVEMENT INTERVAL"], rows)
+        opportunities = payload.get("opportunities") or []
+        if opportunities:
+            print()
+            print(self._paint("Further improvement · recommendation only", "38;5;220;1"))
+            for opportunity in opportunities:
+                if not isinstance(opportunity, dict):
+                    continue
+                print(f"  {opportunity.get('title') or opportunity.get('kind') or 'option'}: {opportunity.get('warning') or 'not applied'}")
+        if payload.get("reason"):
+            print()
+            self._bullets("Reason", [payload["reason"]])
+        if payload.get("report_path"):
+            print(self._dim(f"Report: {payload['report_path']}"))
+
     def _heading(self, text: str) -> None:
         print()
         print(self._paint(f"// {text.upper()}", "38;5;51;1"))

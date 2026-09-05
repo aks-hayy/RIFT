@@ -1,4 +1,4 @@
-import { cp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
@@ -8,6 +8,7 @@ const uiRoot = resolve(scriptDir, "..");
 const clientRoot = resolve(uiRoot, "dist", "client");
 const serverBundle = resolve(uiRoot, "dist", "server", "server.js");
 const staticRoot = resolve(uiRoot, "..", "python", "rift", "web", "static");
+const richDistRoot = resolve(staticRoot, "_rich", "dist");
 
 const routes = [
     { url: "/", filename: "index.html" },
@@ -16,8 +17,42 @@ const routes = [
     { url: "/nodes", filename: "nodes.html" },
     { url: "/models", filename: "models.html" },
     { url: "/operations?tab=operations", filename: "operations.html" },
+    { url: "/tuning", filename: "tuning.html" },
     { url: "/settings?tab=controller", filename: "settings.html" },
 ];
+
+async function sanitizeServerArtifacts() {
+    const serverRoot = join(richDistRoot, "server");
+
+    async function visit(directory) {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+            const entryPath = join(directory, entry.name);
+            if (entry.isDirectory()) {
+                await visit(entryPath);
+                continue;
+            }
+            if (!entry.name.endsWith(".js"))
+                continue;
+
+            const source = await readFile(entryPath, "utf8");
+            let sanitized = source.replace(/[ \t]+(?=\r?\n)/g, "");
+            if (entry.name.startsWith("_tanstack-start-manifest_")) {
+                // TanStack embeds absolute source paths in the SSR route
+                // manifest. They are useful during local development but would
+                // leak a contributor's username and checkout location from the
+                // packaged dashboard. Keep the route-relative portion instead.
+                sanitized = sanitized.replace(
+                    /filePath:\s*"[^"]*\/(ui\/src\/[^\"]+)"/g,
+                    'filePath: "$1"',
+                );
+            }
+            if (sanitized !== source)
+                await writeFile(entryPath, sanitized, "utf8");
+        }
+    }
+
+    await visit(serverRoot);
+}
 
 async function main() {
     const { default: app } = await import(pathToFileURL(serverBundle).href);
@@ -29,6 +64,19 @@ async function main() {
     }
     await cp(join(clientRoot, "assets"), join(staticRoot, "assets"), { recursive: true });
     await cp(join(clientRoot, "rift-mark.svg"), join(staticRoot, "rift-mark.svg"));
+
+    // The dashboard launcher prefers the server-rendered bundle when Node.js is
+    // available. Keep that packaged path in lockstep with the canonical build so
+    // both UI delivery modes expose the same controls and behavior.
+    await rm(richDistRoot, { recursive: true, force: true });
+    await mkdir(richDistRoot, { recursive: true });
+    await cp(join(uiRoot, "dist", "client"), join(richDistRoot, "client"), {
+        recursive: true,
+    });
+    await cp(join(uiRoot, "dist", "server"), join(richDistRoot, "server"), {
+        recursive: true,
+    });
+    await sanitizeServerArtifacts();
 
     for (const route of routes) {
         const response = await app.fetch(new Request(`http://127.0.0.1:8765${route.url}`), {}, {});

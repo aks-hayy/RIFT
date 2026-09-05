@@ -37,6 +37,9 @@ import type {
   TelemetrySample,
   TelemetrySession,
   UseCase,
+  TuningRun,
+  TuningProfile,
+  TuningOpportunity,
 } from "./types";
 import {
   applyRequest,
@@ -1281,6 +1284,105 @@ function mapOperationRecord(value: unknown): OperationRecord {
   };
 }
 
+function mapTuningOpportunity(value: unknown): TuningOpportunity {
+  const raw = object(value);
+  return {
+    id: text(raw.id, "opportunity"),
+    kind: text(raw.kind, "unknown"),
+    status: "recommendation_only",
+    tested: false,
+    title: text(raw.title, "Further improvement opportunity"),
+    warning: text(
+      raw.warning,
+      "This option is recommendation-only and was not selected by autonomous tuning.",
+    ),
+    profile: text(raw.profile) as TuningOpportunity["profile"],
+    lockedValue: raw.locked_value,
+    lockedValues: object(raw.locked_values),
+  };
+}
+
+function mapTuningRun(value: unknown): TuningRun {
+  const raw = object(value);
+  const profile = text(raw.profile, "speed").toLowerCase() as TuningProfile;
+  const target = raw.target && typeof raw.target === "object" ? object(raw.target) : null;
+  const accuracy = raw.accuracy && typeof raw.accuracy === "object" ? object(raw.accuracy) : null;
+  return {
+    runId: text(raw.run_id, text(raw.runId, "unknown")),
+    service: text(raw.service, "unknown"),
+    profile: profile === "cost" ? "cost" : "speed",
+    backend: text(raw.backend, "llama.cpp"),
+    status: text(raw.status, "UNKNOWN"),
+    outcome: text(raw.outcome) ? (text(raw.outcome) as TuningRun["outcome"]) : undefined,
+    applied: bool(raw.applied),
+    createdAt: iso(raw.created ?? raw.created_unix_seconds),
+    updatedAt:
+      raw.updated || raw.updated_unix_seconds
+        ? iso(raw.updated ?? raw.updated_unix_seconds)
+        : undefined,
+    baseline: object(raw.baseline),
+    winner: raw.winner && typeof raw.winner === "object" ? object(raw.winner) : null,
+    winnerLaunchPlan: object(raw.winner_launch_plan),
+    selection: object(raw.selection),
+    precisionLocks: object(raw.precision_locks),
+    candidates: list(raw.candidates).map((item) => object(item)),
+    opportunities: list(raw.opportunities).map(mapTuningOpportunity),
+    decision: text(raw.decision) || undefined,
+    reason: text(raw.reason) || undefined,
+    reportPath: text(raw.report_path) || undefined,
+    operationId: text(raw.operation_id) || undefined,
+    error: text(raw.error) || undefined,
+    events: list(raw.events).map((event) => {
+      const item = object(event);
+      return {
+        eventId: text(item.event_id) || undefined,
+        stage: text(item.stage, "update"),
+        message: text(item.message, "Tuning update"),
+        percent: typeof item.percent === "number" ? item.percent : null,
+        createdAt: item.created ? iso(item.created) : undefined,
+        details: object(item.details),
+      };
+    }),
+    target: target
+      ? {
+          value: typeof target.value === "number" ? target.value : undefined,
+          reached: typeof target.reached === "boolean" ? target.reached : undefined,
+          confidenceLowerBound:
+            typeof target.confidence_lower_bound === "number"
+              ? target.confidence_lower_bound
+              : null,
+          reason: text(target.reason) || undefined,
+        }
+      : undefined,
+    accuracy: accuracy
+      ? {
+          passed: typeof accuracy.passed === "boolean" ? accuracy.passed : undefined,
+          aggregateScore:
+            typeof accuracy.aggregate_score === "number" ? accuracy.aggregate_score : null,
+          worstCaseScore:
+            typeof accuracy.worst_case_score === "number" ? accuracy.worst_case_score : null,
+          tolerance: typeof accuracy.tolerance === "number" ? accuracy.tolerance : undefined,
+          caseTolerance:
+            typeof accuracy.case_tolerance === "number" ? accuracy.case_tolerance : undefined,
+        }
+      : undefined,
+    kvPrecisionSearch:
+      typeof raw.kv_precision_search === "boolean" ? raw.kv_precision_search : undefined,
+    rejected: list(raw.rejected).map((item) => {
+      const value = object(item);
+      return {
+        candidate: object(value.candidate),
+        rejectionReason: text(value.rejection_reason) || undefined,
+        reason: text(value.reason) || undefined,
+      };
+    }),
+    applyState:
+      raw.apply_state && typeof raw.apply_state === "object"
+        ? (object(raw.apply_state) as TuningRun["applyState"])
+        : undefined,
+  };
+}
+
 async function waitForOperation(operationId: string): Promise<JsonObject> {
   const deadline = Date.now() + 15 * 60_000;
   while (Date.now() < deadline) {
@@ -1582,6 +1684,73 @@ export const rift = {
     const payload = await req<JsonObject>("GET", "/v2/operations", undefined, signal);
     return list(payload.operations).map(mapOperationRecord);
   },
+  tuningProfiles: async (signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>("GET", "/v2/tuning/profiles", undefined, signal),
+  listTuningRuns: async (
+    options: { service?: string; profile?: TuningProfile; limit?: number } = {},
+    signal?: AbortSignal,
+  ): Promise<TuningRun[]> => {
+    const params = new URLSearchParams();
+    if (options.service) params.set("service", options.service);
+    if (options.profile) params.set("profile", options.profile);
+    if (options.limit) params.set("limit", String(options.limit));
+    const suffix = params.toString() ? `?${params.toString()}` : "";
+    const payload = await req<JsonObject>("GET", `/v2/tuning/runs${suffix}`, undefined, signal);
+    return list(payload.runs).map(mapTuningRun);
+  },
+  getTuningRun: async (runId: string, signal?: AbortSignal): Promise<TuningRun> =>
+    mapTuningRun(
+      await req<JsonObject>(
+        "GET",
+        `/v2/tuning/runs/${encodeURIComponent(runId)}`,
+        undefined,
+        signal,
+      ),
+    ),
+  startTuning: async (
+    service: string,
+    profile: TuningProfile,
+    options: {
+      allowRestart: boolean;
+      noApply?: boolean;
+      candidateLimit?: number;
+      warmupRuns?: number;
+      repeats?: number;
+      budgetSeconds?: number;
+      dryRun?: boolean;
+      startupTimeoutSeconds?: number;
+      prompt?: string;
+      maxTokens?: number;
+      targetTokensPerSecond?: number;
+      accuracyTolerance?: number;
+      accuracyCaseTolerance?: number;
+      retainAccuracyResponses?: boolean;
+      kvPrecisionSearch?: boolean;
+      ngramSpeculation?: boolean | null;
+    },
+  ): Promise<JsonObject> =>
+    req<JsonObject>("POST", "/v2/tuning/runs", {
+      service,
+      profile,
+      allow_restart: options.allowRestart,
+      no_apply: options.noApply ?? false,
+      candidate_limit: options.candidateLimit ?? 24,
+      warmup_runs: options.warmupRuns ?? 1,
+      repeats: options.repeats ?? 3,
+      budget_seconds: options.budgetSeconds,
+      dry_run: options.dryRun ?? false,
+      startup_timeout_seconds: options.startupTimeoutSeconds ?? 180,
+      prompt: options.prompt,
+      max_tokens: options.maxTokens ?? 32,
+      target_tokens_per_second: options.targetTokensPerSecond ?? 100,
+      accuracy_tolerance: options.accuracyTolerance ?? 0.05,
+      accuracy_case_tolerance: options.accuracyCaseTolerance ?? 0.15,
+      retain_accuracy_responses: options.retainAccuracyResponses ?? false,
+      kv_precision_search: options.kvPrecisionSearch ?? true,
+      ngram_speculation: options.ngramSpeculation,
+    }),
+  cancelTuning: async (operationId: string): Promise<ApplyProgress> =>
+    rift.cancelOperation(operationId, "Cancelled profiled tuning from dashboard"),
   listEvaluations: async (service?: string, signal?: AbortSignal): Promise<EvaluationRun[]> => {
     const query = service ? `?service=${encodeURIComponent(service)}` : "";
     const payload = await req<JsonObject>("GET", `/v2/evaluations${query}`, undefined, signal);
