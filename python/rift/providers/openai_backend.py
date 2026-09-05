@@ -512,10 +512,12 @@ def openai_benchmark(
     prompt: str,
     max_tokens: int,
     timeout_seconds: float = 60.0,
+    credential_ref: str | None = None,
 ) -> JsonDict:
     model_id = resolve_openai_model_id(
         base_url=base_url,
         timeout_seconds=min(timeout_seconds, 5.0),
+        credential_ref=credential_ref,
     )
     payload = {
         "model": model_id or "rift-managed",
@@ -527,7 +529,11 @@ def openai_benchmark(
     request = Request(
         _openai_route(base_url, "/v1/chat/completions"),
         data=data,
-        headers={"Content-Type": "application/json", "User-Agent": "RIFT/1.0"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "RIFT/1.0",
+            **_credential_headers(credential_ref),
+        },
     )
     started = time.perf_counter()
     with urlopen(request, timeout=timeout_seconds) as response:
@@ -546,7 +552,12 @@ def openai_benchmark(
     }
 
 
-def resolve_openai_model_id(*, base_url: str, timeout_seconds: float = 5.0) -> str | None:
+def resolve_openai_model_id(
+    *,
+    base_url: str,
+    timeout_seconds: float = 5.0,
+    credential_ref: str | None = None,
+) -> str | None:
     """Read the live model identifier required by an OpenAI-compatible server.
 
     Backends commonly advertise a filesystem path (for example ``/models``) when
@@ -558,7 +569,11 @@ def resolve_openai_model_id(*, base_url: str, timeout_seconds: float = 5.0) -> s
     try:
         request = Request(
             _openai_route(base_url, "/v1/models"),
-            headers={"Accept": "application/json", "User-Agent": "RIFT/1.0"},
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "RIFT/1.0",
+                **_credential_headers(credential_ref),
+            },
         )
         with urlopen(request, timeout=max(float(timeout_seconds), 0.1)) as response:
             payload = json.loads(response.read(128 * 1024).decode("utf-8", errors="replace"))
@@ -575,6 +590,23 @@ def resolve_openai_model_id(*, base_url: str, timeout_seconds: float = 5.0) -> s
         if model_id:
             return model_id
     return None
+
+
+def _credential_headers(credential_ref: str | None) -> dict[str, str]:
+    """Resolve an explicitly registered environment credential at request time."""
+
+    reference = str(credential_ref or "").strip()
+    if not reference:
+        return {}
+    if not reference.startswith("env:"):
+        raise ValueError("credential_ref must reference an environment variable using env:NAME")
+    name = reference[4:].strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        raise ValueError("credential_ref must reference an environment variable using env:NAME")
+    token = os.environ.get(name)
+    if not token:
+        raise ValueError(f"credential environment variable is not set: {name}")
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _openai_route(base_url: str, route: str) -> str:

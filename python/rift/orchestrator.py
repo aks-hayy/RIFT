@@ -8,19 +8,27 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import statistics
 import subprocess
 import tempfile
 import time
-from typing import Any, Callable
-from urllib.parse import unquote, urlparse, urlsplit
 import uuid
+from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import unquote, urlparse, urlsplit
 
 from .adapters.artifacts import source_from_candidate, source_from_local
 from .adapters.contracts import AdapterManifest
 from .artifacts import ArtifactManifest
 from .adapters.converters import converter_adapter_host
+from .benchmark_suite import (
+    BenchmarkSpec,
+    BenchmarkSuiteRunner,
+    ResearchProtocol,
+    compile_benchmark_plan,
+    profile_catalog,
+)
 from .benchmarking import BenchmarkSuite, summarize_samples
 from .evidence import EvidenceEngine
 from .governance import GovernancePolicy, deployment_manifest, write_deployment_manifest
@@ -31,6 +39,7 @@ from .providers import (
     overlay_registry,
     provider_lifecycle_gate,
 )
+from .providers.openai_backend import openai_benchmark
 from .release import DiagnosticBundle, migrate_config, migrate_state
 from .recommendations import RecommendationStore
 from .rift import RiftEngine
@@ -54,6 +63,43 @@ from .tuning_accuracy import AccuracySuite, score_accuracy_suite
 JsonDict = dict[str, Any]
 ApplyProgressCallback = Callable[[str, str, JsonDict], None]
 _TELEMETRY_RUNTIMES: dict[str, tuple[TelemetryStore, TelemetrySupervisor | None]] = {}
+
+
+def _research_protocol_from_mapping(value: Mapping[str, Any] | None) -> ResearchProtocol:
+    """Convert JSON API research options into the typed protocol contract."""
+
+    payload = dict(value or {})
+    recipe = str(payload.get("recipe") or "repeatability")
+    factors = payload.get("factors") or {}
+    if not isinstance(factors, Mapping):
+        raise ValueError("research factors must be an object")
+    normalized_factors = {
+        str(key): tuple(str(level) for level in levels)
+        for key, levels in factors.items()
+        if isinstance(levels, (list, tuple))
+    }
+    conditions = payload.get("conditions") or (("baseline", "candidate") if recipe == "paired" else ("control",))
+    if isinstance(conditions, str):
+        conditions = (conditions,)
+    elif not isinstance(conditions, (list, tuple)):
+        raise ValueError("research conditions must be an array or string")
+    custom_cases = payload.get("custom_cases") or payload.get("customCases") or ()
+    if not isinstance(custom_cases, (list, tuple)) or any(not isinstance(item, Mapping) for item in custom_cases):
+        raise ValueError("custom research cases must be an array of objects")
+    return ResearchProtocol(
+        recipe=recipe,
+        question=str(payload.get("question") or "Does the service produce repeatable outputs and stable timings on the same workload?"),
+        primary_outcome=str(payload.get("primary_outcome") or payload.get("primaryOutcome") or "agreement"),
+        items=int(payload.get("items") or 40),
+        blocks=int(payload.get("blocks") or 5),
+        repetitions=int(payload.get("repetitions") or 2),
+        seed=int(payload.get("seed") or 42),
+        conditions=tuple(str(item) for item in conditions),
+        factors=normalized_factors,
+        pilot_items=int(payload.get("pilot_items") or payload.get("pilotItems") or 10),
+        custom_cases=tuple(dict(item) for item in custom_cases),
+        scorer=str(payload.get("scorer") or "exact"),
+    )
 
 
 @dataclass
@@ -885,8 +931,8 @@ class RiftOrchestrator:
                 ),
                 None,
             )
-        if selected is None and artifact_id:
-            selected = next(
+        if artifact_id:
+            artifact_selected = next(
                 (
                     item
                     for item in recommendations
@@ -898,19 +944,12 @@ class RiftOrchestrator:
                 ),
                 None,
             )
-        elif artifact_id and selected is not None:
-            selected = next(
-                (
-                    item
-                    for item in recommendations
-                    if str(item.get("artifact_id") or "") == artifact_id
-                    or str((item.get("selected_artifact") or {}).get("artifact_id") or "")
-                    == artifact_id
-                    or str((item.get("artifact_selection") or {}).get("artifact_id") or "")
-                    == artifact_id
-                ),
-                None,
-            )
+            if artifact_selected is not None:
+                selected = artifact_selected
+            elif selected is None or artifact_id != str(selected.get("repo_id") or ""):
+                raise ValueError(
+                    f"artifact {artifact_id!r} was not found in recommendation run {run_id}"
+                )
         if selected is None and selector == "best_estimated":
             selected = recommendations[0]
         if selected is None:
@@ -4154,6 +4193,222 @@ class RiftOrchestrator:
             result["path"] = self.artifacts.write(manifest, target)
         return result
 
+    def benchmark_profiles_catalog(self) -> JsonDict:
+        """Describe the complete benchmark suite without contacting a model."""
+
+        return {"schema_version": "rift.benchmarks/v1", "profiles": profile_catalog()}
+
+    def benchmark_targets(self) -> JsonDict:
+        """List services that are known to RIFT and whether they can be measured."""
+
+        state = self.read_state()
+        targets: list[JsonDict] = []
+        services = state.get("services") or {}
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                continue
+            runtime = service.get("runtime") or {}
+            launch_plan = service.get("launch_plan") or {}
+            base_url = runtime.get("api_base") or launch_plan.get("api_base")
+            status = str(service.get("status") or "unknown").lower()
+            targets.append(
+                {
+                    "id": str(name),
+                    "name": str(name),
+                    "kind": "managed",
+                    "status": status,
+                    "backend": service.get("backend"),
+                    "model": service.get("model"),
+                    "base_url": str(base_url) if base_url else None,
+                    "benchmarkable": bool(base_url and service.get("backend") in self.providers),
+                    "health": service.get("health"),
+                }
+            )
+        for external in self._registered_benchmark_targets():
+            targets.append(external)
+        return {"schema_version": "rift.benchmarks/v1", "targets": targets}
+
+    def register_benchmark_target(
+        self,
+        *,
+        target_id: str,
+        url: str,
+        model: str,
+        credential_ref: str | None = None,
+    ) -> JsonDict:
+        """Register an explicitly approved OpenAI-compatible endpoint.
+
+        Secrets are referenced by name (for example ``env:LAB_API_TOKEN``),
+        never sent to or persisted by the controller.
+        """
+
+        from urllib.parse import urlparse
+
+        normalized_id = str(target_id).strip()
+        parsed = urlparse(str(url).strip())
+        if not normalized_id or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for ch in normalized_id):
+            raise ValueError("target_id must contain only letters, numbers, hyphens, or underscores")
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("external benchmark target url must be an http(s) URL")
+        if parsed.username or parsed.password:
+            raise ValueError("external benchmark target url must not embed credentials")
+        if not str(model).strip():
+            raise ValueError("external benchmark target model is required")
+        if credential_ref:
+            reference = str(credential_ref).strip()
+            if not reference.startswith("env:") or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*", reference[4:].strip()
+            ):
+                raise ValueError("credential_ref must reference an environment variable using env:NAME")
+        values = self._registered_benchmark_targets()
+        values = [item for item in values if item.get("id") != normalized_id]
+        values.append(
+            {
+                "id": normalized_id,
+                "name": normalized_id,
+                "kind": "external",
+                "status": "registered",
+                "backend": "openai-compatible",
+                "model": str(model).strip(),
+                "base_url": str(url).strip().rstrip("/"),
+                "credential_ref": str(credential_ref).strip() if credential_ref else None,
+                "benchmarkable": True,
+                "explicitly_registered": True,
+            }
+        )
+        target_path = self.rift_dir / "benchmarks" / "targets.json"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_json(target_path, {"schema_version": "rift.benchmarks/v1", "targets": values})
+        return values[-1]
+
+    def _registered_benchmark_targets(self) -> list[JsonDict]:
+        path = self.rift_dir / "benchmarks" / "targets.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        values = payload.get("targets") if isinstance(payload, dict) else None
+        return [dict(item) for item in values if isinstance(item, dict)] if isinstance(values, list) else []
+
+    def benchmark_plan(
+        self,
+        *,
+        service_name: str = "chat",
+        profiles: Iterable[str] = ("smoke",),
+        research: Mapping[str, Any] | None = None,
+        max_concurrency: int = 8,
+        seed: int = 42,
+        max_duration_seconds: float | None = None,
+        quality_items: int = 200,
+        max_requests: int = 50_000,
+        retain_responses: bool = True,
+    ) -> JsonDict:
+        """Compile a benchmark plan without dispatching inference requests."""
+
+        protocol = _research_protocol_from_mapping(research) if research else None
+        return compile_benchmark_plan(
+            BenchmarkSpec(
+                target=service_name,
+                profiles=tuple(profiles),
+                research=protocol,
+                max_concurrency=max_concurrency,
+                seed=seed,
+                max_duration_seconds=max_duration_seconds,
+                quality_items=quality_items,
+                max_requests=max_requests,
+                retain_responses=retain_responses,
+            ),
+            capabilities=self._benchmark_capabilities(service_name),
+        )
+
+    def benchmark_profiles(
+        self,
+        *,
+        service_name: str = "chat",
+        profiles: Iterable[str] = ("smoke",),
+        research: Mapping[str, Any] | None = None,
+        max_concurrency: int = 8,
+        seed: int = 42,
+        max_duration_seconds: float | None = None,
+        quality_items: int = 200,
+        max_requests: int = 50_000,
+        retain_responses: bool = True,
+        write: bool = True,
+        progress: Callable[[str, str, float | None, JsonDict | None], None] | None = None,
+    ) -> JsonDict:
+        """Run the new versioned suite without changing service settings."""
+
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        external = next((item for item in self._registered_benchmark_targets() if item.get("id") == service_name), None)
+        provider = self.providers.get(str(service.get("backend") or "")) if isinstance(service, dict) else None
+        if isinstance(service, dict):
+            runtime = service.get("runtime") or {}
+            api_base = runtime.get("api_base") or (service.get("launch_plan") or {}).get("api_base")
+            benchmark_callable = provider.benchmark if provider is not None else None
+        elif external:
+            api_base = external.get("base_url")
+            benchmark_callable = lambda **kwargs: openai_benchmark(
+                "openai-compatible",
+                credential_ref=external.get("credential_ref"),
+                **kwargs,
+            )
+            service = external
+        else:
+            return {"available": False, "reason": f"benchmark target not found: {service_name}"}
+        if benchmark_callable is None or not api_base:
+            return {"available": False, "reason": "target has no benchmarkable provider/api_base"}
+        protocol = _research_protocol_from_mapping(research) if research else None
+        spec = BenchmarkSpec(
+            target=service_name,
+            profiles=tuple(profiles),
+            research=protocol,
+            max_concurrency=max_concurrency,
+            seed=seed,
+            max_duration_seconds=max_duration_seconds,
+            quality_items=quality_items,
+            max_requests=max_requests,
+            retain_responses=retain_responses,
+        )
+        result = BenchmarkSuiteRunner(
+            benchmark_callable,
+            artifact_root=self.rift_dir / "benchmarks",
+        ).run(
+            spec,
+            base_url=str(api_base),
+            metadata={
+                "service": service_name,
+                "backend": service.get("backend"),
+                "model": service.get("model"),
+                "revision": service.get("current_revision") or service.get("revision"),
+                "hardware_fingerprint": (self.engine.hardware_profile() or {}).get("fingerprint"),
+            },
+            capabilities=self._benchmark_capabilities(service_name),
+            progress=progress,
+        )
+        result["available"] = result.get("status") in {"completed", "partial"}
+        if write:
+            self.observability_store.append(
+                "benchmark_profiles_completed",
+                status="ok" if result.get("status") == "completed" else "error",
+                service=service_name,
+                details={
+                    "run_id": result.get("run_id"),
+                    "profiles": result.get("profiles"),
+                    "status": result.get("status"),
+                },
+            )
+        return result
+
+    def _benchmark_capabilities(self, service_name: str) -> JsonDict:
+        service = (self.read_state().get("services") or {}).get(service_name) or {}
+        return {
+            "streaming": bool((service.get("serving") or {}).get("api") in {"openai", "openai-compatible"}),
+            "context_length": (service.get("serving") or {}).get("context_length"),
+            "backend_metrics": str(service.get("backend") or "") == "llama.cpp",
+            "trusted_telemetry": bool((service.get("monitoring") or {}).get("resources", {}).get("enabled", True)),
+        }
+
     def benchmark_suite(
         self,
         *,
@@ -4255,10 +4510,10 @@ class RiftOrchestrator:
             EvaluationCaseResult,
             EvaluationRun,
             EvaluationSuite,
-            evaluate_suite,
-            invoke_openai_compatible,
             default_evaluation_suite,
+            evaluate_suite,
             invoke_judge_openai_compatible,
+            invoke_openai_compatible,
         )
 
         if max_tokens <= 0:

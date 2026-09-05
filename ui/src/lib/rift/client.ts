@@ -40,6 +40,8 @@ import type {
   TuningRun,
   TuningProfile,
   TuningOpportunity,
+  BenchmarkProfile,
+  BenchmarkSuiteRun,
 } from "./types";
 import {
   applyRequest,
@@ -763,6 +765,71 @@ async function listBenchmarks(serviceId: string, signal?: AbortSignal): Promise<
     .sort((a, b) => b.measuredAt.localeCompare(a.measuredAt));
 }
 
+function mapBenchmarkProfile(value: unknown): BenchmarkProfile {
+  const raw = object(value);
+  return {
+    id: text(raw.id),
+    name: text(raw.name, text(raw.id, "Benchmark")),
+    version: text(raw.version, "1.0"),
+    purpose: text(raw.purpose),
+    plannedWorkload: text(raw.planned_workload),
+    requirements: list(raw.requirements).map((item) => String(item)),
+    defaultWallTimeSeconds: numeric(raw.default_wall_time_seconds),
+  };
+}
+
+function mapBenchmarkSuiteRun(value: unknown): BenchmarkSuiteRun {
+  const raw = object(value);
+  const resultMap = object(raw.profile_results);
+  return {
+    runId: text(raw.run_id),
+    target: text(raw.target),
+    profiles: list(raw.profiles).map((item) => String(item)),
+    status: text(raw.status, "unknown"),
+    completedRequests: numeric(raw.completed_requests),
+    plannedRequests: numeric(raw.planned_requests),
+    durationSeconds: raw.duration_seconds == null ? undefined : numeric(raw.duration_seconds),
+    profileResults: Object.fromEntries(
+      Object.entries(resultMap).map(([key, item]) => {
+        const profile = object(item);
+        return [
+          key,
+          {
+            status: text(profile.status, "unknown"),
+            summary: object(profile.summary),
+            observations: list(profile.observations).map(object),
+          },
+        ];
+      }),
+    ),
+    artifactManifest: text(raw.artifact_manifest) || undefined,
+    planFile: text(raw.plan_file) || undefined,
+  };
+}
+
+async function benchmarkProfiles(signal?: AbortSignal): Promise<BenchmarkProfile[]> {
+  const payload = await req<JsonObject>("GET", "/v2/benchmark-profiles", undefined, signal);
+  return list(payload.profiles).map(mapBenchmarkProfile);
+}
+
+async function listBenchmarkSuiteRuns(
+  service?: string,
+  signal?: AbortSignal,
+): Promise<BenchmarkSuiteRun[]> {
+  const query = service ? `?service=${encodeURIComponent(service)}` : "";
+  const payload = await req<JsonObject>("GET", `/v2/benchmarks${query}`, undefined, signal);
+  return list(payload.runs).map(mapBenchmarkSuiteRun);
+}
+
+async function getBenchmarkSuiteRun(
+  runId: string,
+  signal?: AbortSignal,
+): Promise<BenchmarkSuiteRun> {
+  return mapBenchmarkSuiteRun(
+    await req<JsonObject>("GET", `/v2/benchmarks/${encodeURIComponent(runId)}`, undefined, signal),
+  );
+}
+
 async function listRevisions(
   serviceId: string,
   signal?: AbortSignal,
@@ -807,10 +874,14 @@ function mapRecommendation(value: unknown, index: number, runId?: string): Model
   const repo = text(raw.repo_id, `candidate-${index + 1}`);
   const format = text(raw.format, "gguf") as ModelArtifact["format"];
   const artifactSelection = object(raw.artifact_selection);
+  const selectedArtifact = object(raw.selected_artifact);
   const artifactMetadata = object(artifactSelection.metadata);
   const artifactId = text(
     artifactSelection.artifact_id,
-    text(raw.artifact_id, text(raw.selected_artifact_id, repo)),
+    text(
+      selectedArtifact.artifact_id,
+      text(raw.artifact_id, text(raw.selected_artifact_id, repo)),
+    ),
   );
   const selectedBytes = numeric(raw.selected_download_bytes);
   const estimatedBytes =
@@ -1594,6 +1665,9 @@ export const rift = {
   },
   listRevisions,
   listBenchmarks,
+  benchmarkProfiles,
+  listBenchmarkSuiteRuns,
+  getBenchmarkSuiteRun,
   recommend,
   recommendDetailed,
   createPlan: async (input: {
@@ -1898,6 +1972,31 @@ export const rift = {
         repetitions: options.repetitions ?? 3,
         concurrency: options.concurrency ?? 1,
       }),
+    ),
+  benchmarkPlan: async (
+    service: string,
+    profiles: string[],
+    research?: Record<string, unknown>,
+  ): Promise<JsonObject> =>
+    req<JsonObject>("POST", "/v2/benchmark-plans", {
+      service,
+      profiles,
+      ...(research ? { research } : {}),
+    }),
+  benchmarkProfilesRun: async (
+    service: string,
+    profiles: string[],
+    options: { research?: Record<string, unknown>; maxConcurrency?: number } = {},
+  ): Promise<BenchmarkSuiteRun> =>
+    mapBenchmarkSuiteRun(
+      await resolveOperation(
+        await req<JsonObject>("POST", "/v2/benchmarks", {
+          service,
+          profiles,
+          ...(options.research ? { research: options.research } : {}),
+          max_concurrency: options.maxConcurrency ?? 8,
+        }),
+      ),
     ),
   tuneService: async (
     service: string,

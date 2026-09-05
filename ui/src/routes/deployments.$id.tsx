@@ -13,6 +13,8 @@ import {
   useTelemetryLatest,
   useResourceReports,
   useServiceTelemetryAccounting,
+  useBenchmarkProfiles,
+  useBenchmarkSuiteRuns,
 } from "@/lib/rift/hooks";
 import { rift } from "@/lib/rift/client";
 import { bytes, relativeTime } from "@/lib/rift/format";
@@ -35,7 +37,16 @@ import type { Service } from "@/lib/rift/types";
 
 const searchSchema = z.object({
   tab: z
-    .enum(["overview", "playground", "performance", "tuning", "logs", "configuration", "revisions"])
+    .enum([
+      "overview",
+      "playground",
+      "benchmarking",
+      "performance",
+      "tuning",
+      "logs",
+      "configuration",
+      "revisions",
+    ])
     .catch("overview"),
 });
 
@@ -53,6 +64,7 @@ export const Route = createFileRoute("/deployments/$id")({
 const TABS = [
   { id: "overview", label: "Overview" },
   { id: "playground", label: "Playground" },
+  { id: "benchmarking", label: "Benchmarking" },
   { id: "performance", label: "Performance" },
   { id: "tuning", label: "Tuning" },
   { id: "logs", label: "Logs" },
@@ -140,6 +152,7 @@ function DeploymentDetail() {
         )}
         {service && tab === "overview" && <OverviewTab s={service} />}
         {service && tab === "playground" && <PlaygroundTab s={service} />}
+        {service && tab === "benchmarking" && <BenchmarkingTab service={service} />}
         {service && tab === "performance" && <PerformanceTab s={service} />}
         {service && tab === "tuning" && <DeploymentTuningTab service={service} />}
         {service && tab === "logs" && <LogsTab service={service} />}
@@ -513,6 +526,211 @@ function PlaygroundTab({ s }: { s: Service }) {
           <pre className="whitespace-pre-wrap text-[13px] text-ink min-h-[8rem]">
             {out || <span className="text-ink-secondary">Waiting for prompt…</span>}
           </pre>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+const FALLBACK_BENCHMARK_PROFILES = [
+  {
+    id: "smoke",
+    name: "Smoke",
+    purpose: "Protocol integrity and basic behavior",
+    plannedWorkload: "8 checks × 2 repetitions",
+  },
+  {
+    id: "interactive",
+    name: "Interactive",
+    purpose: "User-perceived responsiveness",
+    plannedWorkload: "3 session types × concurrency 1/4",
+  },
+  {
+    id: "throughput",
+    name: "Throughput",
+    purpose: "Sustained capacity and goodput",
+    plannedWorkload: "Concurrency 1/2/4/8 + arrival windows",
+  },
+  {
+    id: "context",
+    name: "Context",
+    purpose: "Length and evidence-position effects",
+    plannedWorkload: "5 lengths × 3 positions × matched documents",
+  },
+  {
+    id: "reliability",
+    name: "Reliability",
+    purpose: "Mixed-load stability and recovery",
+    plannedWorkload: "Baseline + sustained load + bursts",
+  },
+  {
+    id: "quality",
+    name: "Quality",
+    purpose: "Inspectable answer-level behavior",
+    plannedWorkload: "200 cases across eight categories",
+  },
+  {
+    id: "research",
+    name: "Research",
+    purpose: "Controlled, reproducible experiments",
+    plannedWorkload: "Guided recipe with matched trials and uncertainty",
+  },
+] as const;
+
+function BenchmarkingTab({ service }: { service: Service }) {
+  const profilesQuery = useBenchmarkProfiles();
+  const runs = useBenchmarkSuiteRuns(service.id);
+  const profiles = profilesQuery.data?.length ? profilesQuery.data : FALLBACK_BENCHMARK_PROFILES;
+  const [selected, setSelected] = useState<string[]>(["smoke"]);
+  const [study, setStudy] = useState("repeatability");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const toggle = (id: string) => {
+    setSelected((current) =>
+      current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
+    );
+  };
+  const run = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await rift.benchmarkProfilesRun(
+        service.name,
+        selected.length ? selected : ["smoke"],
+        selected.includes("research") ? { research: { recipe: study } } : {},
+      );
+      runs.refetch();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="grid gap-4">
+      <Panel
+        title="Benchmarking"
+        aside={
+          <span className="rift-mono text-[11px] text-ink-secondary">
+            No service settings are changed
+          </span>
+        }
+      >
+        <p className="text-[13px] text-ink-secondary max-w-3xl">
+          Choose one or more substantial profiles. RIFT compiles them into one reviewed run and
+          executes the measured phases sequentially so load from one profile does not distort
+          another.
+        </p>
+        <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {profiles.map((profile) => {
+            const checked = selected.includes(profile.id);
+            return (
+              <label
+                key={profile.id}
+                className={cn(
+                  "flex gap-3 rounded-[4px] border p-3 cursor-pointer transition-colors",
+                  checked ? "border-primary bg-primary/5" : "border-border hover:bg-muted/40",
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggle(profile.id)}
+                  className="mt-1 size-4 accent-[var(--oxide)]"
+                />
+                <span className="min-w-0">
+                  <span className="block text-[13px] font-medium text-ink">{profile.name}</span>
+                  <span className="mt-1 block text-[12px] text-ink-secondary">
+                    {profile.purpose}
+                  </span>
+                  <span className="mt-2 block rift-mono text-[10.5px] text-ink-secondary">
+                    {profile.plannedWorkload}
+                  </span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        {selected.includes("research") && (
+          <div className="mt-4 max-w-md grid gap-1 text-[12px]">
+            <label className="rift-label" htmlFor="research-recipe">
+              Research recipe
+            </label>
+            <select
+              id="research-recipe"
+              value={study}
+              onChange={(event) => setStudy(event.target.value)}
+              className="h-9 rounded-[4px] border border-border bg-raised px-2 text-[13px]"
+            >
+              <option value="repeatability">Repeatability</option>
+              <option value="paired">Paired comparison</option>
+              <option value="factorial">Factorial ablation</option>
+              <option value="context_position">Context position</option>
+              <option value="prefix_reuse">Prefix reuse</option>
+            </select>
+            <span className="text-[11px] text-ink-secondary">
+              The protocol, seed, controls, and uncertainty analysis are recorded with the run.
+            </span>
+          </div>
+        )}
+        <div className="mt-5 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={run}
+            disabled={busy || !["running", "healthy"].includes(service.status)}
+            className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-[4px] bg-primary text-primary-foreground text-[13px] font-medium hover:bg-[color:var(--oxide-deep)] disabled:opacity-50"
+          >
+            {busy ? <Loader2 className="size-4 animate-spin" /> : <Gauge className="size-4" />}
+            Run {selected.length || 1} profile{selected.length === 1 ? "" : "s"}
+          </button>
+          <span className="rift-mono text-[11px] text-ink-secondary">
+            Smoke is selected by default · {selected.join(" → ") || "smoke"}
+          </span>
+        </div>
+        {error && (
+          <p className="mt-3 rift-mono text-[11px] text-error" role="alert">
+            {error}
+          </p>
+        )}
+      </Panel>
+      <Panel title="Recent benchmark runs" bodyClassName="p-0">
+        {runs.unavailable ? (
+          <p className="px-4 py-6 text-[12px] text-ink-secondary">
+            Benchmark history is unavailable from this controller.
+          </p>
+        ) : !runs.data?.length ? (
+          <p className="px-4 py-6 text-[12px] text-ink-secondary">No suite runs recorded yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[720px] text-[12px] rift-mono">
+              <thead className="rift-label">
+                <tr className="border-b border-border">
+                  <th className="text-left px-4 h-9 font-normal">Run</th>
+                  <th className="text-left px-4 font-normal">Profiles</th>
+                  <th className="text-left px-4 font-normal">Status</th>
+                  <th className="text-left px-4 font-normal">Coverage</th>
+                  <th className="text-left px-4 font-normal">Duration</th>
+                </tr>
+              </thead>
+              <tbody>
+                {runs.data.map((run) => (
+                  <tr key={run.runId} className="border-b border-border last:border-0">
+                    <td className="px-4 py-2">{run.runId}</td>
+                    <td className="px-4">{run.profiles.join(" → ")}</td>
+                    <td className="px-4">{run.status}</td>
+                    <td className="px-4">
+                      {run.completedRequests} / {run.plannedRequests}
+                    </td>
+                    <td className="px-4">
+                      {run.durationSeconds == null
+                        ? "unavailable"
+                        : `${run.durationSeconds.toFixed(1)}s`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </Panel>
     </div>

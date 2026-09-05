@@ -386,6 +386,68 @@ def test_recommendation_store_rejects_path_traversal_ids():
             raise AssertionError("path traversal run id was accepted")
 
 
+def test_plan_preserves_selected_artifact_when_repo_is_used_as_selector():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        store = recommendations_mod.RecommendationStore(root / ".rift")
+        store.save_recommendation(
+            {
+                "recommendation_run_id": "selected-artifact-run",
+                "task": "chat",
+                "categories": {},
+                "recommendations": [
+                    {
+                        "repo_id": "org/model-gguf",
+                        "backend": "llama.cpp",
+                        "format": "gguf",
+                        "selected_file": "model-Q4_K_M.gguf",
+                        "selected_artifact": {
+                            "artifact_id": "gguf:model-Q4_K_M.gguf",
+                            "format": "gguf",
+                            "total_bytes": 4096,
+                        },
+                    }
+                ],
+            }
+        )
+        orchestrator = orchestrator_mod.RiftOrchestrator(root=root)
+        materialized = orchestrator.materialize_recommendation_config(
+            run_id="selected-artifact-run",
+            selector="org/model-gguf",
+            artifact_id="gguf:model-Q4_K_M.gguf",
+        )
+        service = materialized["config"]["services"]["chat"]
+        assert service["model"]["id"] == "org/model-gguf"
+        assert service["model"]["artifact"]["artifact_id"] == "gguf:model-Q4_K_M.gguf"
+
+
+def test_plan_accepts_legacy_repo_as_artifact_selector_without_clearing_match():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        store = recommendations_mod.RecommendationStore(root / ".rift")
+        store.save_recommendation(
+            {
+                "recommendation_run_id": "legacy-selector-run",
+                "task": "chat",
+                "recommendations": [
+                    {
+                        "repo_id": "org/model-gguf",
+                        "backend": "llama.cpp",
+                        "format": "gguf",
+                        "selected_file": "model.gguf",
+                    }
+                ],
+            }
+        )
+        orchestrator = orchestrator_mod.RiftOrchestrator(root=root)
+        materialized = orchestrator.materialize_recommendation_config(
+            run_id="legacy-selector-run",
+            selector="org/model-gguf",
+            artifact_id="org/model-gguf",
+        )
+        assert materialized["config"]["services"]["chat"]["model"]["id"] == "org/model-gguf"
+
+
 def test_recommendation_store_lists_existing_pulled_models_with_metrics():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

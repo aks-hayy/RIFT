@@ -492,6 +492,25 @@ measurements, live backend measurements, deterministic emulation, and fake
 provider contract tests. Emulation is not evidence of physical fleet
 reliability.
 
+### Benchmark suite evidence
+
+The benchmark suite has a reproducible, offline verification snapshot covering
+profile expansion, sequential multi-profile execution, research statistics,
+artifact persistence, unavailable-metric handling, CLI exposure, and the
+production dashboard build. Read the [benchmark suite verification report](docs/evidence/benchmark-suite-verification.md)
+and its [machine-readable record](docs/evidence/benchmark-suite-verification.json).
+
+This evidence proves the orchestration and artifact contracts; it does not
+substitute for live model, backend, GPU, energy, or heterogeneous-node
+measurements. For a live run, inspect the plan before accepting it and retain
+the complete run bundle:
+
+```powershell
+rift --json benchmark plan --service chat --profiles smoke,quality,research --study paired
+rift benchmark --service chat --profiles smoke,quality,research --study paired --yes
+rift benchmark export RUN_ID --format bundle
+```
+
 ## Compatibility And Project Status
 
 RIFT is a pure-Python control plane suitable for local deployment workflows,

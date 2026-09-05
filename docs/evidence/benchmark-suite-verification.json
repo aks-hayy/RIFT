@@ -1,0 +1,71 @@
+{
+  "schema_version": "rift.evidence/v1",
+  "verified_on": "2026-09-05",
+  "suite_schema": "rift.benchmarks/v1",
+  "verification_mode": "deterministic offline provider plus repository/build checks",
+  "commands": {
+    "benchmark_contract_tests": {
+      "command": "python -m pytest -q tests/python/benchmark_suite_tests.py",
+      "status": "passed",
+      "passed": 11,
+      "duration_seconds": 0.43
+    },
+    "full_python_suite": {
+      "command": "python -m pytest -q",
+      "status": "passed",
+      "passed": 267,
+      "subtests_passed": 8,
+      "duration_seconds": 67.27
+    },
+    "compileall": {
+      "command": "python -m compileall -q python tests",
+      "status": "passed"
+    },
+    "changed_ui_eslint": {
+      "command": "npx eslint src/lib/rift/client.ts src/lib/rift/hooks.ts src/lib/rift/types.ts src/routes/deployments.$id.tsx",
+      "status": "passed"
+    },
+    "ui_build": {
+      "command": "npm run build",
+      "status": "passed",
+      "exported_routes": 8
+    },
+    "diff_check": {
+      "command": "git diff --check",
+      "status": "passed",
+      "notes": "Expected LF/CRLF normalization warnings only for generated static assets."
+    }
+  },
+  "plan_probe": {
+    "profiles": ["smoke", "interactive", "throughput", "context", "reliability", "quality", "research"],
+    "selected_profiles": ["smoke", "research", "quality"],
+    "execution_order": ["smoke", "research", "quality"],
+    "profile_requests": {"smoke": 18, "research": 24, "quality": 4},
+    "planned_requests": 46,
+    "plan_hash": "1a614f613c7316a3ce66cc72882318036c49b054d538441b6fa1e68892320975",
+    "research_recipe": "paired",
+    "research_conditions": ["baseline", "candidate"],
+    "pilot_excluded": true
+  },
+  "artifact_probe": {
+    "status": "completed",
+    "execution_order": ["smoke", "research", "quality"],
+    "profile_status": {"smoke": "completed", "research": "completed", "quality": "completed"},
+    "profile_observations": {"smoke": 18, "research": 4, "quality": 2},
+    "artifacts": ["manifest.json", "observations.jsonl", "plan.json", "result.json"],
+    "plan_schema": "rift.benchmarks/v1",
+    "manifest_schema": "rift.benchmarks/v1"
+  },
+  "cli_plan_probe": {
+    "command": "rift --json benchmark plan --service chat --profiles smoke,quality,research --study paired",
+    "status": "passed",
+    "schema": "rift.benchmarks/v1",
+    "execution_order": ["smoke", "research", "quality"],
+    "plan_hash": "15662d5ef600c49e4fa1c6ac0c01f4495fc8366b4dede370906166bfb8b8e6f8"
+  },
+  "limits": [
+    "Offline provider evidence does not measure a model, backend, network, GPU, or power.",
+    "Live research claims require retaining the run artifacts and hardware/model provenance.",
+    "Whole-repository lint is not reported here because unrelated pre-existing files have lint findings; the changed UI files were linted directly."
+  ]
+}

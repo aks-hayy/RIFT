@@ -5,13 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import fnmatch
 import hashlib
+from http.client import IncompleteRead, RemoteDisconnected
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import time
 from typing import Any, Iterable, Optional
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
@@ -292,33 +294,65 @@ class HfHubClient:
         # Xet-backed Hub files can stall on an unbounded initial response.
         # A zero-offset range still permits a full download while making the
         # transport use the same resumable path as subsequent requests.
-        headers: dict[str, str] = {"Range": f"bytes={resume_from}-"}
-        request = self._request(url, headers=headers)
-        try:
-            response = urlopen(request, timeout=60)
-        except HTTPError as exc:
-            if exc.code == 416 and part_path.exists():
+        last_error: BaseException | None = None
+        # A Hub proxy or Xet connection can close a large response without
+        # completing it. Preserve the bytes delivered by that response and
+        # resume with a range request instead of restarting the artifact.
+        for attempt in range(1, 6):
+            resume_from = part_path.stat().st_size if part_path.exists() else 0
+            headers: dict[str, str] = {"Range": f"bytes={resume_from}-"}
+            request = self._request(url, headers=headers)
+            try:
+                response = urlopen(request, timeout=60)
+            except HTTPError as exc:
+                if exc.code == 416 and part_path.exists():
+                    self._promote_download(part_path, local_path)
+                    return local_path.stat().st_size
+                raise
+
+            mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
+            if mode == "wb":
+                resume_from = 0
+            bytes_written = resume_from
+            try:
+                with response, part_path.open(mode) as output:
+                    while True:
+                        try:
+                            chunk = response.read(1024 * 1024)
+                        except IncompleteRead as exc:
+                            partial = exc.partial or b""
+                            if partial:
+                                output.write(partial)
+                                output.flush()
+                                bytes_written += len(partial)
+                            raise
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        bytes_written += len(chunk)
+                if expected_size is not None and bytes_written != int(expected_size):
+                    raise IOError(
+                        f"downloaded size mismatch for {filename}: expected {expected_size}, "
+                        f"got {bytes_written}"
+                    )
                 self._promote_download(part_path, local_path)
-                return local_path.stat().st_size
-            raise
-        mode = "ab" if resume_from > 0 and response.status == 206 else "wb"
-        if mode == "wb":
-            resume_from = 0
-        bytes_written = resume_from
-        with response, part_path.open(mode) as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                bytes_written += len(chunk)
-        if expected_size is not None and bytes_written != int(expected_size):
-            raise IOError(
-                f"downloaded size mismatch for {filename}: expected {expected_size}, got {bytes_written}; "
-                f"partial file retained at {part_path} for repair/resume"
-            )
-        self._promote_download(part_path, local_path)
-        return bytes_written
+                return bytes_written
+            except (IncompleteRead, RemoteDisconnected, socket.timeout, TimeoutError, URLError) as exc:
+                last_error = exc
+            except IOError as exc:
+                # A short but clean EOF is also resumable when the expected
+                # size is known. Other IO errors, such as a full disk, must
+                # surface immediately rather than being retried blindly.
+                if expected_size is None or "downloaded size mismatch" not in str(exc):
+                    raise
+                last_error = exc
+
+            if attempt < 5:
+                time.sleep(min(2.0, 0.25 * attempt))
+
+        detail = str(last_error) if last_error else "unknown transfer error"
+        retained = f"partial file retained at {part_path} for repair/resume"
+        raise IOError(f"download failed for {filename} after 5 attempts: {detail}; {retained}") from last_error
 
     @staticmethod
     def _promote_download(part_path: Path, local_path: Path) -> None:
