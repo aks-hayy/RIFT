@@ -1,0 +1,4871 @@
+openapi: 3.1.0
+info:
+  title: RIFT Controller API
+  version: 1.3.0
+  summary: UI and automation contract for standalone and clustered RIFT controllers.
+  description: |
+    This is the versioned REST contract for the RIFT operator UI and CLI.
+    It is distinct from both the OpenAI-compatible model-serving data plane and
+    the controller-agent gRPC protocol.
+
+    The standalone controller exposes the live `/api/rift` contract and the
+    implemented mesh resources at `/api/rift/v2/mesh`. Routes that are
+    unavailable on a deployment return an honest 404 or 501; clients must never
+    substitute mock operational data.
+
+    Every mutating request accepts `X-Request-ID` (or a body `request_id`) and
+    returns a stable `operation_id`. Repeating the same request ID returns the
+    original result rather than performing the mutation twice. Mutating
+    operations that may take longer than one request return an
+    `Operation` with HTTP 202. Clients can observe it through `/events` or poll
+    `/operations/{operationId}`. An apply operation always references the hash
+    of an immutable, reviewed plan.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: RIFT Project
+servers:
+  - url: http://127.0.0.1:8777/api/rift
+    description: Default standalone controller
+  - url: "{scheme}://{host}:{port}/api/rift"
+    description: Configurable controller
+    variables:
+      scheme:
+        default: https
+        enum: [http, https]
+      host:
+        default: rift-controller.local
+      port:
+        default: "7443"
+tags:
+  - name: Health
+  - name: Setup
+  - name: Nodes
+  - name: Models
+  - name: Desired state
+  - name: Plans
+  - name: Operations
+  - name: Deployments
+  - name: Performance
+  - name: Operations center
+  - name: Gateway
+  - name: Settings
+  - name: Mesh discovery
+  - name: Mesh enrollment
+  - name: Mesh topology
+  - name: Mesh routing
+security:
+  - controllerSession: []
+  - controllerBearer: []
+x-rift-contract-status: implemented-legacy-and-v2-subset
+x-rift-legacy-base-url: http://127.0.0.1:8777/api/rift
+x-rift-agent-protocol: HTTPS JSON with mutual TLS; see rift-node-agent.openapi.yaml
+x-rift-implemented-v2-paths:
+  - /v2/plans
+  - /v2/plans/{planId}
+  - /v2/plans/{planId}/apply
+  - /v2/operations
+  - /v2/operations/{operationId}
+  - /v2/operations/{operationId}/cancel
+  - /v2/evaluations
+  - /v2/evaluations/{runId}
+  - /v2/settings
+  - /v2/model-sources
+
+paths:
+  # These are the live v2 resources used by the bundled dashboard. They are
+  # intentionally listed separately from the aspirational controller model
+  # below so generated clients do not silently target an unimplemented route.
+  /v2/plans:
+    get:
+      tags: [Plans]
+      operationId: listLivePlans
+      responses:
+        "200":
+          description: Immutable plans stored by this controller.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, plans]
+                properties:
+                  api_version: { type: string, const: "2" }
+                  plans:
+                    type: array
+                    items: { $ref: "#/components/schemas/LivePlan" }
+
+  /v2/plans/{planId}:
+    get:
+      tags: [Plans]
+      operationId: getLivePlan
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+      responses:
+        "200":
+          description: One immutable reviewed plan.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LivePlan" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/plans/{planId}/apply:
+    post:
+      tags: [Plans]
+      operationId: applyLivePlan
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_hash]
+              properties:
+                plan_hash: { type: string, minLength: 1 }
+                config: { type: string }
+                allow_download: { type: boolean, default: false }
+                allow_install: { type: boolean, default: false }
+                allow_launch: { type: boolean, default: false }
+                allow_remote: { type: boolean, default: false }
+                optimize: { type: boolean, default: false }
+                write_back: { type: boolean, default: false }
+      responses:
+        "202": { $ref: "#/components/responses/OperationAccepted" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v2/operations:
+    get:
+      tags: [Operations]
+      operationId: listLiveOperations
+      responses:
+        "200":
+          description: Durable operation records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operations]
+                properties:
+                  operations:
+                    type: array
+                    items: { $ref: "#/components/schemas/LiveOperation" }
+
+  /v2/operations/{operationId}:
+    get:
+      tags: [Operations]
+      operationId: getLiveOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: Durable operation progress and result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiveOperation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/operations/{operationId}/cancel:
+    post:
+      tags: [Operations]
+      operationId: cancelLiveOperation
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: { reason: { type: string } }
+      responses:
+        "200":
+          description: Updated operation record.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LiveOperation" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/evaluations:
+    get:
+      tags: [Performance]
+      operationId: listLiveEvaluations
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200":
+          description: Persisted answer-quality evaluation summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, evaluations]
+                properties:
+                  api_version: { type: string, const: "2" }
+                  evaluations:
+                    type: array
+                    items: { $ref: "#/components/schemas/EvaluationRun" }
+    post:
+      tags: [Performance]
+      operationId: createLiveEvaluation
+      parameters: [ { $ref: "#/components/parameters/RequestId" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [service]
+              properties:
+                service: { type: string, minLength: 1 }
+                suite: { type: object, additionalProperties: true }
+                max_tokens: { type: integer, minimum: 1, maximum: 128, default: 128 }
+                deadline_seconds: { type: number, exclusiveMinimum: 0, default: 60 }
+                retain_responses: { type: boolean, default: false }
+                required: { type: boolean, default: false }
+                judge:
+                  type: object
+                  description: Optional external heuristic evaluator; all fields are explicit.
+                  required: [endpoint, model, allowed_hosts, credential_ref, external_data_consent]
+                  properties:
+                    endpoint: { type: string, format: uri }
+                    model: { type: string, minLength: 1 }
+                    allowed_hosts:
+                      type: array
+                      minItems: 1
+                      items: { type: string, minLength: 1 }
+                    credential_ref: { type: string, description: "none or env:VARIABLE_NAME" }
+                    external_data_consent: { type: boolean, const: true }
+                    timeout_seconds: { type: number, exclusiveMinimum: 0, default: 15 }
+      responses:
+        "202": { $ref: "#/components/responses/OperationAccepted" }
+
+  /v2/evaluations/{runId}:
+    get:
+      tags: [Performance]
+      operationId: getLiveEvaluation
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Full case-level evaluation report.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EvaluationRun" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/settings:
+    get:
+      tags: [Settings]
+      operationId: getLiveSettings
+      responses:
+        "200":
+          description: Live redacted operator settings and capabilities.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /v2/services/{serviceName}/telemetry/accounting:
+    parameters:
+      - name: serviceName
+        in: path
+        required: true
+        schema: { type: string, minLength: 1 }
+    get:
+      tags: [Performance]
+      operationId: getServiceTelemetryAccounting
+      summary: Read effective resource accounting rates for one service.
+      description: Service overrides take precedence over global observability.telemetry defaults.
+      responses:
+        "200":
+          description: Effective accounting settings and their configuration sources.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Performance]
+      operationId: updateServiceTelemetryAccounting
+      summary: Persist service-scoped electricity and compute rates.
+      description: A null value clears the service override and restores the global default when configured.
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                accounting:
+                  type: object
+                  properties:
+                    electricity_price_per_kwh: { type: [number, "null"], minimum: 0 }
+                    compute_cost_per_node_hour: { type: [number, "null"], minimum: 0 }
+                  additionalProperties: false
+              required: [accounting]
+              additionalProperties: false
+      responses:
+        "200":
+          description: Persisted effective accounting settings.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v2/model-sources:
+    get:
+      tags: [Models]
+      operationId: getLiveModelSources
+      responses:
+        "200":
+          description: Configured and managed model sources.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: getLiveness
+      summary: Check whether the controller process is alive.
+      security: []
+      responses:
+        "200":
+          description: Controller process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: getReadiness
+      summary: Check whether the controller can serve operator requests.
+      security: []
+      responses:
+        "200":
+          description: Controller is ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /controller:
+    get:
+      tags: [Health]
+      operationId: getController
+      summary: Get controller identity, mode, capabilities, and API compatibility.
+      responses:
+        "200":
+          description: Controller information.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Controller"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /setup:
+    get:
+      tags: [Setup]
+      operationId: getSetupState
+      summary: Get first-run setup state.
+      security: []
+      responses:
+        "200":
+          description: Current setup state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetupState"
+    post:
+      tags: [Setup]
+      operationId: initializeController
+      summary: Initialize a new standalone or controller installation.
+      description: This endpoint is available only before initialization and from an allowed local origin.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetupRequest"
+      responses:
+        "201":
+          description: Controller initialized.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetupState"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /events:
+    get:
+      tags: [Operations]
+      operationId: streamEvents
+      summary: Stream controller, operation, node, deployment, and incident events.
+      parameters:
+        - $ref: "#/components/parameters/LastEventId"
+      responses:
+        "200":
+          description: Server-sent event stream. Each data field contains an EventEnvelope JSON object.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              example: no-cache
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /enrollment-tokens:
+    get:
+      tags: [Nodes]
+      operationId: listEnrollmentTokens
+      summary: List enrollment token metadata. Token secrets are never returned.
+      responses:
+        "200":
+          description: Enrollment token metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EnrollmentTokenMetadata"
+    post:
+      tags: [Nodes]
+      operationId: createEnrollmentToken
+      summary: Create a short-lived, single-display node enrollment token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnrollmentTokenRequest"
+      responses:
+        "201":
+          description: Token created. The secret is returned exactly once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnrollmentTokenSecret"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /enrollment-tokens/{tokenId}:
+    delete:
+      tags: [Nodes]
+      operationId: revokeEnrollmentToken
+      summary: Revoke an unused enrollment token.
+      parameters:
+        - $ref: "#/components/parameters/TokenId"
+      responses:
+        "204":
+          description: Token revoked.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /nodes:
+    get:
+      tags: [Nodes]
+      operationId: listNodes
+      summary: List enrolled nodes and their latest observed state.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/NodeStatus"
+        - name: label
+          in: query
+          description: Label selector in key=value form. Repeat for multiple labels.
+          schema:
+            type: array
+            items:
+              type: string
+          explode: true
+      responses:
+        "200":
+          description: Node page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodePage"
+
+  /nodes/{nodeId}:
+    get:
+      tags: [Nodes]
+      operationId: getNode
+      summary: Get hardware, backends, cache, assignments, and conditions for one node.
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200":
+          description: Node detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Node"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /nodes/{nodeId}/actions:
+    post:
+      tags: [Nodes]
+      operationId: runNodeAction
+      summary: Cordon, uncordon, drain, rediscover, benchmark, or remove a node.
+      parameters:
+        - $ref: "#/components/parameters/NodeId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeActionRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /model-sources:
+    get:
+      tags: [Models]
+      operationId: listModelSources
+      summary: List configured public, private, local, and catalog model sources.
+      responses:
+        "200":
+          description: Model sources with all secrets redacted.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ModelSource"
+    post:
+      tags: [Models]
+      operationId: createModelSource
+      summary: Configure a model source.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelSourceInput"
+      responses:
+        "201":
+          description: Model source created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelSource"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /model-sources/{sourceId}:
+    get:
+      tags: [Models]
+      operationId: getModelSource
+      summary: Get one redacted model source.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      responses:
+        "200":
+          description: Model source.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelSource"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Models]
+      operationId: updateModelSource
+      summary: Update model source configuration or credentials.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModelSourceInput"
+      responses:
+        "200":
+          description: Updated source.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelSource"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Models]
+      operationId: deleteModelSource
+      summary: Remove a model source after dependency checks.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      responses:
+        "204":
+          description: Source removed.
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /model-sources/{sourceId}/test:
+    post:
+      tags: [Models]
+      operationId: testModelSource
+      summary: Validate source reachability and credentials without persisting returned secrets.
+      parameters:
+        - $ref: "#/components/parameters/SourceId"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /recommendations:
+    post:
+      tags: [Models]
+      operationId: createRecommendationRun
+      summary: Search configured sources and rank exact model artifacts for the selected fleet.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecommendationRequest"
+      responses:
+        "202":
+          description: Recommendation search accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecommendationRun"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /recommendations/{runId}:
+    get:
+      tags: [Models]
+      operationId: getRecommendationRun
+      summary: Get recommendation progress, evidence, candidates, and final choices.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Recommendation run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecommendationRun"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /models:
+    get:
+      tags: [Models]
+      operationId: listModelArtifacts
+      summary: List discovered, selected, cached, or deployed model artifacts.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: source_id
+          in: query
+          schema:
+            type: string
+        - name: state
+          in: query
+          schema:
+            type: string
+            enum: [discovered, selected, downloading, cached, verified, rejected, deployed]
+      responses:
+        "200":
+          description: Model artifact page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelArtifactPage"
+
+  /models/{artifactId}:
+    get:
+      tags: [Models]
+      operationId: getModelArtifact
+      summary: Get exact artifact identity, provenance, compatibility, and node cache locations.
+      parameters:
+        - $ref: "#/components/parameters/ArtifactId"
+      responses:
+        "200":
+          description: Model artifact.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelArtifact"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /spec:
+    get:
+      tags: [Desired state]
+      operationId: getDesiredSpec
+      summary: Get the current normalized desired-state document.
+      responses:
+        "200":
+          description: Desired state and revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesiredSpecRevision"
+    put:
+      tags: [Desired state]
+      operationId: replaceDesiredSpec
+      summary: Validate and store a new desired-state revision without applying it.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RiftSpec"
+          application/yaml:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Stored desired-state revision.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesiredSpecRevision"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /plans:
+    get:
+      tags: [Plans]
+      operationId: listPlans
+      summary: List recent immutable plans.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Plan page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanPage"
+    post:
+      tags: [Plans]
+      operationId: createPlan
+      summary: Compare desired state with live observed state and create an immutable plan.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRequest"
+      responses:
+        "201":
+          description: Immutable plan created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /plans/{planId}:
+    get:
+      tags: [Plans]
+      operationId: getPlan
+      summary: Get a reviewed plan, including actions, placement, risks, and blockers.
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+      responses:
+        "200":
+          description: Plan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /plans/{planId}/apply:
+    post:
+      tags: [Plans]
+      operationId: applyPlan
+      summary: Apply exactly the reviewed plan after checking its hash and current-state fingerprint.
+      parameters:
+        - $ref: "#/components/parameters/PlanId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApplyPlanRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /operations:
+    get:
+      tags: [Operations]
+      operationId: listOperations
+      summary: List current and historical controller operations.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/OperationStatus"
+      responses:
+        "200":
+          description: Operation page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationPage"
+
+  /operations/{operationId}:
+    get:
+      tags: [Operations]
+      operationId: getOperation
+      summary: Get operation stages, progress, result, and rollback state.
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "200":
+          description: Operation.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /operations/{operationId}/cancel:
+    post:
+      tags: [Operations]
+      operationId: cancelOperation
+      summary: Request safe cancellation. Completed or non-cancellable stages remain unchanged.
+      parameters:
+        - $ref: "#/components/parameters/OperationId"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /deployments:
+    get:
+      tags: [Deployments]
+      operationId: listDeployments
+      summary: List desired and observed LLM deployments.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/DeploymentStatus"
+      responses:
+        "200":
+          description: Deployment page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentPage"
+
+  /deployments/{deploymentId}:
+    get:
+      tags: [Deployments]
+      operationId: getDeployment
+      summary: Get one deployment, assignments, endpoint, health, and current revision.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+      responses:
+        "200":
+          description: Deployment.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Deployment"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /deployments/{deploymentId}/actions:
+    post:
+      tags: [Deployments]
+      operationId: runDeploymentAction
+      summary: Start, stop, restart, recover, benchmark, tune, rollback, or destroy a deployment.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeploymentActionRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /deployments/{deploymentId}/revisions:
+    get:
+      tags: [Deployments]
+      operationId: listDeploymentRevisions
+      summary: List normalized configuration and measured evidence for deployment revisions.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+      responses:
+        "200":
+          description: Deployment revisions.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeploymentRevision"
+
+  /deployments/{deploymentId}/logs:
+    get:
+      tags: [Deployments]
+      operationId: getDeploymentLogs
+      summary: Read redacted deployment logs from assigned nodes.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5000
+            default: 500
+      responses:
+        "200":
+          description: Log page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogPage"
+
+  /deployments/{deploymentId}/metrics:
+    get:
+      tags: [Deployments]
+      operationId: getDeploymentMetrics
+      summary: Get a bounded metrics window for one deployment.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Deployment metrics.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricSeriesSet"
+
+  /telemetry/latest:
+    get:
+      tags: [Telemetry]
+      operationId: getLatestTelemetry
+      summary: Read the latest node and managed-service resource samples.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: node
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Latest best-effort samples. Unsupported sensors are null and annotated in availability.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/series:
+    get:
+      tags: [Telemetry]
+      operationId: getTelemetrySeries
+      summary: Read raw or rolled-up telemetry samples for a session or service.
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: number }
+        - name: until
+          in: query
+          schema: { type: number }
+      responses:
+        "200":
+          description: Telemetry series.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/reports:
+    get:
+      tags: [Telemetry]
+      operationId: listResourceReports
+      summary: List completed service resource reports.
+      responses:
+        "200":
+          description: Completed reports retained after services stop or are deleted.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/reports/{reportId}:
+    get:
+      tags: [Telemetry]
+      operationId: getResourceReport
+      summary: Read one completed resource report.
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Resource report.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/ResourceReport" } }
+            text/csv: { schema: { type: string } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /telemetry/signals:
+    get:
+      tags: [Telemetry]
+      operationId: listResourceSignals
+      summary: List sustained resource threshold signals for managed services.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: Warning, critical, and hysteresis-clear signals.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /deployments/{deploymentId}/playground-session:
+    post:
+      tags: [Deployments]
+      operationId: createPlaygroundSession
+      summary: Create a short-lived credential for the separate OpenAI-compatible serving endpoint.
+      parameters:
+        - $ref: "#/components/parameters/DeploymentId"
+      responses:
+        "201":
+          description: Short-lived serving session. The bearer token is returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlaygroundSession"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /benchmarks:
+    get:
+      tags: [Performance]
+      operationId: listBenchmarks
+      summary: List reproducible benchmark results.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: deployment_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Benchmark page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BenchmarkPage"
+    post:
+      tags: [Performance]
+      operationId: runBenchmark
+      summary: Run a reproducible benchmark against a healthy deployment.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BenchmarkRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+
+  /benchmarks/{benchmarkId}:
+    get:
+      tags: [Performance]
+      operationId: getBenchmark
+      summary: Get benchmark configuration, evidence provenance, and measured results.
+      parameters:
+        - $ref: "#/components/parameters/BenchmarkId"
+      responses:
+        "200":
+          description: Benchmark result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Benchmark"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v2/tuning/profiles:
+    get:
+      tags: [Performance]
+      operationId: getTuningProfiles
+      summary: List autonomous tuning profiles supported by the controller.
+      responses:
+        "200":
+          description: Speed and cost profile definitions and measurement semantics.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, profiles]
+                properties:
+                  api_version: { type: string }
+                  profiles:
+                    type: array
+                    items:
+                      type: object
+                      required: [id, label, objective, metric]
+                      properties:
+                        id: { type: string, enum: [speed, cost] }
+                        label: { type: string }
+                        objective: { type: string }
+                        metric: { type: string }
+                        availability: { type: string }
+                        attribution: { type: string }
+
+  /v2/tuning/runs:
+    get:
+      tags: [Performance]
+      operationId: listTuningRuns
+      summary: List durable autonomous llama.cpp tuning runs and profile decisions.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: profile
+          in: query
+          schema: { type: string, enum: [speed, cost] }
+      responses:
+        "200":
+          description: Tuning run history.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, runs, count]
+                properties:
+                  api_version: { type: string }
+                  count: { type: integer }
+                  runs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TuningRun"
+    post:
+      tags: [Performance]
+      operationId: startTuningRun
+      summary: Start a durable autonomous speed or cost tuning operation.
+      description: |
+        The first implementation supports llama.cpp. Normal tuning preserves
+        model identity, weight quantization, K/V cache precision, context, and
+        concurrency. Candidate restarts require explicit allow_restart consent;
+        cost profiling requires usable GPU power telemetry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TuningRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+
+  /v2/tuning/runs/{runId}:
+    get:
+      tags: [Performance]
+      operationId: getTuningRun
+      summary: Get baseline, candidates, winner, explanations, events, and recommendation-only opportunities.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Tuning run.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TuningRun"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /incidents:
+    get:
+      tags: [Operations center]
+      operationId: listIncidents
+      summary: List open and historical incidents.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: state
+          in: query
+          schema:
+            type: string
+            enum: [open, acknowledged, recovering, resolved]
+      responses:
+        "200":
+          description: Incident page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IncidentPage"
+
+  /incidents/{incidentId}:
+    get:
+      tags: [Operations center]
+      operationId: getIncident
+      summary: Get incident timeline, affected resources, evidence, and recovery state.
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      responses:
+        "200":
+          description: Incident.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Incident"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /incidents/{incidentId}/actions:
+    post:
+      tags: [Operations center]
+      operationId: runIncidentAction
+      summary: Acknowledge, recover, or resolve an incident.
+      parameters:
+        - $ref: "#/components/parameters/IncidentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IncidentActionRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /audit-events:
+    get:
+      tags: [Operations center]
+      operationId: listAuditEvents
+      summary: List immutable redacted controller audit events.
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: resource_id
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Audit event page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditEventPage"
+
+  /gateway:
+    get:
+      tags: [Gateway]
+      operationId: getGateway
+      summary: Get gateway health, routing, limits, and public serving endpoints.
+      responses:
+        "200":
+          description: Gateway configuration and observed state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Gateway"
+    put:
+      tags: [Gateway]
+      operationId: updateGateway
+      summary: Validate and update gateway policy. Listener changes are applied through an operation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewaySpec"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+
+  /gateway/keys:
+    get:
+      tags: [Gateway]
+      operationId: listGatewayKeys
+      summary: List key metadata and quotas. Key secrets are never returned.
+      responses:
+        "200":
+          description: Gateway key metadata.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/GatewayKeyMetadata"
+    post:
+      tags: [Gateway]
+      operationId: createGatewayKey
+      summary: Create a serving API key whose secret is returned exactly once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GatewayKeyRequest"
+      responses:
+        "201":
+          description: Gateway key created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayKeySecret"
+
+  /gateway/keys/{keyId}:
+    delete:
+      tags: [Gateway]
+      operationId: revokeGatewayKey
+      summary: Revoke a serving API key.
+      parameters:
+        - $ref: "#/components/parameters/KeyId"
+      responses:
+        "204":
+          description: Key revoked.
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /settings:
+    get:
+      tags: [Settings]
+      operationId: getSettings
+      summary: Get redacted controller, security, retention, and policy settings.
+      responses:
+        "200":
+          description: Controller settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControllerSettings"
+    put:
+      tags: [Settings]
+      operationId: updateSettings
+      summary: Validate and store controller settings without exposing stored secrets.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ControllerSettings"
+      responses:
+        "200":
+          description: Updated settings.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ControllerSettings"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /v2/mesh/sightings:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    get:
+      tags: [Mesh discovery]
+      operationId: listMeshSightingsV2
+      summary: List current untrusted node sightings.
+      description: |
+        Returns non-expired discovery observations and provider diagnostics.
+        A sighting never grants trust, remote-action permission, or routing
+        eligibility. The current preview endpoint is loopback-oriented and does
+        not yet implement controller operator authentication.
+      security: []
+      responses:
+        "200":
+          description: Current discovery observations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshSightingsResponse"
+
+  /v2/mesh/enrollment-window:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Loopback operator API
+    get:
+      tags: [Mesh enrollment]
+      operationId: getMeshEnrollmentWindowV2
+      summary: Get the current short-lived managed-node enrollment window.
+      security: []
+      responses:
+        "200":
+          description: Window state. Pairing codes are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollmentWindow"
+    post:
+      tags: [Mesh enrollment]
+      operationId: openMeshEnrollmentWindowV2
+      summary: Open the TLS bootstrap listener and mDNS advertisement.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ttl_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 3600
+                  default: 600
+      responses:
+        "200":
+          description: Enrollment window opened.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollmentWindow"
+    delete:
+      tags: [Mesh enrollment]
+      operationId: closeMeshEnrollmentWindowV2
+      summary: Close the bootstrap listener and stop advertising the controller.
+      security: []
+      responses:
+        "200":
+          description: Enrollment window closed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollmentWindow"
+
+  /v2/mesh/discover:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh discovery]
+      operationId: discoverMeshNodesV2
+      summary: Run registered discovery providers.
+      description: |
+        Invokes all registered providers or the requested provider names.
+        Passive mDNS and ADB are registered by the default controller. Private
+        subnet, USB-network, and mass-storage providers may be registered for
+        this scan through explicit request options; subnet-style scanning also
+        requires its matching consent flag.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                providers:
+                  type: array
+                  uniqueItems: true
+                  items:
+                    type: string
+                  examples:
+                    - [mdns, adb]
+                private_networks:
+                  type: array
+                  items:
+                    type: string
+                  examples:
+                    - [192.168.1.0/24]
+                allow_subnet_scan:
+                  type: boolean
+                  default: false
+                max_hosts:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 256
+                usb_networks:
+                  type: array
+                  items:
+                    type: string
+                  examples:
+                    - [192.168.55.0/30]
+                allow_usb_scan:
+                  type: boolean
+                  default: false
+                max_usb_hosts:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 32
+                storage_roots:
+                  type: array
+                  items:
+                    type: string
+                  description: Explicit removable-media roots to inspect for .rift/rift-node.json.
+      responses:
+        "200":
+          description: Updated untrusted sighting inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshSightingsResponse"
+        "400":
+          description: Invalid provider list or unknown provider.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "403":
+          description: A provider requires explicit consent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/enrollments:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    get:
+      tags: [Mesh enrollment]
+      operationId: listManagedMeshEnrollmentsV2
+      summary: List safe managed-node enrollment metadata.
+      description: Pairing codes, private keys, CSRs, and certificate envelopes are never returned.
+      security: []
+      responses:
+        "200":
+          description: Pending and completed enrollment sessions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, enrollments]
+                properties:
+                  api_version: { const: "2" }
+                  enrollments:
+                    type: array
+                    items: { $ref: "#/components/schemas/ManagedMeshEnrollment" }
+    post:
+      tags: [Mesh enrollment]
+      operationId: beginMeshEnrollmentV2
+      summary: Begin explicit pairing for an untrusted sighting.
+      description: |
+        Creates a six-digit challenge whose verifier is stored as an scrypt
+        hash. The code is obtained from the node's trusted display or channel;
+        it is not returned by this controller response.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sighting_id]
+              properties:
+                sighting_id:
+                  type: string
+                ttl_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 900
+                  default: 120
+      responses:
+        "200":
+          description: Pairing challenge created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollment"
+        "400":
+          description: Unknown/expired sighting or invalid TTL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/enrollments/{enrollmentId}/approve:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh enrollment]
+      operationId: approveMeshEnrollmentV2
+      summary: Approve a pending pairing challenge.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/MeshEnrollmentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pairing_code]
+              properties:
+                pairing_code:
+                  type: string
+                  pattern: "^[0-9]{6}$"
+                  writeOnly: true
+      responses:
+        "200":
+          description: Pairing approved; certificate activation is still required.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollmentResult"
+        "400":
+          description: Unknown enrollment or invalid state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "403":
+          description: Pairing code does not match.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "410":
+          description: Pairing challenge expired.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/enrollments/{enrollmentId}/certificate:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh enrollment]
+      operationId: issueMeshNodeCertificateV2
+      summary: Issue and activate a node client certificate from a CSR.
+      description: |
+        Pairing must already be approved. The signed CSR common name must match
+        the controller-assigned node ID. The response contains sensitive
+        certificate material and must only be transported over an authenticated,
+        confidential operator/bootstrap channel in a physical deployment.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/MeshEnrollmentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csr_pem]
+              properties:
+                csr_pem:
+                  type: string
+                  writeOnly: true
+      responses:
+        "200":
+          description: Certificate issued and node activated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshCertificateResult"
+        "400":
+          description: Invalid CSR or enrollment state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "403":
+          description: Pairing is not approved or CSR identity does not match.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/enrollments/{enrollmentId}/activate:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh enrollment]
+      operationId: activateMeshEnrollmentV2
+      summary: Activate an enrollment with an externally issued certificate fingerprint.
+      description: Controlled integration and external-PKI path; managed CSR issuance is preferred.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/MeshEnrollmentId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [certificate_fingerprint]
+              properties:
+                certificate_fingerprint:
+                  $ref: "#/components/schemas/MeshCertificateFingerprint"
+      responses:
+        "200":
+          description: Node activated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshEnrollmentResult"
+        "400":
+          description: Invalid fingerprint, enrollment, or state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/nodes:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    get:
+      tags: [Mesh enrollment]
+      operationId: listMeshNodesV2
+      summary: List enrolled, active, and revoked mesh nodes.
+      security: []
+      responses:
+        "200":
+          description: Persistent trusted-node inventory.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshNodesResponse"
+
+  /v2/mesh/nodes/{nodeId}/telemetry:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh topology]
+      operationId: publishMeshTelemetryV2
+      summary: Publish consent-controlled, sequence-ordered node telemetry.
+      security:
+        - controllerBearer: []
+      parameters:
+        - $ref: "#/components/parameters/MeshNodeId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeshTelemetrySnapshot"
+      responses:
+        '200':
+          description: Telemetry accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshTelemetryResponse"
+        '403': { description: Node is not active or telemetry is not authorized. }
+        '409': { description: Telemetry sequence is stale. }
+
+  /v2/mesh/nodes/{nodeId}/capabilities:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh topology]
+      operationId: publishMeshCapabilitiesV2
+      summary: Publish a monotonically increasing node capability snapshot.
+      description: |
+        The node record must already be ACTIVE. The current local-preview HTTP
+        server enforces the state gate but does not yet bind this request to a
+        presented node client certificate; production controller TLS/mTLS is a
+        physical acceptance requirement.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/MeshNodeId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeshCapabilitySnapshot"
+      responses:
+        "200":
+          description: Capability state accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, node]
+                properties:
+                  api_version:
+                    const: "2"
+                  node:
+                    $ref: "#/components/schemas/MeshNode"
+        "400":
+          description: Invalid or non-increasing sequence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "403":
+          description: Node is not active.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/links:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh topology]
+      operationId: publishMeshLinkV2
+      summary: Record one directional link measurement.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeshLinkMeasurement"
+      responses:
+        "200":
+          description: Newest link evidence retained.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, link]
+                properties:
+                  api_version:
+                    const: "2"
+                  link:
+                    $ref: "#/components/schemas/MeshLinkMeasurement"
+        "400":
+          description: Invalid endpoint or measurement values.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+        "403":
+          description: Both endpoints are not active nodes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /v2/mesh/topology:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    get:
+      tags: [Mesh topology]
+      operationId: getMeshTopologyV2
+      summary: Get trusted nodes and retained directional links.
+      security: []
+      responses:
+        "200":
+          description: Current controller topology state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshTopologyResponse"
+
+  /v2/mesh/routes/resolve:
+    servers:
+      - url: http://127.0.0.1:8777
+        description: Implemented local preview controller
+    post:
+      tags: [Mesh routing]
+      operationId: resolveMeshRouteV2
+      summary: Select a feasible inference offer and issue a route lease.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeshRouteRequest"
+      responses:
+        "200":
+          description: Route decision and short-lived cached-autonomy lease.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshRouteResponse"
+        "400":
+          description: Invalid intent or no feasible route.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeshError"
+
+  /metrics/prometheus:
+    get:
+      tags: [Operations center]
+      operationId: getPrometheusMetrics
+      summary: Export controller and known fleet metrics in Prometheus text format.
+      responses:
+        "200":
+          description: Prometheus exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    controllerSession:
+      type: apiKey
+      in: cookie
+      name: rift_session
+    controllerBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: RIFT controller token
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    LastEventId:
+      name: Last-Event-ID
+      in: header
+      required: false
+      schema:
+        type: string
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Expected desired-state revision or ETag.
+      schema:
+        type: string
+    RequestId:
+      name: X-Request-ID
+      in: header
+      required: false
+      description: Client idempotency key. Reuse it to safely retry a mutation.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 200
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TokenId:
+      name: tokenId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SourceId:
+      name: sourceId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ArtifactId:
+      name: artifactId
+      in: path
+      required: true
+      schema:
+        type: string
+    PlanId:
+      name: planId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeploymentId:
+      name: deploymentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    BenchmarkId:
+      name: benchmarkId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IncidentId:
+      name: incidentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    KeyId:
+      name: keyId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    MeshEnrollmentId:
+      name: enrollmentId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^enroll-[A-Za-z0-9_-]+$"
+    MeshNodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema:
+        type: string
+        pattern: "^node-[A-Za-z0-9_-]+$"
+
+  responses:
+    OperationAccepted:
+      description: Long-running operation accepted.
+      headers:
+        Location:
+          description: URL of the operation resource.
+          schema:
+            type: string
+            format: uri-reference
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Operation"
+    Unauthorized:
+      description: Authentication is required or invalid.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Forbidden:
+      description: The authenticated principal is not allowed to perform this action.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Conflict:
+      description: Desired state, observed state, generation, or plan fingerprint conflicts.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationFailed:
+      description: Request or desired state failed validation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unavailable:
+      description: Controller or required dependency is not ready.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    LivePlan:
+      type: object
+      required: [rift_product, schema_version, plan_id, plan_hash, actions, services]
+      properties:
+        rift_product: { type: string, const: RIFT }
+        schema_version: { type: integer, const: 1 }
+        plan_id: { type: string }
+        plan_hash: { type: string }
+        config_path: { type: string }
+        materialized_config: { type: string }
+        read_only: { type: boolean, const: true }
+        actions: { type: array, items: { type: object, additionalProperties: true } }
+        services: { type: object, additionalProperties: true }
+        nodes: { type: array, items: { type: object, additionalProperties: true } }
+        drift: { type: array, items: { type: object, additionalProperties: true } }
+
+    LiveOperation:
+      type: object
+      required: [schema_version, request_id, operation_id, action, status, stage, percent]
+      properties:
+        schema_version: { type: integer, const: 2 }
+        request_id: { type: string }
+        operation_id: { type: string }
+        action: { type: string }
+        actor: { type: string }
+        status:
+          type: string
+          enum: [RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+        stage: { type: string }
+        message: { type: string }
+        percent: { type: [number, "null"], minimum: 0, maximum: 100 }
+        payload_sha256: { type: [string, "null"] }
+        created_unix_seconds: { type: number }
+        updated_unix_seconds: { type: number }
+        completed_unix_seconds: { type: number }
+        error: { type: string }
+        result: { type: object, additionalProperties: true }
+        details: { type: object, additionalProperties: true }
+
+    EvaluationRun:
+      type: object
+      required: [run_id, suite, status, service, summary, cases]
+      properties:
+        run_id: { type: string }
+        service: { type: string }
+        backend: { type: string }
+        status: { type: string, enum: [running, completed, deadline, not_run] }
+        available: { type: boolean }
+        required: { type: boolean }
+        suite: { type: object, additionalProperties: true }
+        summary: { type: object, additionalProperties: { type: integer, minimum: 0 } }
+        cases:
+          type: array
+          items:
+            type: object
+            required: [case_id, status, criteria, detail]
+            properties:
+              case_id: { type: string }
+              status: { type: string, enum: [pass, fail, not_assessed, error] }
+              criteria: { type: string }
+              detail: { type: string }
+              elapsed_seconds: { type: [number, "null"] }
+              response: { type: string, description: Returned only with explicit retention consent. }
+              judge:
+                type: object
+                properties:
+                  status: { type: string, enum: [not_assessed, assessed, error] }
+                  score: { type: [number, "null"], minimum: 0, maximum: 1 }
+                  detail: { type: [string, "null"] }
+        model_revision: { type: object, additionalProperties: true }
+        configuration: { type: object, additionalProperties: true }
+        assessment: { type: string }
+        report_path: { type: string }
+
+    Problem:
+      type: object
+      required: [type, title, status, detail, code, request_id]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+        title:
+          type: string
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri-reference
+        code:
+          type: string
+        request_id:
+          type: string
+        retryable:
+          type: boolean
+          default: false
+        errors:
+          type: array
+          items:
+            type: object
+            required: [path, message]
+            properties:
+              path:
+                type: string
+              message:
+                type: string
+
+    HealthStatus:
+      type: object
+      required: [ok, status, version, time]
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: string
+          enum: [live, ready, degraded, unavailable]
+        version:
+          type: string
+        time:
+          type: string
+          format: date-time
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+
+    Controller:
+      type: object
+      required: [id, name, mode, version, api_version, initialized, capabilities]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        mode:
+          type: string
+          enum: [standalone, controller]
+        version:
+          type: string
+        api_version:
+          type: string
+          const: v1
+        initialized:
+          type: boolean
+        public_url:
+          type: [string, "null"]
+          format: uri
+        capabilities:
+          type: object
+          required: [node_enrollment, remote_apply, event_stream, gateway, benchmarks, tuning]
+          properties:
+            node_enrollment:
+              type: boolean
+            remote_apply:
+              type: boolean
+            event_stream:
+              type: boolean
+            gateway:
+              type: boolean
+            benchmarks:
+              type: boolean
+            tuning:
+              type: boolean
+            unsupported_reasons:
+              type: array
+              items:
+                type: string
+
+    SetupRequest:
+      type: object
+      required: [name, mode]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        mode:
+          type: string
+          enum: [standalone, controller]
+        bind_host:
+          type: string
+          default: 127.0.0.1
+        public_url:
+          type: [string, "null"]
+          format: uri
+        enroll_local_agent:
+          type: boolean
+          default: true
+        create_admin_session:
+          type: boolean
+          default: true
+
+    SetupState:
+      type: object
+      required: [initialized, step, controller]
+      properties:
+        initialized:
+          type: boolean
+        step:
+          type: string
+          enum: [welcome, controller, nodes, model_source, recommendation, plan, apply, complete]
+        controller:
+          oneOf:
+            - $ref: "#/components/schemas/Controller"
+            - type: "null"
+        local_agent:
+          oneOf:
+            - $ref: "#/components/schemas/NodeSummary"
+            - type: "null"
+        next_actions:
+          type: array
+          items:
+            type: string
+
+    ResourceMetadata:
+      type: object
+      required: [id, name, generation, created_at, updated_at, labels]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        generation:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    Condition:
+      type: object
+      required: [type, status, reason, message, observed_at]
+      properties:
+        type:
+          type: string
+        status:
+          type: string
+          enum: ["true", "false", unknown]
+        reason:
+          type: string
+        message:
+          type: string
+        observed_at:
+          type: string
+          format: date-time
+
+    EnrollmentTokenRequest:
+      type: object
+      properties:
+        label:
+          type: string
+          maxLength: 100
+        expires_in_seconds:
+          type: integer
+          minimum: 60
+          maximum: 86400
+          default: 900
+        max_uses:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    EnrollmentTokenMetadata:
+      type: object
+      required: [id, label, created_at, expires_at, max_uses, uses, revoked]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        max_uses:
+          type: integer
+        uses:
+          type: integer
+        revoked:
+          type: boolean
+
+    EnrollmentTokenSecret:
+      allOf:
+        - $ref: "#/components/schemas/EnrollmentTokenMetadata"
+        - type: object
+          required: [token, join_endpoint, join_command]
+          properties:
+            token:
+              type: string
+              writeOnly: true
+            join_endpoint:
+              type: string
+              format: uri
+            join_command:
+              type: string
+
+    NodeStatus:
+      type: string
+      enum: [pending, enrolling, ready, not_ready, cordoned, draining, offline, removed]
+
+    NodeSummary:
+      type: object
+      required: [metadata, status, last_heartbeat_at, allocatable, conditions]
+      properties:
+        metadata:
+          $ref: "#/components/schemas/ResourceMetadata"
+        status:
+          $ref: "#/components/schemas/NodeStatus"
+        last_heartbeat_at:
+          type: [string, "null"]
+          format: date-time
+        allocatable:
+          $ref: "#/components/schemas/ResourceCapacity"
+        conditions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Condition"
+
+    Node:
+      allOf:
+        - $ref: "#/components/schemas/NodeSummary"
+        - type: object
+          required: [agent, hardware, backends, model_cache, assignments]
+          properties:
+            agent:
+              $ref: "#/components/schemas/AgentStatus"
+            hardware:
+              $ref: "#/components/schemas/HardwareProfile"
+            backends:
+              type: array
+              items:
+                $ref: "#/components/schemas/BackendStatus"
+            model_cache:
+              type: array
+              items:
+                $ref: "#/components/schemas/CachedArtifact"
+            assignments:
+              type: array
+              items:
+                $ref: "#/components/schemas/Assignment"
+
+    NodePage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/NodeSummary"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    AgentStatus:
+      type: object
+      required: [version, protocol_version, connected, certificate_expires_at]
+      properties:
+        version:
+          type: string
+        protocol_version:
+          type: string
+        connected:
+          type: boolean
+        connected_at:
+          type: [string, "null"]
+          format: date-time
+        certificate_expires_at:
+          type: string
+          format: date-time
+        update_available:
+          type: boolean
+
+    HardwareProfile:
+      type: object
+      required: [os, architecture, cpu, memory, gpus, disks, pressure]
+      properties:
+        os:
+          type: object
+          required: [family, version]
+          properties:
+            family:
+              type: string
+            version:
+              type: string
+        architecture:
+          type: string
+        cpu:
+          type: object
+          required: [model, physical_cores, logical_cores]
+          properties:
+            model:
+              type: string
+            physical_cores:
+              type: integer
+            logical_cores:
+              type: integer
+        memory:
+          $ref: "#/components/schemas/CapacityUsage"
+        gpus:
+          type: array
+          items:
+            $ref: "#/components/schemas/GpuDevice"
+        disks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiskDevice"
+        pressure:
+          type: object
+          required: [memory, disk, thermal]
+          properties:
+            memory:
+              type: string
+              enum: [normal, elevated, critical, unknown]
+            disk:
+              type: string
+              enum: [normal, elevated, critical, unknown]
+            thermal:
+              type: string
+              enum: [normal, elevated, critical, unknown]
+        measured_at:
+          type: string
+          format: date-time
+
+    CapacityUsage:
+      type: object
+      required: [total_bytes, used_bytes, available_bytes]
+      properties:
+        total_bytes:
+          type: integer
+          minimum: 0
+        used_bytes:
+          type: integer
+          minimum: 0
+        available_bytes:
+          type: integer
+          minimum: 0
+
+    ResourceCapacity:
+      type: object
+      required: [cpu_millicores, memory_bytes, vram_bytes, disk_bytes]
+      properties:
+        cpu_millicores:
+          type: integer
+          minimum: 0
+        memory_bytes:
+          type: integer
+          minimum: 0
+        vram_bytes:
+          type: integer
+          minimum: 0
+        disk_bytes:
+          type: integer
+          minimum: 0
+
+    GpuDevice:
+      type: object
+      required: [id, vendor, model, total_vram_bytes, available_vram_bytes]
+      properties:
+        id:
+          type: string
+        vendor:
+          type: string
+        model:
+          type: string
+        total_vram_bytes:
+          type: integer
+        available_vram_bytes:
+          type: integer
+        compute_capability:
+          type: [string, "null"]
+        driver_version:
+          type: [string, "null"]
+        temperature_celsius:
+          type: [number, "null"]
+        power_limit_watts:
+          type: [number, "null"]
+
+    DiskDevice:
+      type: object
+      required: [path, total_bytes, available_bytes, writable]
+      properties:
+        path:
+          type: string
+        media_type:
+          type: string
+          enum: [nvme, ssd, hdd, network, unknown]
+        total_bytes:
+          type: integer
+        available_bytes:
+          type: integer
+        writable:
+          type: boolean
+        sequential_read_bytes_per_second:
+          type: [number, "null"]
+        measurement_source:
+          type: string
+          enum: [measured, reported, estimated, unknown]
+
+    BackendStatus:
+      type: object
+      required: [id, name, installed, support_level, formats, health]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        version:
+          type: [string, "null"]
+        installed:
+          type: boolean
+        support_level:
+          type: string
+          enum: [verified, accepted, experimental, platform_gated, unsupported]
+        formats:
+          type: array
+          items:
+            type: string
+            enum: [gguf, gptq, awq, safetensors, fp16, bf16]
+        health:
+          type: string
+          enum: [healthy, unavailable, degraded, unknown]
+        blockers:
+          type: array
+          items:
+            type: string
+
+    CachedArtifact:
+      type: object
+      required: [artifact_id, path, bytes, verified, last_accessed_at]
+      properties:
+        artifact_id:
+          type: string
+        path:
+          type: string
+        bytes:
+          type: integer
+        verified:
+          type: boolean
+        last_accessed_at:
+          type: string
+          format: date-time
+
+    NodeActionRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [cordon, uncordon, drain, rediscover, benchmark, remove]
+        reason:
+          type: string
+        force:
+          type: boolean
+          default: false
+
+    ModelSourceInput:
+      type: object
+      required: [name, kind]
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [huggingface, private_hub, local_directory, catalog]
+        endpoint:
+          type: [string, "null"]
+          format: uri
+        path:
+          type: [string, "null"]
+        token:
+          type: [string, "null"]
+          writeOnly: true
+        enabled:
+          type: boolean
+          default: true
+        policy:
+          type: object
+          additionalProperties: true
+
+    ModelSource:
+      type: object
+      required: [id, name, kind, enabled, credential_state, health]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [huggingface, private_hub, local_directory, catalog]
+        endpoint:
+          type: [string, "null"]
+          format: uri
+        path:
+          type: [string, "null"]
+        enabled:
+          type: boolean
+        credential_state:
+          type: string
+          enum: [not_required, configured, missing, invalid]
+        health:
+          type: string
+          enum: [ready, degraded, unavailable, unchecked]
+        last_checked_at:
+          type: [string, "null"]
+          format: date-time
+
+    RecommendationRequest:
+      type: object
+      required: [task]
+      properties:
+        task:
+          type: string
+          enum: [chat, coding, documents, rag, agent, custom]
+        custom_task:
+          type: [string, "null"]
+        source_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        node_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        requirements:
+          $ref: "#/components/schemas/WorkloadRequirements"
+        candidate_limit:
+          type: integer
+          minimum: 10
+          maximum: 1000
+          default: 200
+        refresh:
+          type: boolean
+          default: false
+
+    RecommendationRun:
+      type: object
+      required: [id, status, progress_percent, requested_at, recommendations, warnings]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, searching, enriching, ranking, succeeded, failed, cancelled]
+        progress_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+        requested_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+        recommendations:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelRecommendation"
+        warnings:
+          type: array
+          items:
+            type: string
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/Problem"
+            - type: "null"
+
+    ModelRecommendation:
+      type: object
+      required: [category, artifact, backend, placement, fit, quality, reasons, warnings]
+      properties:
+        category:
+          type: string
+          enum: [recommended, higher_quality, higher_speed]
+        artifact:
+          $ref: "#/components/schemas/ModelArtifact"
+        backend:
+          $ref: "#/components/schemas/BackendChoice"
+        placement:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlacementDecision"
+        fit:
+          $ref: "#/components/schemas/ResourceEstimate"
+        quality:
+          $ref: "#/components/schemas/QualityEvidence"
+        expected_performance:
+          $ref: "#/components/schemas/PerformanceEstimate"
+        reasons:
+          type: array
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+
+    ModelArtifact:
+      type: object
+      required: [id, source_id, model_id, revision, file, format, bytes, provenance, compatibility]
+      properties:
+        id:
+          type: string
+        source_id:
+          type: string
+          format: uuid
+        model_id:
+          type: string
+        revision:
+          type: string
+        file:
+          type: string
+        format:
+          type: string
+          enum: [gguf, gptq, awq, safetensors, fp16, bf16]
+        quantization:
+          type: [string, "null"]
+        parameters_billion:
+          type: [number, "null"]
+        bytes:
+          type: integer
+          minimum: 0
+        sha256:
+          type: [string, "null"]
+          pattern: "^[a-fA-F0-9]{64}$"
+        license:
+          type: [string, "null"]
+        gated:
+          type: boolean
+        provenance:
+          type: object
+          required: [source, size_evidence, hash_evidence]
+          properties:
+            source:
+              type: string
+            size_evidence:
+              type: string
+              enum: [exact, publisher, estimated, unknown]
+            hash_evidence:
+              type: string
+              enum: [verified_local, publisher, absent]
+        compatibility:
+          type: array
+          items:
+            type: object
+            required: [backend, supported, support_level, reasons]
+            properties:
+              backend:
+                type: string
+              supported:
+                type: boolean
+              support_level:
+                type: string
+              reasons:
+                type: array
+                items:
+                  type: string
+        cached_on:
+          type: array
+          items:
+            type: string
+            format: uuid
+
+    ModelArtifactPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelArtifact"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    BackendChoice:
+      type: object
+      required: [provider, support_level, install_required, reasons]
+      properties:
+        provider:
+          type: string
+        version:
+          type: [string, "null"]
+        support_level:
+          type: string
+          enum: [verified, accepted, experimental, platform_gated, unsupported]
+        install_required:
+          type: boolean
+        reasons:
+          type: array
+          items:
+            type: string
+
+    PlacementDecision:
+      type: object
+      required: [node_id, replicas, score, reasons, rejected_alternatives]
+      properties:
+        node_id:
+          type: string
+          format: uuid
+        replicas:
+          type: integer
+          minimum: 1
+        score:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+        rejected_alternatives:
+          type: array
+          items:
+            type: object
+            required: [node_id, reasons]
+            properties:
+              node_id:
+                type: string
+                format: uuid
+              reasons:
+                type: array
+                items:
+                  type: string
+
+    ResourceEstimate:
+      type: object
+      required: [model_bytes, disk_bytes, memory_bytes, vram_bytes, kv_cache_bytes, fits, confidence]
+      properties:
+        model_bytes:
+          type: integer
+        disk_bytes:
+          type: integer
+        memory_bytes:
+          type: integer
+        vram_bytes:
+          type: integer
+        kv_cache_bytes:
+          type: integer
+        fits:
+          type: boolean
+        confidence:
+          type: string
+          enum: [measured, exact, published, estimated, unknown]
+
+    QualityEvidence:
+      type: object
+      required: [score, confidence, highest_level, evidence]
+      properties:
+        score:
+          type: number
+          minimum: 0
+          maximum: 1
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        highest_level:
+          type: string
+          enum: [local_evaluation, reproducible_benchmark, curated_evaluation, publisher_claim, hub_metadata, unknown]
+        evidence:
+          type: array
+          items:
+            type: object
+            required: [level, source, description]
+            properties:
+              level:
+                type: string
+              source:
+                type: string
+              description:
+                type: string
+              value:
+                type: [number, string, "null"]
+
+    PerformanceEstimate:
+      type: object
+      required: [source]
+      properties:
+        source:
+          type: string
+          enum: [measured_local, measured_equivalent, published, modeled, unknown]
+        decode_tokens_per_second:
+          type: [number, "null"]
+        time_to_first_token_seconds:
+          type: [number, "null"]
+        range:
+          type: [string, "null"]
+
+    WorkloadRequirements:
+      type: object
+      properties:
+        context_length:
+          type: integer
+          minimum: 128
+          default: 4096
+        concurrency:
+          type: integer
+          minimum: 1
+          default: 1
+        replicas:
+          type: integer
+          minimum: 1
+          default: 1
+        latency_priority:
+          type: string
+          enum: [quality, balanced, speed]
+          default: balanced
+        minimum_quality_score:
+          type: [number, "null"]
+          minimum: 0
+          maximum: 1
+        max_download_bytes:
+          type: [integer, "null"]
+        required_labels:
+          type: object
+          additionalProperties:
+            type: string
+
+    RiftSpec:
+      type: object
+      required: [apiVersion, kind, metadata, services, policies]
+      properties:
+        apiVersion:
+          type: string
+          const: rift.dev/v1
+        kind:
+          type: string
+          const: RiftProject
+        metadata:
+          type: object
+          required: [name]
+          properties:
+            name:
+              type: string
+            labels:
+              type: object
+              additionalProperties:
+                type: string
+        services:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ServiceSpec"
+        policies:
+          $ref: "#/components/schemas/ProjectPolicies"
+
+    DesiredSpecRevision:
+      type: object
+      required: [revision, hash, spec, created_at, created_by]
+      properties:
+        revision:
+          type: integer
+          minimum: 1
+        hash:
+          type: string
+        spec:
+          $ref: "#/components/schemas/RiftSpec"
+        created_at:
+          type: string
+          format: date-time
+        created_by:
+          type: string
+
+    ServiceSpec:
+      type: object
+      required: [name, task, model, replicas, serving, placement, recovery]
+      properties:
+        name:
+          type: string
+          pattern: "^[a-z][a-z0-9-]{0,62}$"
+        task:
+          type: string
+          enum: [chat, coding, documents, rag, agent, custom]
+        model:
+          type: object
+          required: [selection]
+          properties:
+            selection:
+              type: string
+              enum: [automatic, pinned]
+            artifact_id:
+              type: [string, "null"]
+            recommendation_run_id:
+              type: [string, "null"]
+              format: uuid
+            category:
+              type: string
+              enum: [recommended, higher_quality, higher_speed]
+              default: recommended
+        replicas:
+          type: integer
+          minimum: 1
+          default: 1
+        serving:
+          type: object
+          required: [context_length, concurrency]
+          properties:
+            context_length:
+              type: integer
+              minimum: 128
+            concurrency:
+              type: integer
+              minimum: 1
+            backend:
+              type: string
+              default: auto
+            provider_options:
+              type: object
+              additionalProperties: true
+        placement:
+          type: object
+          properties:
+            node_ids:
+              type: array
+              items:
+                type: string
+                format: uuid
+            required_labels:
+              type: object
+              additionalProperties:
+                type: string
+            spread:
+              type: boolean
+              default: true
+        recovery:
+          type: object
+          required: [restart_limit, reschedule_on_node_failure]
+          properties:
+            restart_limit:
+              type: integer
+              minimum: 0
+              default: 3
+            reschedule_on_node_failure:
+              type: boolean
+              default: true
+            rollback_on_regression:
+              type: boolean
+              default: true
+        tuning:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              default: false
+            candidate_limit:
+              type: integer
+              minimum: 1
+              maximum: 20
+              default: 4
+
+    ProjectPolicies:
+      type: object
+      required: [allow_backend_install, allow_model_download, allow_remote_launch, require_artifact_hash]
+      properties:
+        allow_backend_install:
+          type: boolean
+        allow_model_download:
+          type: boolean
+        allow_remote_launch:
+          type: boolean
+        require_artifact_hash:
+          type: boolean
+        permitted_licenses:
+          type: array
+          items:
+            type: string
+        disk_reserve_bytes:
+          type: integer
+          minimum: 0
+        public_exposure:
+          type: string
+          enum: [forbidden, gateway_only, allowed]
+
+    PlanRequest:
+      type: object
+      properties:
+        spec_revision:
+          type: [integer, "null"]
+          minimum: 1
+        spec:
+          oneOf:
+            - $ref: "#/components/schemas/RiftSpec"
+            - type: "null"
+        optimization:
+          type: string
+          enum: [exact, propose_tuning]
+          default: exact
+
+    Plan:
+      type: object
+      required: [id, hash, spec_revision, observed_state_hash, status, created_at, expires_at, summary, actions, placements, warnings, blockers]
+      properties:
+        id:
+          type: string
+          format: uuid
+        hash:
+          type: string
+        spec_revision:
+          type: integer
+        observed_state_hash:
+          type: string
+        status:
+          type: string
+          enum: [ready, blocked, stale, applied, expired]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        summary:
+          type: object
+          required: [create, update, replace, delete, noop]
+          properties:
+            create:
+              type: integer
+            update:
+              type: integer
+            replace:
+              type: integer
+            delete:
+              type: integer
+            noop:
+              type: integer
+        actions:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanAction"
+        placements:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlacementDecision"
+        estimates:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/ResourceEstimate"
+        warnings:
+          type: array
+          items:
+            type: string
+        blockers:
+          type: array
+          items:
+            type: string
+
+    PlanAction:
+      type: object
+      required: [id, kind, effect, risk, summary, requires_approval]
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [install, download, verify, configure, place, launch, expose, benchmark, recover, stop, delete]
+        effect:
+          type: string
+          enum: [create, update, replace, delete, noop]
+        risk:
+          type: string
+          enum: [none, low, medium, high]
+        node_id:
+          type: [string, "null"]
+          format: uuid
+        service_name:
+          type: [string, "null"]
+        summary:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+        requires_approval:
+          type: boolean
+        reversible:
+          type: boolean
+
+    PlanPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Plan"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    ApplyPlanRequest:
+      type: object
+      required: [plan_hash, approved]
+      properties:
+        plan_hash:
+          type: string
+        approved:
+          type: boolean
+          const: true
+        approval_note:
+          type: string
+          maxLength: 500
+
+    OperationStatus:
+      type: string
+      enum: [queued, running, cancelling, succeeded, failed, cancelled, rolling_back, rolled_back, partial]
+
+    Operation:
+      type: object
+      required: [id, kind, status, progress_percent, cancellable, created_at, stages]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+        status:
+          $ref: "#/components/schemas/OperationStatus"
+        progress_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+        cancellable:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+        plan_id:
+          type: [string, "null"]
+          format: uuid
+        stages:
+          type: array
+          items:
+            $ref: "#/components/schemas/OperationStage"
+        result:
+          type: [object, "null"]
+          additionalProperties: true
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/Problem"
+            - type: "null"
+
+    OperationStage:
+      type: object
+      required: [id, label, status, progress_percent]
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        node_id:
+          type: [string, "null"]
+          format: uuid
+        action_id:
+          type: [string, "null"]
+        status:
+          type: string
+          enum: [pending, running, succeeded, failed, skipped, rolling_back, rolled_back]
+        progress_percent:
+          type: number
+          minimum: 0
+          maximum: 100
+        message:
+          type: [string, "null"]
+
+    OperationPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Operation"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    DeploymentStatus:
+      type: string
+      enum: [pending, downloading, installing, starting, healthy, degraded, unhealthy, recovering, stopped, failed, deleting]
+
+    Deployment:
+      type: object
+      required: [metadata, service_name, status, desired_replicas, ready_replicas, artifact, backend, assignments, conditions, current_revision]
+      properties:
+        metadata:
+          $ref: "#/components/schemas/ResourceMetadata"
+        service_name:
+          type: string
+        status:
+          $ref: "#/components/schemas/DeploymentStatus"
+        desired_replicas:
+          type: integer
+        ready_replicas:
+          type: integer
+        artifact:
+          $ref: "#/components/schemas/ModelArtifact"
+        backend:
+          $ref: "#/components/schemas/BackendChoice"
+        assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Assignment"
+        endpoint:
+          oneOf:
+            - $ref: "#/components/schemas/ServingEndpoint"
+            - type: "null"
+        conditions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Condition"
+        current_revision:
+          $ref: "#/components/schemas/DeploymentRevision"
+        latest_benchmark:
+          oneOf:
+            - $ref: "#/components/schemas/BenchmarkSummary"
+            - type: "null"
+
+    Assignment:
+      type: object
+      required: [id, deployment_id, node_id, replica, generation, desired_state, observed_state]
+      properties:
+        id:
+          type: string
+          format: uuid
+        deployment_id:
+          type: string
+          format: uuid
+        node_id:
+          type: string
+          format: uuid
+        replica:
+          type: integer
+          minimum: 0
+        generation:
+          type: integer
+          minimum: 1
+        desired_state:
+          type: string
+          enum: [running, stopped, removed]
+        observed_state:
+          type: string
+          enum: [pending, fetching, installing, starting, ready, degraded, failed, stopped, stale]
+        lease_expires_at:
+          type: [string, "null"]
+          format: date-time
+        resources:
+          $ref: "#/components/schemas/ResourceEstimate"
+
+    ServingEndpoint:
+      type: object
+      required: [kind, base_url, model, health_url, control_plane]
+      properties:
+        kind:
+          type: string
+          const: openai_compatible
+        base_url:
+          type: string
+          format: uri
+        model:
+          type: string
+        health_url:
+          type: string
+          format: uri
+        control_plane:
+          type: boolean
+          const: false
+
+    DeploymentActionRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [start, stop, restart, recover, benchmark, tune, rollback, destroy]
+        revision_id:
+          type: [string, "null"]
+          format: uuid
+        reason:
+          type: string
+        force:
+          type: boolean
+          default: false
+
+    DeploymentRevision:
+      type: object
+      required: [id, number, config_hash, created_at, state, provider_config]
+      properties:
+        id:
+          type: string
+          format: uuid
+        number:
+          type: integer
+          minimum: 1
+        config_hash:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        state:
+          type: string
+          enum: [pending, active, superseded, failed, rolled_back]
+        provider_config:
+          type: object
+          additionalProperties: true
+        measured_evidence:
+          type: array
+          items:
+            type: string
+
+    DeploymentPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Deployment"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    PlaygroundSession:
+      type: object
+      required: [serving_base_url, chat_completions_path, model, bearer_token, expires_at]
+      properties:
+        serving_base_url:
+          type: string
+          format: uri
+        chat_completions_path:
+          type: string
+          const: /v1/chat/completions
+        model:
+          type: string
+        bearer_token:
+          type: string
+          writeOnly: true
+        expires_at:
+          type: string
+          format: date-time
+
+    BenchmarkRequest:
+      type: object
+      required: [deployment_id, suite]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        suite:
+          type: string
+          enum: [smoke, interactive, throughput, context, custom]
+        prompts:
+          type: array
+          items:
+            type: string
+        warmups:
+          type: integer
+          minimum: 0
+          maximum: 10
+          default: 1
+        repetitions:
+          type: integer
+          minimum: 1
+          maximum: 20
+          default: 3
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 128
+
+    BenchmarkSummary:
+      type: object
+      required: [id, measured_at, decode_tokens_per_second, time_to_first_token_seconds, verdict]
+      properties:
+        id:
+          type: string
+          format: uuid
+        measured_at:
+          type: string
+          format: date-time
+        decode_tokens_per_second:
+          type: number
+        time_to_first_token_seconds:
+          type: number
+        verdict:
+          type: string
+          enum: [excellent, interactive, usable, slow, failed]
+
+    Benchmark:
+      allOf:
+        - $ref: "#/components/schemas/BenchmarkSummary"
+        - type: object
+          required: [deployment_id, revision_id, configuration, environment, samples]
+          properties:
+            deployment_id:
+              type: string
+              format: uuid
+            revision_id:
+              type: string
+              format: uuid
+            configuration:
+              $ref: "#/components/schemas/BenchmarkRequest"
+            environment:
+              type: object
+              additionalProperties: true
+            samples:
+              type: array
+              items:
+                type: object
+                additionalProperties:
+                  type: number
+            prompt_tokens_per_second:
+              type: [number, "null"]
+            model_load_seconds:
+              type: [number, "null"]
+            peak_memory_bytes:
+              type: [integer, "null"]
+            peak_vram_bytes:
+              type: [integer, "null"]
+
+    BenchmarkPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Benchmark"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    TuningRequest:
+      type: object
+      required: [service, profile]
+      properties:
+        service:
+          type: string
+          description: Active deployed service to profile.
+        profile:
+          type: string
+          enum: [speed, cost]
+        allow_restart:
+          type: boolean
+          default: false
+          description: Explicitly authorize the maintenance restarts required to test candidates.
+        no_apply:
+          type: boolean
+          default: false
+          description: Measure and report the winner, then restore and keep the baseline active.
+        dry_run:
+          type: boolean
+          default: false
+          description: Enumerate candidates and locks without starting a tuning run.
+        candidate_limit:
+          type: integer
+          minimum: 1
+          maximum: 24
+          default: 24
+        warmup_runs:
+          type: integer
+          minimum: 0
+          default: 1
+        repeats:
+          type: integer
+          minimum: 1
+          default: 3
+        startup_timeout_seconds:
+          type: number
+          exclusiveMinimum: 0
+          default: 180
+        prompt:
+          type: string
+        max_tokens:
+          type: integer
+          minimum: 1
+          default: 32
+        budget_seconds:
+          type: number
+          exclusiveMinimum: 0
+        target_tokens_per_second:
+          type: number
+          exclusiveMinimum: 0
+          default: 100
+        accuracy_tolerance:
+          type: number
+          minimum: 0
+          default: 0.05
+        accuracy_case_tolerance:
+          type: number
+          minimum: 0
+          default: 0.15
+        retain_accuracy_responses:
+          type: boolean
+          default: false
+        kv_precision_search:
+          type: boolean
+          default: true
+
+    TuningRun:
+      type: object
+      required: [run_id, service, profile, backend, status]
+      properties:
+        run_id:
+          type: string
+        service:
+          type: string
+        profile:
+          type: string
+          enum: [speed, cost]
+        backend:
+          type: string
+          enum: [llama.cpp]
+        status:
+          type: string
+          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+        outcome:
+          type: string
+          enum: [improved, no_improvement, unavailable, failed, cancelled, interrupted, preview]
+        applied:
+          type: boolean
+        baseline:
+          type: object
+          additionalProperties: true
+        candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        winner:
+          type: [object, "null"]
+          additionalProperties: true
+        winner_launch_plan:
+          type: object
+          additionalProperties: true
+        precision_locks:
+          type: object
+          additionalProperties: true
+        selection:
+          type: object
+          additionalProperties: true
+        opportunities:
+          type: array
+          items:
+            $ref: "#/components/schemas/TuningOpportunity"
+        decision:
+          type: string
+        report_path:
+          type: string
+        operation_id:
+          type: string
+        error:
+          type: string
+        events:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        target:
+          type: object
+          additionalProperties: true
+        accuracy:
+          type: object
+          additionalProperties: true
+        kv_precision_search:
+          type: boolean
+        rejected:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        apply_state:
+          type: object
+          additionalProperties: true
+
+    TuningRunPage:
+      type: object
+      required: [api_version, runs, count]
+      properties:
+        api_version:
+          type: string
+        count:
+          type: integer
+        runs:
+          type: array
+          items:
+            $ref: "#/components/schemas/TuningRun"
+
+    TuningOpportunity:
+      type: object
+      required: [id, kind, status, tested, title, warning]
+      properties:
+        id: { type: string }
+        kind: { type: string }
+        status: { type: string, enum: [recommendation_only] }
+        tested: { type: boolean, const: false }
+        title: { type: string }
+        warning: { type: string }
+        profile: { type: string, enum: [speed, cost] }
+        locked_value: {}
+        locked_values:
+          type: object
+          additionalProperties: true
+
+    Incident:
+      type: object
+      required: [id, severity, state, title, summary, opened_at, affected_resources, timeline]
+      properties:
+        id:
+          type: string
+          format: uuid
+        severity:
+          type: string
+          enum: [info, warning, critical]
+        state:
+          type: string
+          enum: [open, acknowledged, recovering, resolved]
+        title:
+          type: string
+        summary:
+          type: string
+        opened_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: [string, "null"]
+          format: date-time
+        affected_resources:
+          type: array
+          items:
+            $ref: "#/components/schemas/ResourceReference"
+        timeline:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventEnvelope"
+        recommended_actions:
+          type: array
+          items:
+            type: string
+
+    IncidentActionRequest:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [acknowledge, recover, resolve]
+        note:
+          type: string
+        force:
+          type: boolean
+          default: false
+
+    IncidentPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Incident"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    EventEnvelope:
+      type: object
+      required: [id, type, created_at, data]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        resource:
+          oneOf:
+            - $ref: "#/components/schemas/ResourceReference"
+            - type: "null"
+        operation_id:
+          type: [string, "null"]
+          format: uuid
+        data:
+          type: object
+          additionalProperties: true
+
+    ResourceReference:
+      type: object
+      required: [kind, id, name]
+      properties:
+        kind:
+          type: string
+          enum: [controller, node, model, deployment, assignment, plan, operation, benchmark, incident, gateway]
+        id:
+          type: string
+        name:
+          type: string
+
+    LogEntry:
+      type: object
+      required: [id, time, level, message]
+      properties:
+        id:
+          type: string
+        time:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum: [debug, info, warning, error, critical]
+        node_id:
+          type: [string, "null"]
+          format: uuid
+        deployment_id:
+          type: [string, "null"]
+          format: uuid
+        request_id:
+          type: [string, "null"]
+        message:
+          type: string
+        fields:
+          type: object
+          additionalProperties: true
+        redacted:
+          type: boolean
+
+    LogPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        next_cursor:
+          type: [string, "null"]
+
+    MetricSeriesSet:
+      type: object
+      required: [from, to, step_seconds, series]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        step_seconds:
+          type: integer
+        series:
+          type: array
+          items:
+            type: object
+            required: [name, labels, points]
+            properties:
+              name:
+                type: string
+              unit:
+                type: string
+              labels:
+                type: object
+                additionalProperties:
+                  type: string
+              points:
+                type: array
+                items:
+                  type: array
+                  prefixItems:
+                    - type: string
+                      format: date-time
+                    - type: number
+                  minItems: 2
+                  maxItems: 2
+
+    ResourceReport:
+      type: object
+      required: [report_id, session_id, service_name, node_id, started_at, stopped_at, metrics, coverage]
+      properties:
+        report_id: { type: string }
+        session_id: { type: string }
+        service_name: { type: string }
+        node_id: { type: string }
+        started_at: { type: number }
+        stopped_at: { type: number }
+        duration_seconds: { type: number }
+        sample_count: { type: integer }
+        metrics: { type: object, additionalProperties: true }
+        costs: { type: object, additionalProperties: true }
+        traffic: { type: object, additionalProperties: true }
+        coverage: { type: object, additionalProperties: true }
+
+    AuditEvent:
+      type: object
+      required: [id, time, actor, action, outcome, resource, request_id]
+      properties:
+        id:
+          type: string
+        time:
+          type: string
+          format: date-time
+        actor:
+          type: string
+        action:
+          type: string
+        outcome:
+          type: string
+          enum: [allowed, denied, succeeded, failed]
+        resource:
+          $ref: "#/components/schemas/ResourceReference"
+        request_id:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    AuditEventPage:
+      type: object
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        page:
+          $ref: "#/components/schemas/PageMetadata"
+
+    GatewaySpec:
+      type: object
+      required: [enabled, bind_host, port, tls, limits]
+      properties:
+        enabled:
+          type: boolean
+        bind_host:
+          type: string
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        tls:
+          type: object
+          required: [mode]
+          properties:
+            mode:
+              type: string
+              enum: [disabled_local_only, provided, managed]
+            certificate_state:
+              type: string
+              readOnly: true
+        limits:
+          type: object
+          required: [requests_per_minute, tokens_per_minute, max_concurrency]
+          properties:
+            requests_per_minute:
+              type: integer
+              minimum: 1
+            tokens_per_minute:
+              type: integer
+              minimum: 1
+            max_concurrency:
+              type: integer
+              minimum: 1
+        routes:
+          type: array
+          items:
+            type: object
+            required: [name, deployment_id, weight]
+            properties:
+              name:
+                type: string
+              deployment_id:
+                type: string
+                format: uuid
+              weight:
+                type: integer
+                minimum: 0
+                maximum: 100
+
+    Gateway:
+      allOf:
+        - $ref: "#/components/schemas/GatewaySpec"
+        - type: object
+          required: [status, serving_base_url]
+          properties:
+            status:
+              type: string
+              enum: [disabled, starting, healthy, degraded, unhealthy]
+            serving_base_url:
+              type: [string, "null"]
+              format: uri
+            request_count:
+              type: integer
+            rejected_count:
+              type: integer
+
+    GatewayKeyRequest:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: string
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        deployment_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        quota:
+          type: object
+          properties:
+            requests_per_minute:
+              type: integer
+            tokens_per_minute:
+              type: integer
+            max_concurrency:
+              type: integer
+
+    GatewayKeyMetadata:
+      type: object
+      required: [id, label, prefix, created_at, revoked]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        prefix:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: [string, "null"]
+          format: date-time
+        last_used_at:
+          type: [string, "null"]
+          format: date-time
+        revoked:
+          type: boolean
+
+    GatewayKeySecret:
+      allOf:
+        - $ref: "#/components/schemas/GatewayKeyMetadata"
+        - type: object
+          required: [secret]
+          properties:
+            secret:
+              type: string
+              writeOnly: true
+
+    ControllerSettings:
+      type: object
+      required: [controller_name, default_disk_reserve_bytes, retention, security]
+      properties:
+        controller_name:
+          type: string
+        default_disk_reserve_bytes:
+          type: integer
+          minimum: 0
+        retention:
+          type: object
+          required: [logs_days, metrics_days, audits_days]
+          properties:
+            logs_days:
+              type: integer
+              minimum: 1
+            metrics_days:
+              type: integer
+              minimum: 1
+            audits_days:
+              type: integer
+              minimum: 1
+        security:
+          type: object
+          required: [require_tls_for_remote, enrollment_token_ttl_seconds, session_idle_seconds]
+          properties:
+            require_tls_for_remote:
+              type: boolean
+            enrollment_token_ttl_seconds:
+              type: integer
+              minimum: 60
+            session_idle_seconds:
+              type: integer
+              minimum: 60
+        redacted_secret_fields:
+          type: array
+          readOnly: true
+          items:
+            type: string
+
+    PageMetadata:
+      type: object
+      required: [limit, has_more]
+      properties:
+        next_cursor:
+          type: [string, "null"]
+        limit:
+          type: integer
+        has_more:
+          type: boolean
+
+    MeshError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+    MeshCertificateFingerprint:
+      type: string
+      pattern: "^sha256:[0-9A-Za-z._:-]+$"
+      examples:
+        - sha256:67b0aef649fdd0d35a76531d2f2555e99c02bb0a707a7d945898edf8f24ae288
+
+    MeshTrustState:
+      type: string
+      enum:
+        - DISCOVERED_UNTRUSTED
+        - PAIRING_PENDING
+        - ENROLLED
+        - ACTIVE
+        - REVOKED
+        - EXPIRED
+
+    MeshNodeSighting:
+      type: object
+      required:
+        - sighting_id
+        - provider
+        - endpoint
+        - node_hint
+        - api_version
+        - bootstrap_fingerprint
+        - observed_at
+        - expires_at
+        - trust_state
+      properties:
+        sighting_id:
+          type: string
+          pattern: "^[0-9a-f]{24}$"
+        provider:
+          type: string
+          examples: [mdns]
+        endpoint:
+          type: string
+          format: uri
+          pattern: "^https://"
+        node_hint:
+          type: string
+        api_version:
+          type: string
+        bootstrap_fingerprint:
+          $ref: "#/components/schemas/MeshCertificateFingerprint"
+        observed_at:
+          type: number
+          description: Unix timestamp in seconds.
+        expires_at:
+          type: number
+        interface_id:
+          type: string
+        trust_state:
+          $ref: "#/components/schemas/MeshTrustState"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    MeshProviderDiagnostic:
+      type: object
+      required: [provider, scan_count, last_result_count]
+      properties:
+        provider:
+          type: string
+        scan_count:
+          type: integer
+          minimum: 0
+        last_error:
+          type: [string, "null"]
+        last_result_count:
+          type: integer
+          minimum: 0
+
+    MeshSightingsResponse:
+      type: object
+      required: [api_version, evidence, trust_boundary, sightings, providers]
+      properties:
+        api_version:
+          const: "2"
+        evidence:
+          type: string
+          const: LIVE_DISCOVERY
+        trust_boundary:
+          type: string
+        sightings:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshNodeSighting"
+        providers:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshProviderDiagnostic"
+
+    MeshEnrollmentWindow:
+      type: object
+      required: [controller_id, open, pending_count]
+      properties:
+        controller_id: { type: string }
+        open: { type: boolean }
+        expires_at:
+          oneOf:
+            - { type: number }
+            - { type: "null" }
+        pending_count: { type: integer, minimum: 0 }
+        bootstrap:
+          type: object
+          properties:
+            started: { type: boolean }
+            host: { type: string }
+            port: { type: integer }
+
+    ManagedMeshEnrollment:
+      type: object
+      required: [enrollment_id, state]
+      properties:
+        enrollment_id: { type: string }
+        node_id: { type: string }
+        display_name: { type: string }
+        endpoint: { type: string, format: uri }
+        expires_at: { type: number }
+        attempts: { type: integer, minimum: 0 }
+        state:
+          type: string
+          enum: [PAIRING_PENDING, ENROLLED, CERTIFICATE_ISSUED, VERIFYING, ACTIVE, EXPIRED, REJECTED, CANCELLED]
+
+    MeshEnrollment:
+      type: object
+      required:
+        - enrollment_id
+        - sighting_id
+        - node_id
+        - node_hint
+        - endpoint
+        - provider
+        - bootstrap_fingerprint
+        - created_at
+        - expires_at
+        - state
+      properties:
+        enrollment_id:
+          type: string
+        sighting_id:
+          type: string
+        node_id:
+          type: string
+        node_hint:
+          type: string
+        endpoint:
+          type: string
+          format: uri
+        provider:
+          type: string
+        bootstrap_fingerprint:
+          $ref: "#/components/schemas/MeshCertificateFingerprint"
+        created_at:
+          type: number
+        expires_at:
+          type: number
+        approved_at:
+          type: number
+        state:
+          $ref: "#/components/schemas/MeshTrustState"
+
+    MeshRuntimeOffer:
+      type: object
+      required:
+        - offer_id
+        - task
+        - model_id
+        - backend
+        - context_tokens
+        - quality_score
+        - first_token_ms
+        - decode_tokens_per_second
+      properties:
+        offer_id:
+          type: string
+        task:
+          type: string
+        model_id:
+          type: string
+        backend:
+          type: string
+        context_tokens:
+          type: integer
+          minimum: 1
+        quality_score:
+          type: number
+        first_token_ms:
+          type: number
+          minimum: 0
+        decode_tokens_per_second:
+          type: number
+          minimum: 0
+        local_only:
+          type: boolean
+          default: false
+
+    MeshNode:
+      type: object
+      required:
+        - node_id
+        - hostname
+        - endpoint
+        - provider
+        - trust_state
+        - mtls_status
+        - routable
+        - hardware
+        - runtime_offers
+      properties:
+        node_id:
+          type: string
+        hostname:
+          type: string
+        endpoint:
+          type: string
+          format: uri
+        provider:
+          type: string
+        trust_state:
+          $ref: "#/components/schemas/MeshTrustState"
+        mtls_status:
+          type: string
+          enum: [CERTIFICATE_REQUIRED, ACTIVE, REVOKED]
+        certificate_fingerprint:
+          oneOf:
+            - $ref: "#/components/schemas/MeshCertificateFingerprint"
+            - type: "null"
+        routable:
+          type: boolean
+        enrolled_at:
+          type: number
+        activated_at:
+          type: number
+        revoked_at:
+          type: number
+        last_seen_at:
+          type: number
+        capability_sequence:
+          type: integer
+          minimum: 1
+        hardware:
+          type: object
+          additionalProperties: true
+        power:
+          type: object
+          additionalProperties: true
+        pressure:
+          type: object
+          additionalProperties: true
+        healthy:
+          type: boolean
+        queue_depth:
+          type: integer
+          minimum: 0
+        runtime_offers:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshRuntimeOffer"
+
+    MeshEnrollmentResult:
+      type: object
+      required: [enrollment, node]
+      properties:
+        enrollment:
+          $ref: "#/components/schemas/MeshEnrollment"
+        node:
+          $ref: "#/components/schemas/MeshNode"
+        node_token:
+          type: string
+          writeOnly: true
+
+    MeshCertificateResult:
+      allOf:
+        - $ref: "#/components/schemas/MeshEnrollmentResult"
+        - type: object
+          required:
+            - api_version
+            - certificate_pem
+            - ca_certificate_pem
+            - fingerprint
+          properties:
+            api_version:
+              const: "2"
+            certificate_pem:
+              type: string
+              writeOnly: true
+            ca_certificate_pem:
+              type: string
+            fingerprint:
+              $ref: "#/components/schemas/MeshCertificateFingerprint"
+
+    MeshNodesResponse:
+      type: object
+      required: [api_version, count, nodes]
+      properties:
+        api_version:
+          const: "2"
+        count:
+          type: integer
+          minimum: 0
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshNode"
+
+    MeshCapabilitySnapshot:
+      type: object
+      required: [sequence, observed_at, hardware, runtime_offers]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        observed_at:
+          type: number
+          description: Unix timestamp in seconds.
+        hardware:
+          type: object
+          additionalProperties: true
+        runtime_offers:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshRuntimeOffer"
+        power:
+          type: object
+          additionalProperties: true
+        pressure:
+          type: object
+          additionalProperties: true
+        healthy:
+          type: boolean
+          default: true
+        queue_depth:
+          type: integer
+          minimum: 0
+          default: 0
+        evidence:
+          type: string
+          description: Evidence class such as LIVE_MEASUREMENT or EMULATED.
+
+    MeshTelemetrySnapshot:
+      type: object
+      required: [sequence, observed_at]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        observed_at:
+          type: number
+          description: Unix timestamp in seconds.
+        battery_percent: { type: integer, minimum: 0, maximum: 100 }
+        charging: { type: boolean }
+        available_memory_bytes: { type: integer, minimum: 0 }
+        low_memory: { type: boolean }
+        thermal_status: { type: integer, minimum: 0 }
+        runtime_state: { type: string }
+        active_model_sha256: { type: string }
+
+    MeshTelemetryResponse:
+      type: object
+      required: [api_version, telemetry]
+      properties:
+        api_version: { const: "2" }
+        telemetry:
+          $ref: "#/components/schemas/MeshTelemetrySnapshot"
+
+    MeshLinkMeasurement:
+      type: object
+      required:
+        - source_node_id
+        - target_node_id
+        - rtt_p50_ms
+        - rtt_p95_ms
+        - jitter_ms
+        - loss_ratio
+        - upload_mbps
+        - download_mbps
+        - observed_at
+        - evidence
+      properties:
+        source_node_id:
+          type: string
+        target_node_id:
+          type: string
+        rtt_p50_ms:
+          type: number
+          minimum: 0
+        rtt_p95_ms:
+          type: number
+          minimum: 0
+        jitter_ms:
+          type: number
+          minimum: 0
+        loss_ratio:
+          type: number
+          minimum: 0
+          maximum: 1
+        upload_mbps:
+          type: number
+          minimum: 0
+        download_mbps:
+          type: number
+          minimum: 0
+        observed_at:
+          type: number
+        evidence:
+          type: string
+
+    MeshTopologyResponse:
+      type: object
+      required: [api_version, evidence, nodes, links, measurement_mode]
+      properties:
+        api_version:
+          const: "2"
+        evidence:
+          type: string
+        nodes:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshNode"
+        links:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeshLinkMeasurement"
+        measurement_mode:
+          type: string
+          const: reported
+
+    MeshRouteRequest:
+      type: object
+      required: [source_node_id, service_id, policy_hash]
+      properties:
+        source_node_id:
+          type: string
+        service_id:
+          type: string
+        policy_hash:
+          type: string
+          minLength: 1
+        task:
+          type: string
+          default: chat
+        minimum_context_tokens:
+          type: integer
+          minimum: 1
+          default: 1
+        privacy:
+          type: string
+          enum: [LOCAL_ONLY, MESH_ALLOWED]
+          default: MESH_ALLOWED
+        minimum_quality_score:
+          type: number
+          default: 0
+        lease_ttl_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+          default: 30
+
+    MeshRouteCandidate:
+      type: object
+      required:
+        - node_id
+        - offer_id
+        - execution_mode
+        - score
+        - predicted_first_token_ms
+        - reasons
+      properties:
+        node_id:
+          type: string
+        offer_id:
+          type: string
+        execution_mode:
+          type: string
+          enum: [local, remote]
+        score:
+          type: number
+        predicted_first_token_ms:
+          type: number
+        reasons:
+          type: array
+          items:
+            type: string
+
+    MeshRouteDecision:
+      type: object
+      required: [selected, fallbacks, rejected, evidence]
+      properties:
+        selected:
+          $ref: "#/components/schemas/MeshRouteCandidate"
+        fallbacks:
+          type: array
+          maxItems: 3
+          items:
+            $ref: "#/components/schemas/MeshRouteCandidate"
+        rejected:
+          type: array
+          items:
+            type: object
+            required: [node_id, reason]
+            properties:
+              node_id:
+                type: string
+              reason:
+                type: string
+        evidence:
+          type: string
+
+    MeshRouteLease:
+      type: object
+      required:
+        - lease_id
+        - source_node_id
+        - service_id
+        - primary_node_id
+        - fallback_node_ids
+        - policy_hash
+        - issued_at
+        - expires_at
+      properties:
+        lease_id:
+          type: string
+        source_node_id:
+          type: string
+        service_id:
+          type: string
+        primary_node_id:
+          type: string
+        fallback_node_ids:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+        policy_hash:
+          type: string
+        issued_at:
+          type: number
+        expires_at:
+          type: number
+        controller_id:
+          type: string
+        inference_endpoint:
+          type: string
+          format: uri
+        bearer_token:
+          type: string
+          writeOnly: true
+
+    MeshRouteResponse:
+      type: object
+      required: [api_version, decision, lease]
+      properties:
+        api_version:
+          const: "2"
+        decision:
+          $ref: "#/components/schemas/MeshRouteDecision"
+        lease:
+          $ref: "#/components/schemas/MeshRouteLease"

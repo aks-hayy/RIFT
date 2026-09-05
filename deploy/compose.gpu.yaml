@@ -1,0 +1,11 @@
+{
+  "services": {
+    "node": {
+      "gpus": "all",
+      "environment": {
+        "NVIDIA_VISIBLE_DEVICES": "all",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility"
+      }
+    }
+  }
+}

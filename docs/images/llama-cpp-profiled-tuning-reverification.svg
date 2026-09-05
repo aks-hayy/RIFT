@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="560" viewBox="0 0 1040 560" role="img" aria-labelledby="title desc">
+  <title id="title">RIFT llama.cpp profile re-verification</title>
+  <desc id="desc">Baseline versus final measurements for Qwen2.5 3B and 7B speed and cost profiles. Promoted speed and cost runs preserve quality; the 7B cost baseline is retained because its confidence interval crossed zero.</desc>
+  <rect width="1040" height="560" fill="#f7f7f5"/>
+  <rect x="28" y="24" width="984" height="512" rx="8" fill="#ffffff" stroke="#d8d8d2"/>
+  <text x="56" y="66" font-family="Segoe UI, Arial, sans-serif" font-size="25" font-weight="700" fill="#20201d">RIFT tuning: fresh llama.cpp verification</text>
+  <text x="56" y="94" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#66665f">Local workstation GPU · Q4_K_M weights locked · six-case quality gate = 1.00</text>
+
+  <text x="56" y="135" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#20201d">Speed (tokens / second)</text>
+  <line x1="56" y1="150" x2="984" y2="150" stroke="#e2e2dc"/>
+  <text x="56" y="182" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">Qwen2.5 3B</text>
+  <rect x="175" y="164" width="205" height="20" fill="#b8b8b0"/>
+  <rect x="405" y="164" width="231" height="20" fill="#c65334"/>
+  <text x="648" y="180" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">72.64 → 81.56  (+12.29%)</text>
+  <text x="56" y="220" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">Qwen2.5 7B</text>
+  <rect x="175" y="202" width="205" height="20" fill="#b8b8b0"/>
+  <rect x="405" y="202" width="281" height="20" fill="#c65334"/>
+  <text x="698" y="218" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">32.38 → 44.41  (+37.16%)</text>
+  <text x="175" y="246" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#77776f">baseline</text>
+  <text x="405" y="246" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#77776f">final retest</text>
+
+  <text x="56" y="290" font-family="Segoe UI, Arial, sans-serif" font-size="15" font-weight="700" fill="#20201d">Cost (GPU joules / request; lower is better)</text>
+  <line x1="56" y1="305" x2="984" y2="305" stroke="#e2e2dc"/>
+  <text x="56" y="337" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">Qwen2.5 3B</text>
+  <rect x="175" y="319" width="270" height="20" fill="#b8b8b0"/>
+  <rect x="470" y="319" width="190" height="20" fill="#c65334"/>
+  <text x="672" y="335" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">44.69 → 31.41  (−29.73%)</text>
+  <text x="56" y="375" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">Qwen2.5 7B</text>
+  <rect x="175" y="357" width="270" height="20" fill="#b8b8b0"/>
+  <rect x="470" y="357" width="266" height="20" fill="#d8a528"/>
+  <text x="748" y="373" font-family="Segoe UI, Arial, sans-serif" font-size="14" fill="#33332f">79.46 → 78.41  (−1.32%)</text>
+  <text x="175" y="401" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#77776f">baseline</text>
+  <text x="470" y="401" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#77776f">final retest / best passing estimate</text>
+
+  <rect x="56" y="430" width="928" height="72" rx="5" fill="#f1eee5"/>
+  <text x="72" y="456" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#33332f">Every promoted result cleared the quality and repeatability gates.</text>
+  <text x="72" y="478" font-family="Segoe UI, Arial, sans-serif" font-size="13" fill="#33332f">The 7B cost baseline stayed in place when the evidence was inconclusive.</text>
+  <rect x="56" y="516" width="14" height="14" fill="#b8b8b0"/><text x="78" y="528" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#66665f">baseline</text>
+  <rect x="145" y="516" width="14" height="14" fill="#c65334"/><text x="167" y="528" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#66665f">promoted</text>
+  <rect x="250" y="516" width="14" height="14" fill="#d8a528"/><text x="272" y="528" font-family="Segoe UI, Arial, sans-serif" font-size="11" fill="#66665f">not promoted</text>
+</svg>

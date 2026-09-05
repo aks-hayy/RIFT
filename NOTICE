@@ -1,0 +1,13 @@
+RIFT
+Runtime Inference Fitting Tool
+
+Copyright 2026 RIFT contributors.
+
+RIFT source code is licensed under the Apache License, Version 2.0. The full
+license text is in LICENSE.
+
+This repository does not distribute model weights, serving backend binaries,
+benchmark leaderboard data, or user credentials. Models, backends, datasets,
+and benchmark snapshots retain their own licenses and terms. See
+THIRD_PARTY_NOTICES.md and the legal section of README.md for the release
+boundary.

@@ -1,0 +1,13 @@
+*
+!pyproject.toml
+!README.md
+!CHANGELOG.md
+!LICENSE
+!python/
+!python/**
+!docs/
+!docs/**
+!examples/
+!examples/**
+!deploy/
+!deploy/**
