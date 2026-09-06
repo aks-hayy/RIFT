@@ -10,6 +10,7 @@ import time
 from typing import Callable
 
 from .contracts import NodeSighting, TrustState
+from .permissions import ParticipationGrant
 
 
 class EnrollmentService:
@@ -208,6 +209,51 @@ class EnrollmentService:
         public_node = {key: value for key, value in node.items() if key != "node_token_hash"}
         return {"enrollment": self._public_record(record), "node": public_node, "node_token": node_token}
 
+    def activate_outbound(
+        self,
+        enrollment_id: str,
+        *,
+        certificate_fingerprint: str,
+        activation_proof: str,
+    ) -> dict[str, object]:
+        """Activate a node after it proves possession over its outbound session."""
+        if not str(activation_proof or "").strip():
+            raise PermissionError("outbound activation requires node proof")
+        result = self.activate(enrollment_id, certificate_fingerprint=certificate_fingerprint)
+        node = result["node"]
+        assert isinstance(node, dict)
+        node["activation_mode"] = "OUTBOUND_PROOF"
+        nodes = self._state["nodes"]
+        assert isinstance(nodes, dict)
+        stored_node = nodes.get(str(node["node_id"]))
+        if isinstance(stored_node, dict):
+            stored_node["activation_mode"] = "OUTBOUND_PROOF"
+        record = self._record(enrollment_id)
+        record["activation_mode"] = "OUTBOUND_PROOF"
+        self._save()
+        return result
+
+    def rotate_certificate(self, enrollment_id: str, *, certificate_fingerprint: str) -> dict[str, object]:
+        if not certificate_fingerprint.strip():
+            raise ValueError("certificate fingerprint is required")
+        record = self._record(enrollment_id)
+        if record.get("state") != TrustState.ACTIVE.value:
+            raise PermissionError("only an active enrollment may rotate its certificate")
+        nodes = self._state["nodes"]
+        assert isinstance(nodes, dict)
+        node = nodes.get(str(record["node_id"]))
+        if not isinstance(node, dict):
+            raise RuntimeError("active node record is missing")
+        previous = str(node.get("certificate_fingerprint") or "")
+        if previous == certificate_fingerprint:
+            raise ValueError("certificate fingerprint is unchanged")
+        node["previous_certificate_fingerprint"] = previous
+        node["certificate_fingerprint"] = certificate_fingerprint
+        node["certificate_rotated_at"] = float(self._clock())
+        self._save()
+        return {"enrollment": self._public_record(record), "node": dict(node)}
+
+
     def revoke(self, node_id: str) -> dict[str, object]:
         nodes = self._state["nodes"]
         assert isinstance(nodes, dict)
@@ -220,6 +266,26 @@ class EnrollmentService:
         node["revoked_at"] = float(self._clock())
         self._save()
         return dict(node)
+
+    def set_owner_grant(self, node_id: str, grant: ParticipationGrant) -> dict[str, object]:
+        """Persist the owner's explicit participation decision for a node.
+
+        The grant is intentionally separate from transport trust: an active node can
+        remain an access-only viewpoint while still being visible to the controller.
+        """
+        nodes = self._state["nodes"]
+        assert isinstance(nodes, dict)
+        node = nodes.get(node_id)
+        if not isinstance(node, dict):
+            raise KeyError(f"unknown node: {node_id}")
+        node["participation"] = grant.validate().to_dict()
+        node["participation_updated_at"] = float(self._clock())
+        self._save()
+        return dict(node)
+
+    def set_participation(self, node_id: str, grant: ParticipationGrant) -> dict[str, object]:
+        """Compatibility name used by controller and node clients."""
+        return self.set_owner_grant(node_id, grant)
 
     def update_capability(self, node_id: str, snapshot: dict[str, object]) -> dict[str, object]:
         nodes = self._state["nodes"]

@@ -448,6 +448,15 @@ class RiftServerRuntime:
         path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
         if path == "/api/rift/v2/mesh/enrollment-window":
             return self.mesh_controller().enrollment_window_status()
+        if path == "/api/rift/v2/mesh/controller":
+            return self.mesh_controller().controller_status()
+        if path == "/api/rift/v2/mesh/deployments":
+            return self.mesh_controller().deployment_status()
+        if path.startswith("/api/rift/v2/mesh/deployments/"):
+            service_id = path.rsplit("/", 1)[-1]
+            return self.mesh_controller().deployment_status(service_id)
+        if path in {"/api/rift/v2/mesh/catalog", "/api/rift/v2/mesh/model-catalog"}:
+            return self.mesh_controller().model_catalog()
         if path == "/api/rift/v2/mesh/enrollments":
             return self.mesh_controller().managed_enrollments()
         if path == "/api/rift/v2/mesh/sightings":
@@ -456,6 +465,14 @@ class RiftServerRuntime:
             return self.mesh_controller().nodes()
         if path == "/api/rift/v2/mesh/topology":
             return self.mesh_controller().topology()
+        if path == "/api/rift/v2/mesh/services":
+            return self.mesh_controller().services()
+        if path in {"/api/rift/v2/mesh/groups", "/api/rift/v2/mesh/service-groups"}:
+            return self.mesh_controller().groups()
+        if path.startswith("/api/rift/v2/mesh/groups/") or path.startswith("/api/rift/v2/mesh/service-groups/"):
+            group_id = path.rsplit("/", 1)[-1]
+            service_id = ((query or {}).get("service") or [None])[0]
+            return self.mesh_controller().group_detail(group_id, service_id)
         orchestrator = self.orchestrator_factory()
         if path == "/api/rift/v2/plans":
             return {"api_version": "2", **orchestrator.list_plans()}
@@ -885,17 +902,38 @@ class RiftServerRuntime:
                 if not fingerprint:
                     raise ValueError("certificate_fingerprint is required")
                 return self.mesh_controller().activate_enrollment(enrollment_id, fingerprint)
+            if action == "activate-outbound":
+                fingerprint = str(payload.get("certificate_fingerprint") or "")
+                proof = str(payload.get("activation_proof") or "")
+                if not fingerprint or not proof:
+                    raise ValueError("certificate_fingerprint and activation_proof are required")
+                return self.mesh_controller().activate_outbound_enrollment(enrollment_id, fingerprint, proof)
             if action == "certificate":
                 csr_pem = str(payload.get("csr_pem") or "")
                 if not csr_pem:
                     raise ValueError("csr_pem is required")
                 return self.mesh_controller().issue_node_certificate(enrollment_id, csr_pem)
+            if action == "rotate-certificate":
+                csr_pem = str(payload.get("csr_pem") or "")
+                if not csr_pem:
+                    raise ValueError("csr_pem is required")
+                return self.mesh_controller().rotate_node_certificate(enrollment_id, csr_pem)
             raise KeyError(path)
         if path.startswith("/api/rift/v2/mesh/nodes/") and path.endswith("/capabilities"):
             parts = path.strip("/").split("/")
             if len(parts) != 7:
                 raise KeyError(path)
             return self.mesh_controller().update_capability(parts[-2], payload)
+        if path.startswith("/api/rift/v2/mesh/nodes/") and path.endswith("/participation"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7:
+                raise KeyError(path)
+            return self.mesh_controller().set_participation(parts[-2], payload)
+        if path.startswith("/api/rift/v2/mesh/nodes/") and path.endswith("/revoke"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7:
+                raise KeyError(path)
+            return self.mesh_controller().revoke_node(parts[-2])
         if path.startswith("/api/rift/v2/mesh/nodes/") and path.endswith("/telemetry"):
             parts = path.strip("/").split("/")
             if len(parts) != 7:
@@ -904,8 +942,43 @@ class RiftServerRuntime:
             return self.mesh_controller().record_telemetry(parts[-2], payload, token)
         if path == "/api/rift/v2/mesh/links":
             return self.mesh_controller().record_link(payload)
+        if path == "/api/rift/v2/mesh/services":
+            return self.mesh_controller().register_service(payload)
+        if path in {"/api/rift/v2/mesh/groups", "/api/rift/v2/mesh/service-groups"}:
+            return self.mesh_controller().register_group(payload)
         if path == "/api/rift/v2/mesh/routes/resolve":
             return self.mesh_controller().resolve_route(payload)
+        if path == "/api/rift/v2/mesh/gateway/admit":
+            return self.mesh_controller().gateway_admit(payload)
+        if path == "/api/rift/v2/mesh/operations/authority":
+            return self.mesh_controller().issue_operation_authority(
+                str(payload.get("action") or ""),
+                dict(payload.get("payload") or {}),
+                int(payload.get("ttl_seconds") or 30),
+            )
+        if path.startswith("/api/rift/v2/mesh/deployments/"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7:
+                raise KeyError(path)
+            service_id, action = parts[-2], parts[-1]
+            if action == "deploy":
+                return self.mesh_controller().deploy_service(service_id, revision=str(payload.get("revision") or ""), replicas=int(payload.get("replicas") or 1))
+            if action == "terminate":
+                return self.mesh_controller().terminate_service(service_id)
+            if action == "rollback":
+                return self.mesh_controller().rollback_service(service_id, str(payload["revision"]) if payload.get("revision") else None)
+            if action == "scale":
+                return self.mesh_controller().scale_service(service_id, replicas=int(payload.get("replicas") or 1))
+            if action == "reconcile":
+                return self.mesh_controller().reconcile_service(service_id)
+            raise KeyError(path)
+        if path in {"/api/rift/v2/mesh/catalog", "/api/rift/v2/mesh/model-catalog"}:
+            return self.mesh_controller().accept_catalog(payload)
+        if path.startswith("/api/rift/v2/mesh/gateway/requests/"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 7:
+                raise KeyError(path)
+            return self.mesh_controller().gateway_update(parts[-2], parts[-1], payload)
         if path.startswith("/api/rift/v2/operations/") and path.endswith("/cancel"):
             parts = path.strip("/").split("/")
             if len(parts) != 6:

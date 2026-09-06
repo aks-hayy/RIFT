@@ -648,6 +648,23 @@ export interface MeshTopology {
   evidence: string;
 }
 
+export interface MeshService {
+  serviceId: ServiceId;
+  modelId: string;
+  revision: string;
+  task: string;
+  groups: string[];
+  desiredReplicas: number;
+  policyHash?: string;
+}
+
+export interface MeshServiceGroup {
+  groupId: string;
+  serviceIds: string[];
+  defaultService?: string;
+  gatewayPath?: string;
+}
+
 export type EnrollmentState =
   | "PAIRING_PENDING"
   | "ENROLLED"

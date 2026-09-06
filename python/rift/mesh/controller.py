@@ -34,6 +34,13 @@ from .bootstrap import EnrollmentWindow
 from .leases import RouteLeaseStore
 from .identity import NodeCertificateAuthority
 from .routing import RoutePlanner
+from .permissions import ParticipationGrant
+from .services import ServiceCatalog, ServiceDefinition, ServiceGroup
+from .grants import RouteGrant, RouteGrantSigner
+from .gateway import MeshGatewayRouter
+from .consensus import ControllerFence, ControllerProfile
+from .deployment import DeploymentManager
+from .catalog import CatalogEntry, SignedCatalogStore
 
 
 class MeshController:
@@ -45,10 +52,12 @@ class MeshController:
         discovery: DiscoveryManager | None = None,
         enrollments: EnrollmentService | None = None,
         clock: Callable[[], float] = time.time,
+        profile: ControllerProfile = ControllerProfile.SIMPLE,
     ) -> None:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.clock = clock
+        self.profile = ControllerProfile(profile)
         self.controller_id = self._load_controller_id()
         default_providers = (MdnsDiscoveryProvider(), AdbBootstrapProvider())
         self.discovery_manager = discovery or DiscoveryManager(
@@ -60,6 +69,14 @@ class MeshController:
         self.route_leases = RouteLeaseStore(self.root / "route-leases.json", clock=clock)
         self._certificate_authority: NodeCertificateAuthority | None = None
         self.route_planner = RoutePlanner()
+        self.service_catalog = ServiceCatalog(self.root / "services.json")
+        self.route_grant_signer = RouteGrantSigner(self.root / "route-grant-key.pem")
+        self.gateway_router = MeshGatewayRouter(self, self.service_catalog)
+        self.controller_fence = ControllerFence(
+            self.root / "controller-fence.json", controller_id=self.controller_id, profile=self.profile
+        )
+        self.deployments = DeploymentManager(self.root / "deployments.json", clock=clock)
+        self.catalog = SignedCatalogStore(self.root / "catalog")
         self.enrollment_window = EnrollmentWindow(
             controller_id=self.controller_id,
             clock=clock,
@@ -277,6 +294,29 @@ class MeshController:
             enrollment_id, certificate_fingerprint=certificate_fingerprint
         )
 
+    def activate_outbound_enrollment(
+        self, enrollment_id: str, certificate_fingerprint: str, activation_proof: str
+    ) -> dict[str, object]:
+        return self.enrollments.activate_outbound(
+            enrollment_id,
+            certificate_fingerprint=certificate_fingerprint,
+            activation_proof=activation_proof,
+        )
+
+    def rotate_node_certificate(self, enrollment_id: str, csr_pem: str) -> dict[str, object]:
+        record = self.enrollments._record(enrollment_id)
+        if record.get("state") != TrustState.ACTIVE.value:
+            raise PermissionError("only an active enrollment may rotate its certificate")
+        if self._certificate_authority is None:
+            self._certificate_authority = NodeCertificateAuthority(self.root / "pki")
+        issued = self._certificate_authority.issue_node_certificate(
+            node_id=str(record["node_id"]), csr_pem=csr_pem
+        )
+        rotated = self.enrollments.rotate_certificate(
+            enrollment_id, certificate_fingerprint=str(issued["fingerprint"])
+        )
+        return {"api_version": "2", **issued, **rotated}
+
     def bootstrap_activate(self, enrollment_id: str) -> dict[str, object]:
         """Verify the freshly enrolled node over mTLS before making it routable."""
 
@@ -424,6 +464,135 @@ class MeshController:
     def update_capability(self, node_id: str, snapshot: dict[str, object]) -> dict[str, object]:
         return {"api_version": "2", "node": self.enrollments.update_capability(node_id, snapshot)}
 
+    def set_participation(self, node_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "api_version": "2",
+            "node": self.enrollments.set_owner_grant(node_id, ParticipationGrant.from_dict(payload)),
+        }
+
+    def revoke_node(self, node_id: str) -> dict[str, object]:
+        authority = self.issue_operation_authority("revoke-node", {"node_id": node_id})
+        node = self.enrollments.revoke(node_id)
+        return {"api_version": "2", "authority": authority, "node": node, **node}
+
+    def services(self) -> dict[str, object]:
+        return {
+            "api_version": "2",
+            "services": [item.to_dict() for item in self.service_catalog.list_services()],
+        }
+
+    def groups(self) -> dict[str, object]:
+        return {
+            "api_version": "2",
+            "groups": [item.to_dict() for item in self.service_catalog.list_groups()],
+        }
+
+    def controller_status(self) -> dict[str, object]:
+        return {
+            "api_version": "2",
+            "controller_id": self.controller_id,
+            "profile": self.profile.value,
+            "epoch": int(self.controller_fence._state.get("epoch") or 0),
+            "leader_id": str(self.controller_fence._state.get("leader_id") or self.controller_id),
+            "quorum": bool(self.controller_fence._state.get("quorum", True)),
+        }
+
+    def issue_operation_authority(self, action: str, payload: dict[str, object], ttl_seconds: int = 30) -> dict[str, object]:
+        return self.controller_fence.issue(action, payload, ttl_seconds=ttl_seconds, now=float(self.clock()))
+
+    def deploy_service(self, service_id: str, *, revision: str, replicas: int = 1) -> dict[str, object]:
+        authority = self.issue_operation_authority("deploy", {"service_id": service_id, "revision": revision, "replicas": replicas})
+        deployment = self.deployments.deploy(service_id, revision=revision, replicas=replicas, operation_id=str(authority["authority_id"]))
+        return {"api_version": "2", "authority": authority, "deployment": deployment, **deployment}
+
+    def terminate_service(self, service_id: str) -> dict[str, object]:
+        authority = self.issue_operation_authority("terminate", {"service_id": service_id})
+        deployment = self.deployments.terminate(service_id, operation_id=str(authority["authority_id"]))
+        return {"api_version": "2", "authority": authority, "deployment": deployment, **deployment}
+
+    def rollback_service(self, service_id: str, revision: str | None = None) -> dict[str, object]:
+        authority = self.issue_operation_authority("rollback", {"service_id": service_id, "revision": revision})
+        deployment = self.deployments.rollback(service_id, revision=revision, operation_id=str(authority["authority_id"]))
+        return {"api_version": "2", "authority": authority, "deployment": deployment, **deployment}
+
+    def scale_service(self, service_id: str, *, replicas: int) -> dict[str, object]:
+        authority = self.issue_operation_authority("scale", {"service_id": service_id, "replicas": replicas})
+        deployment = self.deployments.scale(service_id, replicas=replicas, operation_id=str(authority["authority_id"]))
+        return {"api_version": "2", "authority": authority, "deployment": deployment, **deployment}
+
+    def reconcile_service(self, service_id: str) -> dict[str, object]:
+        authority = self.issue_operation_authority("reconcile", {"service_id": service_id})
+        nodes = [
+            {"node_id": node.node_id, "healthy": node.healthy, "compute_shared": node.compute_shared}
+            for node in self._graph().nodes.values()
+        ]
+        result = self.deployments.reconcile(service_id, nodes)
+        return {"api_version": "2", "authority": authority, "reconciliation": result, **result}
+
+    def deployment_status(self, service_id: str | None = None) -> dict[str, object]:
+        value = self.deployments.status(service_id)
+        return {"api_version": "2", "deployments": value if isinstance(value, list) else [value]}
+
+    def model_catalog(self) -> dict[str, object]:
+        return self.catalog.current() or {"schema_version": 1, "sequence": 0, "entries": []}
+
+    def publish_catalog(
+        self,
+        *,
+        sequence: int,
+        entries: list[dict[str, object]],
+        issued_at: float,
+        expires_at: float,
+    ) -> dict[str, object]:
+        parsed = [CatalogEntry(**dict(item)) for item in entries]
+        signed = self.catalog.sign(
+            sequence=sequence, entries=parsed, issued_at=issued_at, expires_at=expires_at
+        )
+        self.catalog.accept(signed, now=float(self.clock()))
+        return signed
+
+    def accept_catalog(self, signed: dict[str, object]) -> dict[str, object]:
+        return self.catalog.accept(signed, now=float(self.clock()))
+
+    def group_detail(self, group_id: str, service_id: str | None = None) -> dict[str, object]:
+        group = next((item for item in self.service_catalog.list_groups() if item.group_id == group_id), None)
+        if group is None:
+            raise KeyError(f"unknown service group: {group_id}")
+        service = self.service_catalog.resolve(group_id, service_id)
+        return {"api_version": "2", "group": group.to_dict(), "service": service.to_dict()}
+
+    def register_service(self, payload: dict[str, object]) -> dict[str, object]:
+        service = ServiceDefinition.from_dict(payload)
+        return {"api_version": "2", "service": self.service_catalog.upsert_service(service).to_dict()}
+
+    def register_group(self, payload: dict[str, object]) -> dict[str, object]:
+        group = ServiceGroup.from_dict(payload)
+        return {"api_version": "2", "group": self.service_catalog.upsert_group(group).to_dict()}
+
+    def gateway_admit(self, payload: dict[str, object]) -> dict[str, object]:
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            raise ValueError("request_id is required")
+        metadata = payload.get("prompt_metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ValueError("prompt_metadata must be an object")
+        return self.gateway_router.admit(
+            request_id,
+            group_id=str(payload.get("group_id") or ""),
+            source_node_id=str(payload.get("source_node_id") or ""),
+            service_id=(str(payload["service_id"]) if payload.get("service_id") else None),
+            prompt_metadata=metadata,
+        )
+
+    def gateway_update(self, request_id: str, action: str, payload: dict[str, object]) -> dict[str, object]:
+        if action == "fail":
+            return self.gateway_router.fail(request_id, str(payload.get("node_id") or ""), str(payload.get("reason") or "unspecified"))
+        if action == "complete":
+            return self.gateway_router.complete(request_id, payload.get("response"))
+        if action == "expire":
+            return self.gateway_router.expire(request_id)
+        raise KeyError(action)
+
     def record_telemetry(self, node_id: str, snapshot: dict[str, object], token: str | None = None) -> dict[str, object]:
         return {"api_version": "2", "telemetry": self.enrollments.record_telemetry(node_id, snapshot, token)}
 
@@ -484,6 +653,10 @@ class MeshController:
                 queue_depth=int(value.get("queue_depth") or 0),
                 labels={str(k): str(v) for k, v in dict(value.get("labels") or {}).items()},
                 offers=[self._offer(item) for item in value.get("runtime_offers", [])],
+                compute_shared=(
+                    str(dict(value.get("participation") or {}).get("mode") or "SHARE_COMPUTE")
+                    == "SHARE_COMPUTE"
+                ),
             )
         evidence = {item.evidence for item in self._links.values()}
         return MeshGraph(
@@ -503,24 +676,61 @@ class MeshController:
             minimum_context_tokens=int(payload.get("minimum_context_tokens") or 1),
             privacy=PrivacyPolicy(str(payload.get("privacy") or PrivacyPolicy.MESH_ALLOWED.value)),
             minimum_quality_score=float(payload.get("minimum_quality_score") or 0),
+            model_id=(str(payload["model_id"]) if payload.get("model_id") else None),
         )
         decision = self.route_planner.resolve(graph=self._graph(), intent=intent)
         selected_node = next(
             (node for node in self.enrollments.list_nodes() if node.get("node_id") == decision.selected.node_id),
             {},
         )
+        endpoint = str(selected_node.get("endpoint") or "")
+        if not endpoint:
+            raise RuntimeError("selected node has no authenticated inference endpoint")
+        selected_offer = next(
+            (
+                offer
+                for offer in self._graph().nodes[decision.selected.node_id].offers
+                if offer.offer_id == decision.selected.offer_id
+            ),
+            None,
+        )
+        if selected_offer is None:
+            raise RuntimeError("selected route offer disappeared during lease issuance")
+        lease_ttl = int(payload.get("lease_ttl_seconds") or 30)
+        issued_at = float(self.clock())
+        grant = RouteGrant(
+            grant_id=f"grant-{secrets.token_hex(8)}",
+            controller_id=self.controller_id,
+            source_node_id=intent.source_node_id,
+            service_id=service_id,
+            model_id=selected_offer.model_id,
+            primary_node_id=decision.selected.node_id,
+            fallback_node_ids=tuple(item.node_id for item in decision.fallbacks),
+            inference_endpoint=endpoint,
+            policy_hash=policy_hash,
+            issued_at=issued_at,
+            expires_at=issued_at + lease_ttl,
+            nonce=secrets.token_urlsafe(12),
+        )
+        grant_token = self.route_grant_signer.issue(grant)
         lease = self.route_leases.issue(
             source_node_id=intent.source_node_id,
             service_id=service_id,
             primary_node_id=decision.selected.node_id,
             fallback_node_ids=[item.node_id for item in decision.fallbacks],
-            ttl_seconds=int(payload.get("lease_ttl_seconds") or 30),
+            ttl_seconds=lease_ttl,
             policy_hash=policy_hash,
             controller_id="rift-controller",
-            inference_endpoint=str(selected_node.get("endpoint") or "https://127.0.0.1:8443"),
-            bearer_token=secrets.token_urlsafe(32),
+            inference_endpoint=endpoint,
+            bearer_token=grant_token,
         )
-        return {"api_version": "2", "decision": asdict(decision), "lease": lease}
+        return {
+            "api_version": "2",
+            "decision": asdict(decision),
+            "lease": lease,
+            "route_grant": grant_token,
+            "route_grant_public_key": self.route_grant_signer.public_key().decode("ascii"),
+        }
 
     def topology(self) -> dict[str, object]:
         nodes = self.enrollments.list_nodes()

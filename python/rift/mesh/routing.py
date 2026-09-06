@@ -35,11 +35,23 @@ class RoutePlanner:
                 privacy_rejected = True
                 rejected.append({"node_id": node_id, "reason": "privacy policy requires local execution"})
                 continue
+            if node_id != intent.source_node_id and not node.compute_shared:
+                rejected.append({"node_id": node_id, "reason": "node owner has not shared compute"})
+                continue
             link = graph.link(intent.source_node_id, node_id)
             if link is None or link.loss_ratio >= 1.0:
                 rejected.append({"node_id": node_id, "reason": "node is unreachable"})
                 continue
             for offer in node.offers:
+                if intent.model_id is not None and offer.model_id != intent.model_id:
+                    rejected.append(
+                        {
+                            "node_id": node_id,
+                            "offer_id": offer.offer_id,
+                            "reason": f"offer model {offer.model_id} does not match requested model {intent.model_id}",
+                        }
+                    )
+                    continue
                 if offer.task != intent.task:
                     continue
                 if offer.context_tokens < intent.minimum_context_tokens:
@@ -69,6 +81,8 @@ class RoutePlanner:
         candidates.sort(key=lambda item: (item.score, item.node_id, item.offer_id))
         if not candidates:
             suffix = " because privacy policy requires local execution" if privacy_rejected else ""
+            if intent.model_id:
+                suffix = f" for requested model {intent.model_id}{suffix}"
             raise NoRouteError(f"no feasible inference route{suffix}")
         return RouteDecision(
             selected=candidates[0],
@@ -79,4 +93,3 @@ class RoutePlanner:
 
 
 __all__ = ["NoRouteError", "RoutePlanner"]
-

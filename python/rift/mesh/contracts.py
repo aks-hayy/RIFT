@@ -105,6 +105,7 @@ class TrustedNode:
     queue_depth: int = 0
     labels: dict[str, str] = field(default_factory=dict)
     offers: list[RuntimeOffer] = field(default_factory=list)
+    compute_shared: bool = True
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ class InferenceIntent:
     minimum_context_tokens: int
     privacy: PrivacyPolicy = PrivacyPolicy.MESH_ALLOWED
     minimum_quality_score: float = 0.0
+    model_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,4 +172,3 @@ class RouteDecision:
     fallbacks: tuple[RouteCandidate, ...]
     rejected: tuple[JsonDict, ...]
     evidence: str
-

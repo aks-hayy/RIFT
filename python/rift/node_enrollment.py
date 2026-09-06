@@ -127,6 +127,7 @@ class ManagedNodeStore:
                     "client_certificate_required": True,
                 },
                 "permissions": {
+                    "participation_mode": "ACCESS_ONLY",
                     "allow_download": False,
                     "allow_install": False,
                     "allow_launch": False,
@@ -193,13 +194,22 @@ class ManagedNodeStore:
         return config
 
     def update_permissions(self, permissions: JsonDict) -> JsonDict:
-        allowed = {"allow_download", "allow_install", "allow_launch", "allow_inference"}
+        allowed = {"participation_mode", "allow_download", "allow_install", "allow_launch", "allow_inference"}
         unknown = set(permissions) - allowed
         if unknown:
             raise ValueError("unknown node permissions: " + ", ".join(sorted(unknown)))
         current = self.read_config()
         existing = dict(current.get("permissions") or {})
+        if "participation_mode" in permissions:
+            mode = str(permissions["participation_mode"]).upper().replace("-", "_")
+            if mode not in {"ACCESS_ONLY", "SHARE_COMPUTE"}:
+                raise ValueError("participation_mode must be ACCESS_ONLY or SHARE_COMPUTE")
+            existing["participation_mode"] = mode
         existing.update(permissions)
+        if existing.get("participation_mode") == "ACCESS_ONLY" and any(
+            bool(existing.get(key)) for key in ("allow_download", "allow_install", "allow_launch", "allow_inference")
+        ):
+            raise ValueError("access-only participation cannot enable node permissions")
         return self.update_config({"permissions": existing})
 
     def ensure_csr(self, node_id: str) -> JsonDict:
