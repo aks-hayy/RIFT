@@ -16,6 +16,7 @@ const routes = [
     { url: "/deployments", filename: "deployments.html" },
     { url: "/nodes", filename: "nodes.html" },
     { url: "/models", filename: "models.html" },
+    { url: "/groups", filename: "groups.html" },
     { url: "/operations?tab=operations", filename: "operations.html" },
     { url: "/tuning", filename: "tuning.html" },
     { url: "/settings?tab=controller", filename: "settings.html" },

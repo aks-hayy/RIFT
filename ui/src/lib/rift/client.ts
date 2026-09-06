@@ -23,6 +23,8 @@ import type {
   MeshNode,
   MeshSighting,
   MeshTopology,
+  MeshService,
+  MeshServiceGroup,
   ManagedEnrollment,
   ManagedEnrollmentWindow,
   OperationRecord,
@@ -275,6 +277,29 @@ function mapMeshLink(value: unknown): MeshLink {
     uploadMbps: numeric(raw.upload_mbps, numeric(raw.uploadMbps)),
     downloadMbps: numeric(raw.download_mbps, numeric(raw.downloadMbps)),
     evidence: text(raw.evidence, "UNKNOWN"),
+  };
+}
+
+function mapMeshService(value: unknown): MeshService {
+  const raw = object(value);
+  return {
+    serviceId: text(raw.service_id, text(raw.serviceId)),
+    modelId: text(raw.model_id, text(raw.modelId)),
+    revision: text(raw.revision),
+    task: text(raw.task, "chat"),
+    groups: list(raw.groups).map((item) => text(item)).filter(Boolean),
+    desiredReplicas: numeric(raw.desired_replicas, numeric(raw.desiredReplicas, 1)),
+    policyHash: text(raw.policy_hash, text(raw.policyHash)) || undefined,
+  };
+}
+
+function mapMeshServiceGroup(value: unknown): MeshServiceGroup {
+  const raw = object(value);
+  return {
+    groupId: text(raw.group_id, text(raw.groupId)),
+    serviceIds: list(raw.service_ids).map((item) => text(item)).filter(Boolean),
+    defaultService: text(raw.default_service, text(raw.defaultService)) || undefined,
+    gatewayPath: text(raw.gateway_path, text(raw.gatewayPath)) || undefined,
   };
 }
 
@@ -1561,6 +1586,14 @@ export const rift = {
       links: list(payload.links).map(mapMeshLink),
       evidence: text(payload.evidence, "UNKNOWN"),
     };
+  },
+  listMeshServices: async (signal?: AbortSignal): Promise<MeshService[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/mesh/services", undefined, signal);
+    return list(payload.services).map(mapMeshService);
+  },
+  listMeshServiceGroups: async (signal?: AbortSignal): Promise<MeshServiceGroup[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/mesh/service-groups", undefined, signal);
+    return list(payload.groups).map(mapMeshServiceGroup);
   },
   beginMeshEnrollment: async (
     sightingId: string,

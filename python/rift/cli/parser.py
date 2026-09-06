@@ -338,6 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_service_group(commands)
     _add_cluster_group(commands)
     _add_node_group(commands)
+    _add_mesh_group(commands)
     _add_system_group(commands)
     return parser
 
@@ -665,7 +666,62 @@ def _add_node_group(commands) -> None:
     permission_set = _parser(permission_sub, "set", "Change selected local permissions")
     for name in ("inference", "download", "install", "launch"):
         permission_set.add_argument(f"--{name}", choices=("allow", "deny"))
+    permission_set.add_argument(
+        "--participation",
+        choices=("access-only", "share-compute"),
+        help="Choose whether this enrolled node is a viewpoint or may share compute",
+    )
     permission_set.add_argument("--root", help="Override RIFT_HOME for this node")
+
+
+def _add_mesh_group(commands) -> None:
+    mesh = _parser(commands, "mesh", "Inspect and administer the enrolled RIFT mesh")
+    sub = _subcommands(mesh, title="mesh commands", dest="mesh_command")
+    groups = _parser(sub, "groups", "List or inspect service gateway groups")
+    group_sub = _subcommands(groups, title="group commands", dest="mesh_group_command")
+    group_list = _parser(group_sub, "list", "List configured mesh service groups")
+    group_list.add_argument("--root", help="Override the controller mesh state directory")
+    service = _parser(sub, "service", "Register an immutable model-backed mesh service")
+    service_sub = _subcommands(service, title="service commands", dest="mesh_service_command")
+    service_list = _parser(service_sub, "list", "List configured mesh services")
+    service_list.add_argument("--root", help="Override the controller mesh state directory")
+    register = _parser(service_sub, "register", "Register or update a mesh service")
+    register.add_argument("--id", required=True, dest="service_id")
+    register.add_argument("--model", required=True, dest="model_id")
+    register.add_argument("--revision", required=True)
+    register.add_argument("--task", default="chat")
+    register.add_argument("--group", action="append", default=[])
+    register.add_argument("--replicas", type=int, default=1, dest="desired_replicas")
+    register.add_argument("--root", help="Override the controller mesh state directory")
+    group_register = _parser(group_sub, "register", "Create or update a service gateway group")
+    group_register.add_argument("--id", required=True, dest="group_id")
+    group_register.add_argument("--service", action="append", required=True, dest="service_ids")
+    group_register.add_argument("--default-service", dest="default_service")
+    group_register.add_argument("--gateway-path", dest="gateway_path")
+    group_register.add_argument("--root", help="Override the controller mesh state directory")
+    deployment = _parser(sub, "deployment", "Deploy and operate a mesh service")
+    deployment_sub = _subcommands(deployment, title="deployment commands", dest="mesh_deployment_command")
+    deploy = _parser(deployment_sub, "deploy", "Declare a service revision and replica target")
+    deploy.add_argument("--service", required=True)
+    deploy.add_argument("--revision", required=True)
+    deploy.add_argument("--replicas", type=int, default=1)
+    deploy.add_argument("--root", help="Override the controller mesh state directory")
+    terminate = _parser(deployment_sub, "terminate", "Stop a mesh service")
+    terminate.add_argument("--service", required=True)
+    terminate.add_argument("--root", help="Override the controller mesh state directory")
+    rollback = _parser(deployment_sub, "rollback", "Roll a service back to its previous revision")
+    rollback.add_argument("--service", required=True)
+    rollback.add_argument("--revision")
+    rollback.add_argument("--root", help="Override the controller mesh state directory")
+    scale = _parser(deployment_sub, "scale", "Change a service replica target")
+    scale.add_argument("--service", required=True)
+    scale.add_argument("--replicas", required=True, type=int)
+    scale.add_argument("--root", help="Override the controller mesh state directory")
+    deploy_list = _parser(deployment_sub, "list", "List mesh service deployment state")
+    deploy_list.add_argument("--root", help="Override the controller mesh state directory")
+    reconcile = _parser(deployment_sub, "reconcile", "Reconcile desired replicas onto healthy shared-compute nodes")
+    reconcile.add_argument("--service", required=True)
+    reconcile.add_argument("--root", help="Override the controller mesh state directory")
 
 
 def _add_system_group(commands) -> None:

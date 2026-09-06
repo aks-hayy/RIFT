@@ -15,6 +15,7 @@ import { Route as SettingsRouteImport } from './routes/settings'
 import { Route as OperationsRouteImport } from './routes/operations'
 import { Route as NodesRouteImport } from './routes/nodes'
 import { Route as ModelsRouteImport } from './routes/models'
+import { Route as GroupsRouteImport } from './routes/groups'
 import { Route as DeploymentsRouteImport } from './routes/deployments'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as NodesIndexRouteImport } from './routes/nodes.index'
@@ -52,6 +53,11 @@ const ModelsRoute = ModelsRouteImport.update({
   path: '/models',
   getParentRoute: () => rootRouteImport,
 } as any)
+const GroupsRoute = GroupsRouteImport.update({
+  id: '/groups',
+  path: '/groups',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const DeploymentsRoute = DeploymentsRouteImport.update({
   id: '/deployments',
   path: '/deployments',
@@ -86,6 +92,7 @@ const DeploymentsIdRoute = DeploymentsIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/deployments': typeof DeploymentsRouteWithChildren
+  '/groups': typeof GroupsRoute
   '/models': typeof ModelsRoute
   '/nodes': typeof NodesRouteWithChildren
   '/operations': typeof OperationsRoute
@@ -99,6 +106,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/groups': typeof GroupsRoute
   '/models': typeof ModelsRoute
   '/operations': typeof OperationsRoute
   '/settings': typeof SettingsRoute
@@ -113,6 +121,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/deployments': typeof DeploymentsRouteWithChildren
+  '/groups': typeof GroupsRoute
   '/models': typeof ModelsRoute
   '/nodes': typeof NodesRouteWithChildren
   '/operations': typeof OperationsRoute
@@ -129,6 +138,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/deployments'
+    | '/groups'
     | '/models'
     | '/nodes'
     | '/operations'
@@ -142,6 +152,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/groups'
     | '/models'
     | '/operations'
     | '/settings'
@@ -155,6 +166,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/'
     | '/deployments'
+    | '/groups'
     | '/models'
     | '/nodes'
     | '/operations'
@@ -170,6 +182,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DeploymentsRoute: typeof DeploymentsRouteWithChildren
+  GroupsRoute: typeof GroupsRoute
   ModelsRoute: typeof ModelsRoute
   NodesRoute: typeof NodesRouteWithChildren
   OperationsRoute: typeof OperationsRoute
@@ -220,6 +233,13 @@ declare module '@tanstack/react-router' {
       path: '/models'
       fullPath: '/models'
       preLoaderRoute: typeof ModelsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/groups': {
+      id: '/groups'
+      path: '/groups'
+      fullPath: '/groups'
+      preLoaderRoute: typeof GroupsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/deployments': {
@@ -296,6 +316,7 @@ const NodesRouteWithChildren = NodesRoute._addFileChildren(NodesRouteChildren)
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DeploymentsRoute: DeploymentsRouteWithChildren,
+  GroupsRoute: GroupsRoute,
   ModelsRoute: ModelsRoute,
   NodesRoute: NodesRouteWithChildren,
   OperationsRoute: OperationsRoute,

@@ -15,6 +15,8 @@ import type {
   MeshNode,
   MeshSighting,
   MeshTopology,
+  MeshService,
+  MeshServiceGroup,
   OperationRecord,
   SettingsSnapshot,
   EvaluationRun,
@@ -32,6 +34,8 @@ export const keys = {
   meshSightings: ["rift", "mesh", "sightings"] as const,
   meshNodes: ["rift", "mesh", "nodes"] as const,
   meshTopology: ["rift", "mesh", "topology"] as const,
+  meshServices: ["rift", "mesh", "services"] as const,
+  meshGroups: ["rift", "mesh", "groups"] as const,
   services: ["rift", "services"] as const,
   deploymentRecords: ["rift", "deployment-records"] as const,
   service: (id: string) => ["rift", "service", id] as const,
@@ -148,6 +152,24 @@ export function useMeshTopology() {
       retry: false,
     }),
   );
+}
+export function useMeshServices() {
+  return shape(useQuery<MeshService[]>({
+    queryKey: keys.meshServices,
+    queryFn: ({ signal }) => rift.listMeshServices(signal),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    retry: false,
+  }));
+}
+export function useMeshServiceGroups() {
+  return shape(useQuery<MeshServiceGroup[]>({
+    queryKey: keys.meshGroups,
+    queryFn: ({ signal }) => rift.listMeshServiceGroups(signal),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    retry: false,
+  }));
 }
 export function useServices() {
   return shape(useQuery(servicesOptions));

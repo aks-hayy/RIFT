@@ -25,12 +25,16 @@ from rift.rift import RiftEngine
 from rift.rift_yaml import read_yaml, write_yaml
 from rift.runtime_paths import RiftPaths
 from rift.tuning_engine import TuningStore
+from rift.mesh.controller import MeshController
 
 from .console import RiftConsole
 
 
 def execute(args: Any, console: RiftConsole) -> int:
     orchestrator = RiftOrchestrator()
+
+    if args.command == "mesh":
+        return _mesh(args, console)
 
     if args.command == "init":
         result = orchestrator.init_config(path=args.config, overwrite=args.force)
@@ -1139,6 +1143,9 @@ def _node(args: Any, console: RiftConsole) -> int:
             value = getattr(args, option)
             if value is not None:
                 updates[key] = value == "allow"
+        participation = getattr(args, "participation", None)
+        if participation is not None:
+            updates["participation_mode"] = participation.replace("-", "_").upper()
         if not updates:
             console.error("At least one permission flag is required", hint="Use `rift node permissions set --inference allow`.")
             return 2
@@ -1151,6 +1158,65 @@ def _node(args: Any, console: RiftConsole) -> int:
         serve_node_agent(config_path=args.config, root=args.root)
         return 0
     raise ValueError("rift node requires a subcommand")
+
+
+def _mesh(args: Any, console: RiftConsole) -> int:
+    root = Path(args.root).expanduser().resolve() if getattr(args, "root", None) else (RiftPaths.from_environment().home / "mesh")
+    controller = MeshController(root=root)
+    command = args.mesh_command
+    if command == "groups":
+        if args.mesh_group_command == "list":
+            console.render(controller.groups(), title="RIFT mesh service groups")
+            return 0
+        if args.mesh_group_command == "register":
+            result = controller.register_group(
+                {
+                    "group_id": args.group_id,
+                    "service_ids": args.service_ids,
+                    "default_service": args.default_service,
+                    "gateway_path": args.gateway_path,
+                }
+            )
+            console.render(result, title="RIFT mesh service group registered")
+            return 0
+    if command == "service":
+        if args.mesh_service_command == "list":
+            console.render(controller.services(), title="RIFT mesh services")
+            return 0
+        if args.mesh_service_command == "register":
+            result = controller.register_service(
+                {
+                    "service_id": args.service_id,
+                    "model_id": args.model_id,
+                    "revision": args.revision,
+                    "task": args.task,
+                    "groups": args.group,
+                    "desired_replicas": args.desired_replicas,
+                }
+            )
+            console.render(result, title="RIFT mesh service registered")
+            return 0
+    if command == "deployment":
+        action = args.mesh_deployment_command
+        if action == "list":
+            console.render(controller.deployment_status(), title="RIFT mesh deployments")
+            return 0
+        service_id = args.service
+        if action == "deploy":
+            result = controller.deploy_service(service_id, revision=args.revision, replicas=args.replicas)
+        elif action == "terminate":
+            result = controller.terminate_service(service_id)
+        elif action == "rollback":
+            result = controller.rollback_service(service_id, args.revision)
+        elif action == "scale":
+            result = controller.scale_service(service_id, replicas=args.replicas)
+        elif action == "reconcile":
+            result = controller.reconcile_service(service_id)
+        else:
+            raise ValueError(f"unsupported mesh deployment action: {action}")
+        console.render(result, title=f"RIFT mesh deployment {action}")
+        return 0
+    raise ValueError("rift mesh requires groups or service subcommands")
 
 
 def _system(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
