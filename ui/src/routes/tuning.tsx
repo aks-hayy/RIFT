@@ -5,7 +5,7 @@ import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, StatDot } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
 import { rift } from "@/lib/rift/client";
-import { useActiveTuningRun, useServices, useTuningRuns } from "@/lib/rift/hooks";
+import { useActiveTuningRun, useServices, useTuningCapabilities, useTuningRuns } from "@/lib/rift/hooks";
 import { tuningOutcomeTone, tuningProfileLabel } from "@/lib/rift/tuning-contract";
 import type { TuningProfile, TuningRun } from "@/lib/rift/types";
 
@@ -21,7 +21,7 @@ export const Route = createFileRoute("/tuning")({
       { title: "Tuning — RIFT" },
       {
         name: "description",
-        content: "Autonomously tune llama.cpp deployments for speed or GPU energy cost.",
+        content: "Autonomously tune supported deployments for speed or measured energy cost.",
       },
     ],
   }),
@@ -34,6 +34,7 @@ function TuningPage() {
   const service =
     services.data?.find((item) => item.name === selectedServiceName) ?? services.data?.[0];
   const [profile, setProfile] = useState<TuningProfile>("speed");
+  const [usage, setUsage] = useState<"interactive" | "shared">("interactive");
   const [allowRestart, setAllowRestart] = useState(false);
   const [noApply, setNoApply] = useState(false);
   const [targetTokensPerSecond, setTargetTokensPerSecond] = useState(100);
@@ -56,6 +57,7 @@ function TuningPage() {
   const [preview, setPreview] = useState<TuningPreview | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
   const runs = useTuningRuns({ service: service?.name });
+  const capabilities = useTuningCapabilities(service?.name);
   const activeRun = useActiveTuningRun(runs.data);
   useEffect(() => {
     const status = activeRun.data?.status?.toUpperCase();
@@ -110,6 +112,7 @@ function TuningPage() {
     retainAccuracyResponses,
     kvPrecisionSearch,
     ngramSpeculation: ngramSpeculation === "default" ? undefined : ngramSpeculation === "on",
+    usage,
   });
 
   const start = async () => {
@@ -193,7 +196,7 @@ function TuningPage() {
       <PageHeader
         eyebrow="Optimization"
         title="Tuning"
-        description="RIFT measures bounded llama.cpp candidates, explains the winner, and preserves your model and precision contract."
+        description="RIFT measures bounded backend candidates, explains the winner, and preserves your model and precision contract."
       />
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-2 grid gap-4">
@@ -204,6 +207,23 @@ function TuningPage() {
               <p className="text-[13px] text-ink-secondary">Deploy a service before tuning it.</p>
             ) : (
               <div className="grid gap-5">
+                <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-secondary">
+                  <span className="rift-label">Backend</span>
+                  <span className="rounded-full border border-border bg-muted px-2 py-1 font-medium text-ink">
+                    {service.backendKind}
+                  </span>
+                  {capabilities.data?.qualification && (
+                    <span>Capability status: {String(capabilities.data.qualification)}</span>
+                  )}
+                </div>
+                <label className="grid gap-1 text-[12px] sm:max-w-xs">
+                  <span className="rift-label">Usage mode</span>
+                  <select value={usage} onChange={(event) => setUsage(event.target.value as "interactive" | "shared")} className="h-9 rounded-[4px] border border-border bg-raised px-2">
+                    <option value="interactive">Interactive responses</option>
+                    <option value="shared">Shared serving</option>
+                  </select>
+                  <span className="text-[11px] text-ink-secondary">The backend adapter chooses applicable controls for this service.</span>
+                </label>
                 {services.data && services.data.length > 1 && (
                   <label className="grid gap-1 text-[12px]">
                     <span className="rift-label">Deployment</span>

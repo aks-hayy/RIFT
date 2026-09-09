@@ -295,8 +295,9 @@ service becomes healthy, using two candidates, one warmup, and three measured
 repetitions per candidate. The baseline remains authoritative when tuning is
 unavailable or a candidate fails.
 
-For autonomous, profile-aware tuning of an already deployed `llama.cpp` service,
-use the profiled command. It keeps the model artifact and weight quantization
+For autonomous, profile-aware tuning of an already deployed service, use the
+profiled command. The service's recorded backend selects its tuning adapter;
+there is one Speed/Cost workflow for llama.cpp, vLLM, and future backends. It keeps the model artifact and weight quantization
 locked. K/V cache precision can be explored only as a bounded, quality-gated
 experiment; it is never changed silently. Context length and concurrency remain
 fixed. Restarts are a reviewed maintenance action, so `--yes` and
@@ -311,7 +312,7 @@ rift tune status
 rift tune report RUN_ID --json
 ```
 
-Speed maximizes measured generated tokens per second while rejecting latency regressions. Cost minimizes GPU joules per request
+Speed maximizes measured generated tokens per second while rejecting latency regressions. Use `--usage interactive` for per-request decode or `--usage shared` for concurrency-aware goodput. Cost minimizes GPU joules per request
 and requires usable GPU power telemetry; it is explicitly GPU-only in this
 release. A run writes a durable journal under the RIFT runtime home and reports
 the baseline, every candidate, reliability interval, winning configuration, and
@@ -385,10 +386,39 @@ rejections, and raw runtime report IDs are in
 The JSON journals remain under `.rift-runtime/reports/` on the machine that ran
 the experiment.
 
-At present, llama.cpp is the only backend with RIFT's full, tailor-made
-profiled tuning path (including real restarts, GPU-energy measurement, quality
-gates, and rollback). vLLM and the other backends have baseline tuning hooks;
-their deeper backend-specific implementations are next.
+The latest eight-cell matrix (3B/7B × llama.cpp/vLLM × Speed/Cost), including
+charts, lifecycle evidence, WSL GPU probing, and the vLLM installation result,
+is recorded in the [2026-09-07 matrix report](docs/evidence/real-tuning-validation-20260907/README.md).
+
+llama.cpp has the first locally exercised profile path, including real
+restarts, GPU-energy measurement, quality gates, and rollback. vLLM now exposes
+a backend-specific adapter with runtime-probed scheduler, KV-cache, prefix,
+execution, offload, and CPU controls across CUDA, ROCm, XPU, and CPU families.
+Those vLLM families remain explicitly unqualified until a matching runtime and
+hardware acceptance run is recorded; adapter metadata is not benchmark proof.
+
+#### Cross-backend real-model matrix (2026-09-06)
+
+The latest clean-room matrix exercised the local Qwen2.5 3B and 7B GGUF
+artifacts through both Speed and Cost profiles, with service teardown after
+every cell. The tracked evidence (including charts, a lifecycle diagram, and a
+sanitized summary) is in
+[docs/evidence/real-tuning-validation](docs/evidence/real-tuning-validation/README.md).
+It reports best-observed measurements separately from statistically promotable
+winners: the 3B Speed cell observed 91.45 tok/s versus an 81.05 tok/s basic
+baseline, and the 7B Cost cell observed 108.91 GPU J versus 127.90 GPU J, but
+both remained `no_improvement` under the confidence gate. All four vLLM cells
+are recorded as `BLOCKED` because this workstation currently has no vLLM,
+Docker, or accessible WSL runtime.
+
+A separate verified promotion used the same real 3B Q4_K_M artifact with a
+valid conservative `flash_attn=off` baseline. RIFT changed only
+`flash_attn` to `auto`, then retested and promoted it: 87.66 → 91.71 tok/s
+(+4.62%; 95% improvement interval +4.03% to +8.32%), with the quality suite
+remaining at 1.00. The model weights, quantization, context, batching, thread
+count, and K/V precision were unchanged. See the
+[promotion evidence](docs/evidence/real-tuning-validation/README.md#verified-promotion)
+and its [sanitized record](docs/evidence/real-tuning-validation/promotion.json).
 
 Use `--ngram-speculation` or `--no-ngram-speculation` to make the n-gram choice
 explicit when tuning. It remains an opt-in scenario-specific acceleration, not

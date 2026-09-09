@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 import json
 import math
+import os
 import platform
 from pathlib import Path
 import sqlite3
@@ -34,6 +35,11 @@ LOCKED_KEYS = frozenset(
         "gpu_layers",
         "spec_draft_model",
         "spec_draft_sha256",
+        "kv_cache_dtype", "quantization", "dtype", "tokenizer", "tokenizer_revision",
+        "revision", "chat_template", "tool_call_parser", "reasoning_parser",
+        "generation_config", "tensor_parallel_size", "pipeline_parallel_size",
+        "container_image", "executable", "runtime_mode", "command_style",
+        "vllm_use_v1", "device_ids", "accelerator_family", "speculative_config",
     }
 )
 PROFILE_NAMES = frozenset({"speed", "cost"})
@@ -210,7 +216,7 @@ def candidate_is_allowed(contract: TuningContract, candidate: Mapping[str, Any])
             return False
 
     for key in LOCKED_KEYS:
-        if key in {"cache_type_k", "cache_type_v"} and contract.kv_precision_search:
+        if key in {"cache_type_k", "cache_type_v", "kv_cache_dtype"} and contract.kv_precision_search:
             continue
         if key in candidate and key in contract.locked:
             if candidate[key] != contract.locked[key]:
@@ -748,6 +754,45 @@ class TuningStore:
                 "CREATE TABLE IF NOT EXISTS tuning_events ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, created REAL NOT NULL, payload TEXT NOT NULL)"
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS tuning_leases ("
+                "resource TEXT PRIMARY KEY, run_id TEXT NOT NULL, owner TEXT NOT NULL)"
+            )
+
+    def acquire(self, run_id: str, resources: Iterable[str]) -> None:
+        """Atomically reserve service and device domains until explicit recovery.
+
+        Leases deliberately do not expire: a slow launch is not permission for
+        a second controller to steal the device or kill its process.
+        """
+        import psutil
+        owner = json.dumps({"pid": os.getpid(), "created": psutil.Process().create_time()})
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for resource in sorted(set(resources)):
+                row = connection.execute("SELECT run_id FROM tuning_leases WHERE resource = ?", (resource,)).fetchone()
+                if row and row[0] != run_id:
+                    raise ValueError(f"{resource} is reserved by tuning run {row[0]}")
+            for resource in sorted(set(resources)):
+                connection.execute("INSERT OR IGNORE INTO tuning_leases VALUES (?, ?, ?)", (resource, run_id, owner))
+
+    def release(self, run_id: str) -> None:
+        with self._connection() as connection:
+            connection.execute("DELETE FROM tuning_leases WHERE run_id = ?", (run_id,))
+
+    def owner_alive(self, run_id: str) -> bool:
+        import psutil
+        with self._connection() as connection:
+            row = connection.execute("SELECT owner FROM tuning_leases WHERE run_id = ? LIMIT 1", (run_id,)).fetchone()
+        if not row:
+            return False
+        owner = json.loads(row[0])
+        try:
+            return psutil.Process(owner["pid"]).create_time() == owner["created"]
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            return True
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(str(self.path))

@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-09-07",
+  "hardware_scope": "local workstation RTX 4060 Laptop GPU (8,188 MiB), WSL2 Ubuntu GPU passthrough",
+  "artifacts": {
+    "3B": "Qwen2.5 Instruct GGUF Q4_K_M",
+    "7B": "Qwen2.5 Instruct GGUF Q4_K_M"
+  },
+  "cells": [
+    {"model":"3B","backend":"llama.cpp","profile":"speed","outcome":"no_improvement","baseline_tps":90.164507,"best_observed_tps":91.631664,"candidates":4,"quality_score":1.0,"teardown_verified":true},
+    {"model":"3B","backend":"llama.cpp","profile":"cost","outcome":"no_improvement","baseline_gpu_joules_per_request":9.294568,"best_observed_gpu_joules_per_request":8.250975,"candidates":4,"quality_score":1.0,"energy_scope":"GPU-only","teardown_verified":true},
+    {"model":"7B","backend":"llama.cpp","profile":"speed","outcome":"no_improvement","baseline_tps":45.12,"best_observed_tps":45.49,"candidates":4,"quality_score":1.0,"teardown_verified":true},
+    {"model":"7B","backend":"llama.cpp","profile":"cost","outcome":"no_improvement","baseline_gpu_joules_per_request":35.39,"best_observed_gpu_joules_per_request":33.53,"candidates":4,"quality_score":1.0,"energy_scope":"GPU-only","teardown_verified":true},
+    {"model":"3B","backend":"vLLM","profile":"speed","outcome":"blocked","reason":"vLLM was not installed; isolated WSL installation attempted but stopped after prolonged low-throughput CUDA dependency downloads","gpu_visible_in_wsl":true,"teardown_verified":true},
+    {"model":"3B","backend":"vLLM","profile":"cost","outcome":"blocked","reason":"same installation blocker; no service was launched","gpu_visible_in_wsl":true,"teardown_verified":true},
+    {"model":"7B","backend":"vLLM","profile":"speed","outcome":"blocked","reason":"same installation blocker; no service was launched","gpu_visible_in_wsl":true,"teardown_verified":true},
+    {"model":"7B","backend":"vLLM","profile":"cost","outcome":"blocked","reason":"same installation blocker; no service was launched","gpu_visible_in_wsl":true,"teardown_verified":true}
+  ],
+  "installation": {
+    "wsl_distribution":"Ubuntu",
+    "gpu_probe":"passed",
+    "python":"3.14.4",
+    "vllm_initially_present":false,
+    "isolated_install":"vllm==0.28.0",
+    "result":"aborted_after_more_than_one_hour_of_slow_dependency_downloads",
+    "partial_environment_removed":true,
+    "no_vllm_service_started":true
+  },
+  "manual_effort_metric": {
+    "human_baseline_seconds": null,
+    "status":"not_independently_measured",
+    "claim": "No human-time saving percentage is claimed without a measured engineer baseline.",
+    "automation_proxy": "RIFT completed deployment, health check, baseline, quality gate, candidate restart/comparison, restore, report, and teardown for each llama.cpp cell.",
+    "completed_cells":4,
+    "requested_cells":8,
+    "lifecycle_stages_automated":9,
+    "candidate_configs_tested":16,
+    "human_interventions_during_completed_cells":0
+  },
+  "interpretation":"The four llama.cpp cells are real measurements with verified teardown. The four vLLM cells are blocked by an unavailable runtime installation, not performance failures; WSL GPU visibility was confirmed separately."
+}

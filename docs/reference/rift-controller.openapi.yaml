@@ -1325,7 +1325,7 @@ paths:
     get:
       tags: [Performance]
       operationId: listTuningRuns
-      summary: List durable autonomous llama.cpp tuning runs and profile decisions.
+      summary: List durable backend-neutral tuning runs and profile decisions.
       parameters:
         - $ref: "#/components/parameters/Limit"
         - name: service
@@ -1354,7 +1354,8 @@ paths:
       operationId: startTuningRun
       summary: Start a durable autonomous speed or cost tuning operation.
       description: |
-        The first implementation supports llama.cpp. Normal tuning preserves
+        The first certified path is llama.cpp; the vLLM adapter is runtime
+        probed per environment. Normal tuning preserves
         model identity, weight quantization, K/V cache precision, context, and
         concurrency. Candidate restarts require explicit allow_restart consent;
         cost profiling requires usable GPU power telemetry.
@@ -1367,6 +1368,23 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/OperationAccepted"
+
+  /v2/tuning/capabilities:
+    get:
+      tags: [Performance]
+      operationId: getTuningCapabilities
+      summary: Return the selected service backend's runtime-probed tuning controls.
+      parameters:
+        - name: service
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Backend-neutral capabilities with backend-specific parameter descriptors.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
 
   /v2/tuning/runs/{runId}:
     get:
@@ -3915,6 +3933,10 @@ components:
         kv_precision_search:
           type: boolean
           default: true
+        usage:
+          type: string
+          enum: [interactive, shared]
+          description: Interactive per-request optimization or concurrency-aware shared-serving goodput.
 
     TuningRun:
       type: object
@@ -3929,10 +3951,10 @@ components:
           enum: [speed, cost]
         backend:
           type: string
-          enum: [llama.cpp]
+          description: Backend recorded on the deployed service; tuning has no backend selector.
         status:
           type: string
-          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, BLOCKED, ROLLBACK_FAILED]
         outcome:
           type: string
           enum: [improved, no_improvement, unavailable, failed, cancelled, interrupted, preview]

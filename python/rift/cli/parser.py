@@ -525,6 +525,7 @@ def _add_tune_options(tune) -> None:
     tune.add_argument("--service", default="chat")
     tune.add_argument("--config", default="rift.yaml")
     tune.add_argument("--profile", choices=("speed", "cost"), help="Autonomous tuning objective")
+    tune.add_argument("--usage", choices=("interactive", "shared"), help="Speed usage mode; inferred from service concurrency if omitted")
     tune.add_argument("--budget", default="60m", help="Experiment budget, for example 60m or 1h")
     tune.add_argument("--live", action="store_true")
     tune.add_argument("--allow-restart", action="store_true")

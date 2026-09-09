@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-09-06",
+  "status": "VERIFIED_PROMOTION",
+  "hardware_scope": "local workstation RTX 4060 Laptop GPU",
+  "model": "Qwen2.5 Instruct GGUF 3B",
+  "artifact": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+  "artifact_sha256": "626b4a6678b86442240e33df819e00132d3ba7dddfe1cdc4fbb18e0a9615c62d",
+  "backend": "llama.cpp",
+  "profile": "speed",
+  "usage": "interactive",
+  "search": {
+    "candidate_limit": 20,
+    "repeats_per_measurement": 8,
+    "warmup_runs": 1,
+    "context_tokens": 4096,
+    "weight_quantization_locked": true,
+    "quality_policy": "rift-tuning-core/v2"
+  },
+  "baseline": {
+    "tokens_per_second": 87.664537,
+    "configuration": {
+      "batch": 128,
+      "ubatch": 128,
+      "threads": 1,
+      "threads_batch": 1,
+      "gpu_layers": 999,
+      "parallel": 1,
+      "flash_attn": "off",
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "mlock": false,
+      "no_mmap": false,
+      "ngram_speculation": false
+    }
+  },
+  "winner": {
+    "tokens_per_second_screening": 92.068714,
+    "tokens_per_second_final": 91.713548,
+    "confidence_interval_improvement_95": [0.040271, 0.083173],
+    "configuration": {
+      "batch": 128,
+      "ubatch": 128,
+      "threads": 1,
+      "threads_batch": 1,
+      "gpu_layers": 999,
+      "parallel": 1,
+      "flash_attn": "auto",
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "mlock": false,
+      "no_mmap": false,
+      "ngram_speculation": false
+    },
+    "changed_settings": {
+      "flash_attn": {"from": "off", "to": "auto"}
+    },
+    "unchanged_settings": [
+      "batch", "ubatch", "threads", "threads_batch", "gpu_layers",
+      "parallel", "cache_type_k", "cache_type_v", "mlock", "no_mmap",
+      "ngram_speculation", "Q4_K_M weight quantization", "4096-token context"
+    ]
+  },
+  "improvement": {
+    "throughput_percent": 4.619,
+    "confidence_interval_percent_95": [4.0271, 8.3173],
+    "positive_lower_bound": true
+  },
+  "quality": {
+    "suite": "rift-tuning-core/v2",
+    "aggregate_score": 1.0,
+    "passed": true,
+    "regression": false
+  },
+  "promotion": {
+    "outcome": "improved",
+    "applied": true,
+    "final_endpoint_verified": true,
+    "baseline_restored": false,
+    "temporary_service_torn_down": true,
+    "teardown_verified": true
+  },
+  "limitations": [
+    "This is a single fixed interactive recipe on one workstation, not a universal speed claim.",
+    "The measured improvement is for the tested llama.cpp runtime and artifact identity.",
+    "No human-engineer timing baseline was collected, so no manual-time saving is claimed."
+  ]
+}

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
 from typing import Any
 
 from ..adapters.contracts import ADAPTER_API_VERSION, AdapterManifest, BackendCapability
 from .base import ProviderLifecycleMixin
+from ..tuning_adapters import VLLM_PARAMETERS, accelerator_family
 from .openai_backend import (
     JsonDict,
     container_image_detection,
@@ -61,7 +63,9 @@ def _vllm_v1_disabled(runtime_mode: str, tuning: JsonDict) -> bool:
     explicit = tuning.get("vllm_use_v1")
     if explicit is not None:
         return str(explicit).strip().lower() not in {"1", "true", "yes", "on"}
-    return os.name == "nt" and runtime_mode in {"native", "container", "wsl2"}
+    # A Windows host does not identify the engine running inside Linux.
+    # Retain V0 only for an explicitly selected legacy deployment.
+    return tuning.get("container_image") == WINDOWS_V0_CONTAINER_IMAGE
 
 
 class VllmProvider(ProviderLifecycleMixin):
@@ -181,8 +185,10 @@ class VllmProvider(ProviderLifecycleMixin):
         selected: JsonDict,
         runtime_mode: str | None,
         command_style: str | None,
+        container_image: str | None = None,
+        wsl_distribution: str | None = None,
     ) -> JsonDict:
-        if not selected.get("available") or runtime_mode != "native":
+        if not selected.get("available"):
             return {
                 "probed": False,
                 "reason": "Runtime flags are probed after a native/isolated executable is available.",
@@ -195,9 +201,17 @@ class VllmProvider(ProviderLifecycleMixin):
             if command_style == "python-module"
             else [executable, "serve"]
         )
+        if runtime_mode == "container":
+            command = [executable, "run", "--rm", "--pull", "never", "--network", "none", container_image or self._preferred_container_image()]
+        elif runtime_mode == "wsl2":
+            wsl = wsl_detection()
+            command = [str(wsl.get("executable") or "wsl.exe")]
+            if wsl_distribution:
+                command.extend(["--distribution", wsl_distribution])
+            command.extend(["--", executable, "-m", "vllm.entrypoints.openai.api_server"])
         return probe_command_flags(
             command,
-            (
+            tuple(p.flag for p in VLLM_PARAMETERS if p.flag.startswith("--")) + tuple("--no-" + p.flag[2:] for p in VLLM_PARAMETERS if p.kind == "boolean") + (
                 "--quantization",
                 "--tensor-parallel-size",
                 "--pipeline-parallel-size",
@@ -206,6 +220,28 @@ class VllmProvider(ProviderLifecycleMixin):
                 "--enable-prefix-caching",
                 "--kv-cache-dtype",
             ),
+        )
+
+    def probe_tuning_runtime(self, launch_plan: JsonDict) -> JsonDict:
+        """Probe the deployed execution environment, never an alternative runtime.
+
+        Help only establishes argument syntax. Successful trial launch and
+        qualification evidence are separate requirements.
+        """
+        tuning = launch_plan.get("tuning") or {}
+        command = launch_plan.get("command") or []
+        mode = tuning.get("runtime_mode", "native")
+        executable = tuning.get("executable")
+        if mode == "wsl2":
+            executable = tuning.get("wsl_python")
+        elif command:
+            executable = command[0]
+        return self._feature_probe(
+            selected={"available": bool(executable), "executable": executable},
+            runtime_mode=mode,
+            command_style=tuning.get("command_style", "cli"),
+            container_image=tuning.get("container_image") or launch_plan.get("container_image"),
+            wsl_distribution=tuning.get("wsl_distribution"),
         )
 
     def _platform_notes(self) -> list[str]:
@@ -239,17 +275,26 @@ class VllmProvider(ProviderLifecycleMixin):
         }
 
     def install(self, *, target_dir: str, variant: str = "auto", force: bool = False) -> JsonDict:
-        existing = self.detect(search_root=target_dir)
-        if existing.get("available"):
-            return {"backend": self.name, "installed": True, "changed": False, "detection": existing}
         selected_variant = variant.lower()
+        existing = self.detect(search_root=target_dir)
         if selected_variant == "auto":
+            if existing.get("available"):
+                return {"backend": self.name, "installed": True, "changed": False, "detection": existing}
             if os.name == "nt" and container_runtime_detection().get("available"):
                 selected_variant = "container"
             elif os.name == "nt" and wsl_detection().get("available"):
                 selected_variant = "wsl2"
             else:
                 selected_variant = "isolated-python"
+        else:
+            # An explicit variant is an instruction to install/use that runtime.
+            # Do not let an already-detected alternative (for example Docker)
+            # short-circuit a requested WSL or native installation.
+            desired_mode = "container" if selected_variant in ("container", "docker", "podman") else (
+                "wsl2" if selected_variant in ("wsl", "wsl2") else "native"
+            )
+            if existing.get("available") and existing.get("runtime_mode") == desired_mode:
+                return {"backend": self.name, "installed": True, "changed": False, "detection": existing}
         if selected_variant in ("container", "docker", "podman"):
             container_image = self._preferred_container_image()
             result = install_container_image(container_image)
@@ -283,24 +328,43 @@ class VllmProvider(ProviderLifecycleMixin):
 
     def model_fit(self, *, model: JsonDict, hardware: JsonDict) -> JsonDict:
         fmt = str(model.get("format") or "").lower()
-        cuda = bool(hardware.get("cuda_available", False))
+        family = accelerator_family(hardware)
         size = int(model.get("size") or model.get("estimated_download_bytes") or 0)
-        vram = int(hardware.get("total_vram_bytes") or 0)
+        vram = int(hardware.get("total_host_ram_bytes") or 0) if family == "cpu" else int(hardware.get("total_vram_bytes") or 0)
         supported_format = fmt in self.manifest.capability.formats
-        fits = cuda and supported_format and (not size or size < max(int(vram * 1.8), 1))
+        # Unknown size is an admissible planning state for local selectors
+        # (the artifact may not exist yet); it is marked preliminary and must
+        # be resolved by startup allocation before promotion.
+        context = int(model.get("context_length") or model.get("max_model_len") or 4096)
+        concurrency = int(model.get("concurrency") or 1)
+        config = model.get("config") if isinstance(model.get("config"), dict) else {}
+        layers = int(config.get("num_hidden_layers") or config.get("n_layer") or 0)
+        hidden = int(config.get("hidden_size") or config.get("n_embd") or 0)
+        kv_heads = int(config.get("num_key_value_heads") or config.get("num_attention_heads") or 0)
+        head_dim = int(config.get("head_dim") or (hidden // max(1, int(config.get("num_attention_heads") or 1)))) if hidden else 0
+        kv_bytes = 2  # effective baseline KV dtype is conservatively treated as fp16
+        kv_estimate = (2 * layers * kv_heads * head_dim * kv_bytes * context * concurrency) if layers and kv_heads and head_dim else 0
+        reserve = max(512 * 1024**2, int(vram * 0.08))
+        required = size + kv_estimate + reserve
+        fits = supported_format and vram > 0 and (size == 0 or required < int(vram * 0.92))
         reasons = []
-        if not cuda:
-            reasons.append("vLLM requires a supported accelerator for this RIFT provider path.")
         if not supported_format:
             reasons.append(f"format {fmt or 'unknown'} is not the preferred vLLM path in RIFT.")
-        if size and vram and size >= int(vram * 1.8):
-            reasons.append("model appears too large for practical vLLM serving on this GPU without distribution/offload.")
+        if size > 0 and not fits:
+            reasons.append("Known artifact size and sufficient memory headroom are required; context-aware allocation must be validated at launch.")
+        elif size == 0 and supported_format:
+            reasons.append("Artifact size is unknown; storage and context-aware allocation must be validated before launch.")
         if not reasons:
-            reasons.append("CUDA SafeTensors/AWQ/GPTQ model can be served through vLLM when the backend is installed.")
+            reasons.append(f"Preliminary {family} artifact fit; runtime allocation is not yet verified.")
         return {
             "backend": self.name,
             "fits": fits,
             "model_bytes": size,
+            "accelerator_family": family,
+            "fit_evidence": "context_aware_estimate" if kv_estimate else "preliminary_weight_capacity_only",
+            "estimated_kv_bytes": kv_estimate,
+            "estimated_required_bytes": required,
+            "reserve_bytes": reserve,
             "reason": " ".join(reasons),
         }
 
@@ -315,7 +379,16 @@ class VllmProvider(ProviderLifecycleMixin):
         hardware: JsonDict,
         tuning: JsonDict | None = None,
     ) -> JsonDict:
-        tuning = tuning or {}
+        tuning = dict(tuning or {})
+        family = str(tuning.get("accelerator_family") or accelerator_family(hardware))
+        if family not in {"cuda", "rocm", "xpu", "cpu"}:
+            raise ValueError("unsupported accelerator family")
+        tuning["accelerator_family"] = family
+        for parameter in VLLM_PARAMETERS:
+            if parameter.name in tuning:
+                parameter.validate(tuning[parameter.name])
+                if family not in parameter.platforms:
+                    raise ValueError(f"{parameter.name} cannot be used on {family}")
         model_reference = _model_directory_reference(model_path)
         detect = self.detect(search_root=tuning.get("search_root"))
         runtime_mode = str(tuning.get("runtime_mode") or detect.get("runtime_mode") or "native").lower()
@@ -340,14 +413,18 @@ class VllmProvider(ProviderLifecycleMixin):
                 str(runtime["executable"]),
                 "run",
                 "--rm",
-                "--gpus",
-                "all",
                 "--name",
                 container_name,
                 "--ipc=host",
                 "-p",
-                f"{port}:{port}",
+                f"{host}:{port}:{port}",
             ]
+            if family == "cuda":
+                args.extend(["--gpus", str(tuning.get("device_ids") or "all")])
+            elif family == "rocm":
+                args.extend(["--device", "/dev/kfd", "--device", "/dev/dri"])
+            elif family == "xpu":
+                args.extend(["--device", "/dev/dri"])
             if disable_v1:
                 args.extend(["--env", "VLLM_USE_V1=0"])
             if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
@@ -359,6 +436,8 @@ class VllmProvider(ProviderLifecycleMixin):
                 container_model = "/models"
                 args.extend(["-v", f"{mount_root}:/models:ro"])
             container_image = str(tuning.get("container_image") or self._preferred_container_image())
+            if family != "cuda" and not tuning.get("container_image"):
+                raise ValueError(f"{family} requires an explicitly selected compatible container image")
             args.extend(
                 [
                     container_image,
@@ -376,7 +455,10 @@ class VllmProvider(ProviderLifecycleMixin):
             if not linux_model_path:
                 raise ValueError("model path could not be translated for the WSL2 launch path")
             wsl_python = str((detect.get("wsl_install") or {}).get("python") or tuning.get("wsl_python") or "python3")
-            args = [str(wsl["executable"]), "--"]
+            args = [str(wsl["executable"])]
+            if tuning.get("wsl_distribution"):
+                args.extend(["--distribution", str(tuning["wsl_distribution"])])
+            args.append("--")
             if disable_v1:
                 args.extend(["env", "VLLM_USE_V1=0"])
             args.extend([wsl_python, "-m", "vllm.entrypoints.openai.api_server", str(linux_model_path)])
@@ -398,8 +480,6 @@ class VllmProvider(ProviderLifecycleMixin):
                 str(port),
                 "--max-model-len",
                 str(context_length),
-                "--gpu-memory-utilization",
-                f"{gpu_util:.3f}",
                 "--max-num-seqs",
                 str(max_seqs),
                 "--max-num-batched-tokens",
@@ -410,6 +490,41 @@ class VllmProvider(ProviderLifecycleMixin):
                 str(tuning.get("generation_config", "vllm")),
             ]
         )
+        if family != "cpu" and not tuning.get("kv_cache_memory_bytes"):
+            args.extend(["--gpu-memory-utilization", f"{gpu_util:.3f}"])
+        # A saved plan pins the probe so tuning cannot borrow flags from a
+        # newly discovered runtime in another environment.
+        feature_probe = tuning.get("runtime_feature_probe") or detect.get("runtime_feature_probe") or {}
+        flags = feature_probe.get("flags") or {}
+        encoded = {"max_num_batched_tokens", "max_num_seqs", "gpu_memory_utilization"}
+        for parameter in VLLM_PARAMETERS:
+            if parameter.name not in tuning or parameter.name in encoded:
+                continue
+            value = tuning[parameter.name]
+            parameter.validate(value)
+            if family not in parameter.platforms:
+                raise ValueError(f"{parameter.name} cannot be used on {family}")
+            if parameter.flag.startswith("VLLM_"):
+                if runtime_mode == "native":
+                    process_env[parameter.flag] = str(value)
+                elif runtime_mode == "container":
+                    image_index = args.index(container_image)
+                    args[image_index:image_index] = ["--env", f"{parameter.flag}={value}"]
+                else:
+                    pos = args.index("--") + 1
+                    if args[pos] != "env":
+                        args.insert(pos, "env")
+                    args.insert(pos + 1, f"{parameter.flag}={value}")
+                continue
+            if flags.get(parameter.flag) is not True:
+                raise ValueError(f"Installed runtime has not verified {parameter.flag}")
+            if parameter.kind == "boolean":
+                flag = parameter.flag if value else "--no-" + parameter.flag[2:]
+                if not value and flags.get(flag) is not True:
+                    raise ValueError(f"Installed runtime has not verified {flag}")
+                args.append(flag)
+            else:
+                args.extend([parameter.flag, json.dumps(value, sort_keys=True) if isinstance(value, dict) else str(value)])
         quantization = tuning.get("quantization")
         if quantization:
             args.extend(["--quantization", str(quantization)])
@@ -432,9 +547,11 @@ class VllmProvider(ProviderLifecycleMixin):
             "context_length": context_length,
             "concurrency": concurrency,
             "tuning": {
+                **{p.name: tuning[p.name] for p in VLLM_PARAMETERS if p.name in tuning},
+                "accelerator_family": family,
                 "command_style": command_style,
                 "runtime_mode": runtime_mode,
-                "gpu_memory_utilization": gpu_util,
+                **({"gpu_memory_utilization": gpu_util} if family != "cpu" and not tuning.get("kv_cache_memory_bytes") else {}),
                 "max_num_seqs": max_seqs,
                 "max_num_batched_tokens": max_batched_tokens,
                 "dtype": str(tuning.get("dtype", "auto")),
@@ -444,6 +561,11 @@ class VllmProvider(ProviderLifecycleMixin):
                 "container_image": container_image if runtime_mode == "container" else None,
                 "container_name": container_name if runtime_mode == "container" else None,
                 "search_root": tuning.get("search_root"),
+                "executable": executable,
+                "wsl_python": wsl_python if runtime_mode == "wsl2" else None,
+                "wsl_distribution": tuning.get("wsl_distribution"),
+                "device_ids": tuning.get("device_ids"),
+                "runtime_feature_probe": feature_probe,
                 **({"quantization": quantization} if quantization else {}),
             },
         }
@@ -469,6 +591,9 @@ class VllmProvider(ProviderLifecycleMixin):
         prompt: str,
         max_tokens: int,
         timeout_seconds: float = 60.0,
+        seed: int | None = None,
+        temperature: float | None = None,
+        ignore_eos: bool = False,
     ) -> JsonDict:
         return openai_benchmark(
             self.name,
@@ -476,6 +601,10 @@ class VllmProvider(ProviderLifecycleMixin):
             prompt=prompt,
             max_tokens=max_tokens,
             timeout_seconds=timeout_seconds,
+            seed=seed,
+            temperature=temperature,
+            ignore_eos=ignore_eos,
+            stream=True,
         )
 
     def tune_candidates(self, *, launch_plan: JsonDict, hardware: JsonDict) -> list[JsonDict]:
@@ -499,15 +628,19 @@ class VllmProvider(ProviderLifecycleMixin):
         return self._unique(candidates)
 
     def _preferred_container_image(self) -> str:
+        # Keep the known Windows-compatible image as the discovery fallback.
+        # This is a runtime selection rule, not a blanket V0 decision: a
+        # Linux/WSL/container plan may pin another image explicitly.
         if os.name == "nt":
             return WINDOWS_V0_CONTAINER_IMAGE
         return self.container_image
 
     def _unique(self, candidates: list[JsonDict]) -> list[JsonDict]:
+        import json
         unique: list[JsonDict] = []
         seen = set()
         for candidate in candidates:
-            key = tuple(sorted(candidate.items()))
+            key = json.dumps(candidate, sort_keys=True, default=str)
             if key not in seen:
                 seen.add(key)
                 unique.append(candidate)
