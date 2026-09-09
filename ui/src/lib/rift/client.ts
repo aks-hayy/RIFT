@@ -1793,6 +1793,8 @@ export const rift = {
   },
   tuningProfiles: async (signal?: AbortSignal): Promise<JsonObject> =>
     req<JsonObject>("GET", "/v2/tuning/profiles", undefined, signal),
+  tuningCapabilities: async (service: string, signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>("GET", `/v2/tuning/capabilities?service=${encodeURIComponent(service)}`, undefined, signal),
   listTuningRuns: async (
     options: { service?: string; profile?: TuningProfile; limit?: number } = {},
     signal?: AbortSignal,
@@ -1834,6 +1836,7 @@ export const rift = {
       retainAccuracyResponses?: boolean;
       kvPrecisionSearch?: boolean;
       ngramSpeculation?: boolean | null;
+      usage?: "interactive" | "shared";
     },
   ): Promise<JsonObject> =>
     req<JsonObject>("POST", "/v2/tuning/runs", {
@@ -1855,6 +1858,7 @@ export const rift = {
       retain_accuracy_responses: options.retainAccuracyResponses ?? false,
       kv_precision_search: options.kvPrecisionSearch ?? true,
       ngram_speculation: options.ngramSpeculation,
+      usage: options.usage,
     }),
   cancelTuning: async (operationId: string): Promise<ApplyProgress> =>
     rift.cancelOperation(operationId, "Cancelled profiled tuning from dashboard"),

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "run_date": "2026-09-06",
+  "hardware_scope": "local workstation RTX 4060 Laptop GPU",
+  "artifacts": {
+    "3B": "Qwen2.5 Instruct GGUF Q4_K_M (1.96 GB)",
+    "7B": "Qwen2.5 Instruct GGUF Q4_K_M (4.36 GB)"
+  },
+  "cells": [
+    {"model": "3B", "backend": "llama.cpp", "profile": "speed", "outcome": "no_improvement", "baseline_tps": 81.0464, "best_observed_tps": 91.4505, "candidates": 4, "quality_score": 1.0, "teardown_verified": true},
+    {"model": "3B", "backend": "llama.cpp", "profile": "cost", "outcome": "no_improvement", "baseline_gpu_joules": 37.20161, "best_observed_gpu_joules": 29.827665, "candidates": 4, "quality_score": 1.0, "energy_scope": "GPU-only", "teardown_verified": true},
+    {"model": "7B", "backend": "llama.cpp", "profile": "speed", "outcome": "no_improvement", "baseline_tps": 45.2940, "best_observed_tps": 46.3103, "candidates": 4, "quality_score": 1.0, "teardown_verified": true},
+    {"model": "7B", "backend": "llama.cpp", "profile": "cost", "outcome": "no_improvement", "baseline_gpu_joules": 127.897697, "best_observed_gpu_joules": 108.910883, "point_estimate_reduction": 0.14845, "candidates": 4, "quality_score": 1.0, "energy_scope": "GPU-only", "teardown_verified": true},
+    {"model": "3B", "backend": "vLLM", "profile": "speed+cost", "outcome": "blocked", "reason": "exact runtime unavailable", "teardown_verified": true},
+    {"model": "7B", "backend": "vLLM", "profile": "speed+cost", "outcome": "blocked", "reason": "exact runtime unavailable", "teardown_verified": true},
+    {"model": "3B", "backend": "llama.cpp", "profile": "speed", "outcome": "improved", "applied": true, "baseline_tps": 87.664537, "winner_tps": 91.713548, "improvement_percent": 4.619, "improvement_interval_95": [0.040271, 0.083173], "changed_setting": "flash_attn off -> auto", "quality_score": 1.0, "teardown_verified": true}
+  ],
+  "manual_effort_metric": {
+    "human_baseline_seconds": null,
+    "status": "not_independently_measured",
+    "automation_proxy": "deploy, health, baseline, quality, candidate restart/comparison, restore, evidence, teardown",
+    "candidate_slots_recorded": 36,
+    "human_time_saving_claim": false
+  }
+}

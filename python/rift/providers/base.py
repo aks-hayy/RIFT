@@ -99,14 +99,20 @@ _CAPABILITIES: dict[str, JsonDict] = {
         "tuning_knobs": ["context_length", "gpu_layers", "batch", "ubatch", "threads", "mmap", "mlock"],
     },
     "vllm": {
-        "status": "implemented_platform_gate_pending",
+        "status": "implemented_runtime_probe_unqualified",
         "operating_systems": ["linux", "wsl2"],
-        "accelerators": ["cuda", "rocm", "cpu_limited"],
+        "accelerators": ["cuda", "rocm", "xpu", "cpu"],
         "formats": ["safetensors", "awq", "gptq", "fp16", "bf16"],
         "multi_gpu": True,
         "api": "openai_compatible",
         "streaming": True,
-        "tuning_knobs": ["gpu_memory_utilization", "max_num_seqs", "max_num_batched_tokens"],
+        "tuning_knobs": [
+            "max_num_batched_tokens", "max_num_seqs", "enable_chunked_prefill",
+            "gpu_memory_utilization", "kv_cache_memory_bytes", "enable_prefix_caching",
+            "kv_cache_dtype", "calculate_kv_scales", "enforce_eager", "attention_backend",
+            "compilation_config", "cpu_offload_gb", "kv_offloading_size",
+            "VLLM_CPU_KVCACHE_SPACE", "VLLM_CPU_OMP_THREADS_BIND",
+        ],
     },
     "sglang": {
         "status": "implemented_platform_gate_pending",

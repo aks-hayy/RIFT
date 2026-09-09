@@ -508,6 +508,18 @@ class RiftServerRuntime:
         if path.startswith("/api/rift/v2/evaluations/"):
             run_id = path.rsplit("/", 1)[-1]
             return orchestrator.load_evaluation(run_id)
+        if path == "/api/rift/v2/tuning/capabilities":
+            from .tuning_adapters import tuning_adapter
+            name = str(((query or {}).get("service") or ["chat"])[0])
+            service = (orchestrator.read_state().get("services") or {}).get(name)
+            if not isinstance(service, dict):
+                raise KeyError(name)
+            backend = service.get("backend")
+            provider = orchestrator.providers.get(backend)
+            adapter = tuning_adapter(backend, provider) if provider else None
+            if adapter is None:
+                return {"service": name, "backend": backend, "profiles": [], "parameters": [], "available": False}
+            return {**adapter.probe(service), "service": name, "available": True}
         if path == "/api/rift/v2/tuning/profiles":
             return {
                 "api_version": "1",
@@ -517,6 +529,7 @@ class RiftServerRuntime:
                         "label": "Speed",
                         "objective": "Maximize measured generated tokens per second while preserving the locked deployment contract and rejecting latency regressions.",
                         "metric": "median generated tokens/second",
+                        "usage_modes": ["interactive", "shared"],
                     },
                     {
                         "id": "cost",
@@ -525,6 +538,7 @@ class RiftServerRuntime:
                         "metric": "GPU joules/request",
                         "availability": "Requires usable GPU power telemetry during each candidate run.",
                         "attribution": "Aggregate device power; other workloads sharing the GPU are included.",
+                        "usage_modes": ["interactive", "shared"],
                     },
                 ],
             }
@@ -540,6 +554,10 @@ class RiftServerRuntime:
                 runs = [item for item in runs if str(item.get("profile") or "").lower() == profile_filter]
             return {"api_version": "1", "runs": runs, "count": len(runs)}
         if path.startswith("/api/rift/v2/tuning/runs/"):
+            if path.endswith("/events") or path.endswith("/report"):
+                run_id = path.split("/")[-2]
+                record = TuningStore(orchestrator.rift_dir / "tuning.db").get_run(run_id)
+                return {"events": record.get("events", [])} if path.endswith("/events") else record
             run_id = path.rsplit("/", 1)[-1]
             return TuningStore(orchestrator.rift_dir / "tuning.db").get_run(run_id)
         if path.startswith("/api/rift/v2/services/") and path.endswith("/telemetry/accounting"):
@@ -1281,6 +1299,9 @@ class RiftServerRuntime:
                 service_name=str(payload.get("service") or "chat"),
                 profile=profile,
                 allow_restart=bool(payload.get("allow_restart", False)),
+                usage=payload.get("usage"),
+                parent_run_id=payload.get("parent_run_id"),
+                contract_hash=payload.get("contract_hash"),
                 no_apply=bool(payload.get("no_apply", False)),
                 dry_run=bool(payload.get("dry_run", False)),
                 candidate_limit=int(payload.get("candidate_limit") or 24),

@@ -432,6 +432,7 @@ def execute(args: Any, console: RiftConsole) -> int:
                 retain_accuracy_responses=args.retain_accuracy_responses,
                 kv_precision_search=args.kv_precision_search,
                 ngram_speculation=args.ngram_speculation,
+                usage=getattr(args, "usage", None),
             ) if not args.dry_run else orchestrator.profiled_tune_service(
                 service_name=args.service,
                 profile=args.profile,
@@ -451,6 +452,7 @@ def execute(args: Any, console: RiftConsole) -> int:
                 retain_accuracy_responses=args.retain_accuracy_responses,
                 kv_precision_search=args.kv_precision_search,
                 ngram_speculation=args.ngram_speculation,
+                usage=getattr(args, "usage", None),
             )
         console.render(result, view="tuning", title="Profiled tuning result")
         if result.get("required_permission"):
@@ -537,6 +539,7 @@ def _submit_profiled_tuning(args: Any, budget_seconds: float) -> dict[str, Any]:
         "retain_accuracy_responses": args.retain_accuracy_responses,
         "kv_precision_search": args.kv_precision_search,
         "ngram_speculation": args.ngram_speculation,
+        "usage": getattr(args, "usage", None),
     }
     return _controller_post(
         base,

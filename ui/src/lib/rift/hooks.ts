@@ -406,6 +406,18 @@ export function useTuningRuns(options: { service?: string; profile?: "speed" | "
   );
 }
 
+export function useTuningCapabilities(service: string | undefined) {
+  return shape(
+    useQuery({
+      queryKey: ["rift", "tuning", "capabilities", service ?? "none"],
+      queryFn: ({ signal }) => rift.tuningCapabilities(service!, signal),
+      enabled: !!service,
+      staleTime: 30_000,
+      retry: false,
+    }),
+  );
+}
+
 export function useActiveTuningRun(runs: TuningRun[] | undefined) {
   const active = runs?.find((run) => ["QUEUED", "RUNNING"].includes(run.status.toUpperCase()));
   return useTuningRun(active?.runId);
