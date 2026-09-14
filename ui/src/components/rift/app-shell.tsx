@@ -14,6 +14,7 @@ import {
   X,
   SlidersHorizontal,
   Layers3,
+  WandSparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { rift } from "@/lib/rift/client";
@@ -22,7 +23,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { keys } from "@/lib/rift/hooks";
 
 type NavItem = {
-  to: "/" | "/deployments" | "/nodes" | "/models" | "/groups" | "/operations" | "/settings" | "/tuning";
+  to: "/" | "/deployments" | "/nodes" | "/models" | "/groups" | "/operations" | "/settings" | "/tuning" | "/workloads";
   label: string;
   icon: typeof Home;
   exact?: boolean;
@@ -35,6 +36,7 @@ const NAV: readonly NavItem[] = [
   { to: "/groups", label: "Groups", icon: Layers3 },
   { to: "/operations", label: "Operations", icon: Activity },
   { to: "/tuning", label: "Tuning", icon: SlidersHorizontal },
+  { to: "/workloads", label: "Easy deploy", icon: WandSparkles },
   { to: "/settings", label: "Settings", icon: Settings2 },
 ];
 

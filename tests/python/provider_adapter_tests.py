@@ -86,17 +86,17 @@ def test_vllm_and_sglang_container_launches_use_official_images_and_read_only_mo
                 concurrency=2,
                 hardware=CUDA_HARDWARE,
             )
-            assert vllm_plan["command"][:5] == ["docker", "run", "--rm", "--gpus", "all"]
+            assert vllm_plan["command"][:3] == ["docker", "run", "--rm"]
+            assert vllm_plan["command"][vllm_plan["command"].index("--gpus") + 1] == "all"
+            assert "127.0.0.1:18001:18001" in vllm_plan["command"]
             assert vllm_plan["container_image"] == vllm_mod.WINDOWS_V0_CONTAINER_IMAGE
             assert vllm_plan["container_image"] in vllm_plan["command"]
             assert any(value.endswith(":/models:ro") for value in vllm_plan["command"])
             image_index = vllm_plan["command"].index(vllm_plan["container_image"])
             assert vllm_plan["command"][image_index + 1] == "/models"
             assert "--model" not in vllm_plan["command"]
-            assert ["--env", "VLLM_USE_V1=0"] == vllm_plan["command"][
-                vllm_plan["command"].index("--env") : vllm_plan["command"].index("--env") + 2
-            ]
-            assert vllm_plan["tuning"]["vllm_use_v1"] is False
+            assert "VLLM_USE_V1=0" not in vllm_plan["command"]
+            assert vllm_plan["tuning"]["vllm_use_v1"] is True
 
             sglang = sglang_mod.SglangProvider()
             sglang.detect = lambda search_root=None: {
@@ -142,7 +142,8 @@ def test_vllm_and_sglang_wsl_launch_paths_are_explicit():
             concurrency=1,
             hardware=CUDA_HARDWARE,
         )
-        assert plan["command"][:6] == ["wsl.exe", "--", "env", "VLLM_USE_V1=0", "/rift/vllm/python", "-m"]
+        assert plan["command"][:4] == ["wsl.exe", "--", "/rift/vllm/python", "-m"]
+        assert "VLLM_USE_V1=0" not in plan["command"]
         assert "0.0.0.0" in plan["command"]
 
         sglang = sglang_mod.SglangProvider()

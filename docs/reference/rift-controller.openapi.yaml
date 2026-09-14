@@ -77,6 +77,12 @@ x-rift-implemented-v2-paths:
   - /v2/benchmark-plans
   - /v2/benchmarks
   - /v2/benchmarks/{runId}
+  - /v2/workloads
+  - /v2/workloads/{draftId}
+  - /v2/workloads/{draftId}/approve
+  - /v2/workload-runs
+  - /v2/workload-runs/{runId}
+  - /v2/workload-policies
 
 paths:
   # These are the live v2 resources used by the bundled dashboard. They are
@@ -1040,6 +1046,52 @@ paths:
           content:
             application/json: { schema: { type: object, additionalProperties: true } }
 
+  /telemetry/catalog:
+    get:
+      tags: [Telemetry]
+      operationId: getTelemetryCatalog
+      summary: List selectable telemetry metrics and built-in collection profiles.
+      responses:
+        "200":
+          description: Metric definitions and profiles supported by this controller.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/objectives/catalog:
+    get:
+      tags: [Telemetry]
+      operationId: getTelemetryObjectiveCatalog
+      summary: List objective operators, aggregations, and selectable metrics.
+      responses:
+        "200":
+          description: Objective vocabulary used by CLI and dashboard policy editors.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /telemetry/objectives:
+    get:
+      tags: [Telemetry]
+      operationId: getTelemetryObjectives
+      summary: Read configured service objectives and latest evaluations.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: events
+          in: query
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: Configured objective definitions, evaluations, and optional transitions.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
   /telemetry/series:
     get:
       tags: [Telemetry]
@@ -1325,7 +1377,7 @@ paths:
     get:
       tags: [Performance]
       operationId: listTuningRuns
-      summary: List durable autonomous llama.cpp tuning runs and profile decisions.
+      summary: List durable backend-neutral tuning runs and profile decisions.
       parameters:
         - $ref: "#/components/parameters/Limit"
         - name: service
@@ -1354,10 +1406,12 @@ paths:
       operationId: startTuningRun
       summary: Start a durable autonomous speed or cost tuning operation.
       description: |
-        The first implementation supports llama.cpp. Normal tuning preserves
-        model identity, weight quantization, K/V cache precision, context, and
+        llama.cpp and vLLM share a coordinator; runtime/hardware qualification
+        remains specific to each tested environment. Normal tuning preserves
+        model identity, weight quantization, context, and
         concurrency. Candidate restarts require explicit allow_restart consent;
-        cost profiling requires usable GPU power telemetry.
+        KV precision search is separately controlled. Cost profiling currently
+        requires usable GPU power telemetry and single-request concurrency.
       requestBody:
         required: true
         content:
@@ -1367,6 +1421,62 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/OperationAccepted"
+
+  /v2/telemetry/history:
+    get:
+      tags: [Performance]
+      operationId: getResourceHistory
+      summary: Bounded resource gauge history for one recorded session.
+      description: |
+        Returns sample means, minima, maxima and counts, not percentile averages.
+        Empty buckets are null, never zero-filled. Host/GPU values are not
+        exclusive service attribution. Supports ranges up to 48 hours of raw data;
+        this endpoint does not imply long-term rollup or latency histogram support.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: metric
+          in: query
+          schema:
+            type: string
+            default: cpu_percent
+            enum: [cpu_percent, host_ram_pressure_percent, gpu_utilization_percent, gpu_temperature_c, cpu_temperature_c, gpu_power_watts, gpu_memory_used_bytes, host_ram_used_bytes, ram_used_bytes, gpu_vram_used_bytes, gpu_vram_pressure_percent]
+        - name: since
+          in: query
+          schema: { type: number, description: "Unix seconds, inclusive" }
+        - name: until
+          in: query
+          schema: { type: number, description: "Unix seconds, exclusive" }
+        - name: buckets
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1200, default: 180 }
+      responses:
+        "200":
+          description: Recorded resource buckets with explicit gaps and measurement scope.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "400":
+          description: Unsupported metric, missing session id or invalid range/bucket limit.
+
+  /v2/tuning/capabilities:
+    get:
+      tags: [Performance]
+      operationId: getTuningCapabilities
+      summary: Return the selected service backend's runtime-probed tuning controls.
+      parameters:
+        - name: service
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Backend-neutral capabilities with backend-specific parameter descriptors.
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
 
   /v2/tuning/runs/{runId}:
     get:
@@ -1384,6 +1494,250 @@ paths:
                 $ref: "#/components/schemas/TuningRun"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /v2/workloads:
+    get:
+      tags: [Setup]
+      operationId: listWorkloadDrafts
+      summary: List immutable workload interpretation drafts.
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Latest revision of each saved workload draft.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [api_version, drafts]
+                properties:
+                  api_version: { type: string, const: "2" }
+                  drafts: { type: array, items: { $ref: "#/components/schemas/WorkloadDraft" } }
+    post:
+      tags: [Setup]
+      operationId: compileWorkload
+      summary: Compile natural language or structured workload input into a reviewable draft.
+      description: |
+        Compilation is deterministic and review-first. Unsupported requirements
+        remain visible, and this route never downloads, installs, launches, or
+        promotes a service. The draft must be explicitly reviewed and approved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workload]
+              properties:
+                workload: { description: Natural-language string or structured JSON object }
+                persist: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Compiled draft (persisted unless persist=false).
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/WorkloadDraft" } }
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /v2/workloads/compile:
+    post:
+      tags: [Setup]
+      operationId: compileWorkloadExplicit
+      summary: Compile a workload request (canonical compile route).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workload]
+              properties:
+                workload: { description: Natural-language string or structured JSON object }
+                persist: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Compiled workload draft.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/WorkloadDraft" } }
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+
+  /v2/workloads/{draftId}:
+    get:
+      tags: [Setup]
+      operationId: getWorkloadDraft
+      parameters:
+        - name: draftId
+          in: path
+          required: true
+          schema: { type: string }
+        - name: revision
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: Workload draft with field-level provenance and review questions.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/WorkloadDraft" } }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      tags: [Setup]
+      operationId: reviseWorkloadDraft
+      summary: Recompile an edited workload as a new immutable revision.
+      parameters:
+        - name: draftId
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workload, revision]
+              properties:
+                workload: { description: Natural-language string or structured JSON object }
+                revision: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: New draft revision; any previous approval is superseded.
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/WorkloadDraft" } }
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v2/workloads/{draftId}/approve:
+    post:
+      tags: [Setup]
+      operationId: approveWorkloadDraft
+      summary: Approve an exact draft hash and bounded action envelope.
+      description: |
+        Approval is idempotent and binds the contract, saved policy revision,
+        envelope hash, and limits. In this release it records authority only;
+        deployment_started is always false until the workload executor is shipped.
+      parameters:
+        - name: draftId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [revision, contract_hash, policy_id, policy_revision, envelope, envelope_hash]
+              additionalProperties: false
+              properties:
+                revision: { type: integer, minimum: 1 }
+                contract_hash: { type: string }
+                policy_id: { type: string }
+                policy_revision: { type: integer, minimum: 1 }
+                envelope: { type: object }
+                envelope_hash: { type: string }
+      responses:
+        "200":
+          description: Recorded approval; no deployment side effect in v1.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /v2/workload-runs:
+    get:
+      tags: [Setup]
+      operationId: listWorkloadRuns
+      summary: List autonomous workload deployment runs.
+      responses:
+        "200":
+          description: Durable workload runs and their outcomes.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+    post:
+      tags: [Setup]
+      operationId: startWorkloadRun
+      summary: Execute an approved workload within its bounded envelope.
+      description: |
+        Reuses the existing recommendation, immutable plan/apply, benchmark,
+        evaluation and tuning systems. Candidate actions remain within the
+        approved envelope. The operation is asynchronous and returns an
+        operation link; no permission is inferred from workload text.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approval_id]
+              properties:
+                approval_id: { type: string }
+                models_dir: { type: string, description: Required for offline local search }
+                model_ref: { type: string, description: Optional exact model repository }
+                candidate_limit: { type: integer, minimum: 1, maximum: 24, default: 3 }
+                tune: { type: boolean, default: true }
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v2/workload-runs/{runId}:
+    get:
+      tags: [Setup]
+      operationId: getWorkloadRun
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Workload run state, events and result evidence.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /v2/workload-policies:
+    get:
+      tags: [Setup]
+      operationId: listWorkloadPolicies
+      summary: List saved execution-policy ceilings for workload approvals.
+      responses:
+        "200":
+          description: Explicit policy envelopes; no permissions are inferred.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+    post:
+      tags: [Setup]
+      operationId: saveWorkloadPolicy
+      summary: Save an explicit permission and budget ceiling.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [policy]
+              properties:
+                policy_id: { type: string, default: easy-local }
+                expected_revision: { type: integer, minimum: 0, default: 0 }
+                policy: { type: object }
+      responses:
+        "200":
+          description: Saved policy revision and hash.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        "400":
+          $ref: "#/components/responses/ValidationFailed"
 
   /incidents:
     get:
@@ -1487,6 +1841,92 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/OperationAccepted"
+
+  /gateway/actions:
+    post:
+      tags: [Gateway]
+      operationId: gatewayAction
+      summary: Start or stop the controller-owned shared gateway.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [start, stop]
+                service:
+                  type: string
+                host:
+                  type: string
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+      responses:
+        "200":
+          description: Gateway lifecycle state after the requested action.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Gateway"
+
+  /gateway/groups:
+    get:
+      tags: [Gateway]
+      operationId: listGatewayGroups
+      summary: List virtual group routes and dedicated listener state.
+      responses:
+        "200":
+          description: Group gateway state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  groups:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/GatewayGroup"
+
+  /gateway/groups/{group}/actions:
+    post:
+      tags: [Gateway]
+      operationId: gatewayGroupAction
+      summary: Start or stop an optional dedicated listener for a gateway group.
+      parameters:
+        - name: group
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  enum: [start, stop]
+                host:
+                  type: string
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+      responses:
+        "200":
+          description: Group listener lifecycle state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GatewayGroup"
 
   /gateway/keys:
     get:
@@ -3235,6 +3675,21 @@ components:
           additionalProperties:
             type: string
 
+    WorkloadDraft:
+      type: object
+      required: [draft_id, revision, contract_hash, contract, provenance, questions, status]
+      properties:
+        draft_id: { type: string }
+        revision: { type: integer, minimum: 1 }
+        contract_hash: { type: string, pattern: '^[0-9a-f]{64}$' }
+        contract: { type: object, additionalProperties: true }
+        provenance: { type: object, additionalProperties: true }
+        questions: { type: array, items: { type: string } }
+        warnings: { type: array, items: { type: string } }
+        unsupported_requirements: { type: array, items: { type: object, additionalProperties: true } }
+        limitations: { type: array, items: { type: string } }
+        status: { type: string, enum: [COMPILED, APPROVED, SUPERSEDED] }
+
     RiftSpec:
       type: object
       required: [apiVersion, kind, metadata, services, policies]
@@ -3915,6 +4370,10 @@ components:
         kv_precision_search:
           type: boolean
           default: true
+        usage:
+          type: string
+          enum: [interactive, shared]
+          description: Interactive per-request optimization or concurrency-aware shared-serving goodput.
 
     TuningRun:
       type: object
@@ -3929,10 +4388,10 @@ components:
           enum: [speed, cost]
         backend:
           type: string
-          enum: [llama.cpp]
+          description: Backend recorded on the deployed service; tuning has no backend selector.
         status:
           type: string
-          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED]
+          enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, BLOCKED, ROLLBACK_FAILED]
         outcome:
           type: string
           enum: [improved, no_improvement, unavailable, failed, cancelled, interrupted, preview]
@@ -4310,6 +4769,29 @@ components:
               type: integer
             rejected_count:
               type: integer
+
+    GatewayGroup:
+      type: object
+      required: [kind, group_id, status, process_alive]
+      properties:
+        kind:
+          type: string
+          enum: [group]
+        group_id:
+          type: string
+        status:
+          type: string
+          enum: [not_started, running, stopped, stale, error]
+        process_alive:
+          type: boolean
+        host:
+          type: string
+        port:
+          type: integer
+        gateway_path:
+          type: string
+        service_name:
+          type: string
 
     GatewayKeyRequest:
       type: object

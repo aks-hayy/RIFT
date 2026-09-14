@@ -19,7 +19,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 JsonDict = dict[str, Any]
 Invoke = Callable[[str, int], str | Mapping[str, Any]]
 JudgeInvoke = Callable[["EvaluationCase", str, int], Mapping[str, Any]]
-VALID_KINDS = {"exact", "contains", "json", "reference_contains", "abstention"}
+VALID_KINDS = {"exact", "contains", "json", "reference_contains", "abstention", "nonempty"}
 
 
 def _text(value: Any) -> str:
@@ -237,6 +237,8 @@ def _json_value(response: str) -> Any:
 
 
 def _check(case: EvaluationCase, response: str) -> tuple[bool, str]:
+    if case.kind == "nonempty":
+        return bool(response.strip()), "response contains at least one non-whitespace character"
     if case.kind == "exact":
         passed = _normalize(response) == _normalize(_text(case.expected))
         return passed, "normalized response equals expected answer"

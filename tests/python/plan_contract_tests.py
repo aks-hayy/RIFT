@@ -62,6 +62,29 @@ def test_plan_creation_preserves_all_reviewed_deployment_intent(tmp_path):
     ]
 
 
+def test_plan_creation_preserves_monitoring_objectives(tmp_path):
+    orchestrator = CapturingOrchestrator(tmp_path)
+    runtime = RiftServerRuntime(
+        orchestrator_factory=lambda: orchestrator,
+        operation_store=OperationStore(tmp_path / "operations"),
+    )
+
+    runtime.control_post(
+        "/api/rift/v2/plans",
+        {
+            "recommendation_run_id": "run-1",
+            "selector": "artifact-1",
+            "artifact_id": "artifact-1",
+            "backend_kind": "vllm",
+            "monitoring_objectives": [{
+                "id": "ttft", "metric": "inference.ttft_ms", "operator": "<=", "threshold": 500,
+            }],
+        },
+    )
+
+    assert orchestrator.calls[-1]["monitoring_objectives"][0]["id"] == "ttft"
+
+
 def test_operation_store_rejects_same_request_id_with_different_payload(tmp_path):
     store = OperationStore(tmp_path / "operations")
     first = store.begin(

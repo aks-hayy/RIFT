@@ -2,6 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, StatDot, KV, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
+import { ResourceHistoryPanel } from "@/components/rift/resource-history";
 import {
   useHealth,
   useServices,
@@ -56,6 +57,7 @@ function HomePage() {
         <div className="lg:col-span-2 grid gap-4">
           <HealthPanel />
           <FleetTelemetryPanel />
+          <ResourceHistoryPanel />
           <ServicesPanel />
         </div>
         <div className="grid gap-4">

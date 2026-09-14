@@ -62,6 +62,16 @@ def test_evaluation_deadline_marks_remaining_cases_not_assessed():
     assert calls == []
 
 
+def test_nonempty_case_supports_minimal_workload_quality_pack():
+    from rift.evaluation import EvaluationSuite, evaluate_suite
+
+    suite = EvaluationSuite.from_mapping(
+        {"id": "rift-text-core", "version": "v1", "cases": [{"id": "ready", "prompt": "ready?", "kind": "nonempty"}]}
+    )
+    result = evaluate_suite(suite, lambda _prompt, _max_tokens: "ready")
+    assert result.summary["pass"] == 1
+
+
 def test_judge_assessment_is_separate_and_schema_validated():
     from rift.evaluation import EvaluationSuite, evaluate_suite
 

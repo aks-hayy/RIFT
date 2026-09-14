@@ -25,6 +25,11 @@ import type {
   TuningRun,
   BenchmarkProfile,
   BenchmarkSuiteRun,
+  TelemetryCatalog,
+  ObjectiveCatalog,
+  ObjectiveStatusPayload,
+  GatewayStatus,
+  GatewayGroupStatus,
 } from "./types";
 
 export const keys = {
@@ -36,6 +41,8 @@ export const keys = {
   meshTopology: ["rift", "mesh", "topology"] as const,
   meshServices: ["rift", "mesh", "services"] as const,
   meshGroups: ["rift", "mesh", "groups"] as const,
+  gateway: ["rift", "gateway"] as const,
+  gatewayGroups: ["rift", "gateway", "groups"] as const,
   services: ["rift", "services"] as const,
   deploymentRecords: ["rift", "deployment-records"] as const,
   service: (id: string) => ["rift", "service", id] as const,
@@ -57,6 +64,9 @@ export const keys = {
     ["rift", "tuning", "runs", service ?? "all", profile ?? "all"] as const,
   tuningRun: (id: string) => ["rift", "tuning", "run", id] as const,
   telemetryLatest: (service?: string) => ["rift", "telemetry", "latest", service ?? "all"] as const,
+  telemetryCatalog: ["rift", "telemetry", "catalog"] as const,
+  telemetryObjectiveCatalog: ["rift", "telemetry", "objectives", "catalog"] as const,
+  telemetryObjectives: (service: string, events = false) => ["rift", "telemetry", "objectives", service, events] as const,
   telemetryReports: (service?: string) =>
     ["rift", "telemetry", "reports", service ?? "all"] as const,
   telemetryAccounting: (service: string) => ["rift", "telemetry", "accounting", service] as const,
@@ -116,6 +126,28 @@ export const incidentsOptions = queryOptions<Incident[]>({
 
 export function useHealth() {
   return shape(useQuery(healthOptions));
+}
+export function useGatewayStatus() {
+  return shape(
+    useQuery<GatewayStatus>({
+      queryKey: keys.gateway,
+      queryFn: ({ signal }) => rift.gatewayStatus(signal),
+      staleTime: 1_000,
+      refetchInterval: 2_000,
+      retry: false,
+    }),
+  );
+}
+export function useGatewayGroups() {
+  return shape(
+    useQuery<GatewayGroupStatus[]>({
+      queryKey: keys.gatewayGroups,
+      queryFn: ({ signal }) => rift.gatewayGroups(signal),
+      staleTime: 1_000,
+      refetchInterval: 2_000,
+      retry: false,
+    }),
+  );
 }
 export function useNodes() {
   return shape(useQuery(nodesOptions));
@@ -262,6 +294,41 @@ export function useTelemetryLatest(service?: string) {
   );
 }
 
+export function useTelemetryCatalog() {
+  return shape(
+    useQuery<TelemetryCatalog>({
+      queryKey: keys.telemetryCatalog,
+      queryFn: ({ signal }) => rift.telemetryCatalog(signal),
+      staleTime: 5 * 60_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useTelemetryObjectiveCatalog() {
+  return shape(
+    useQuery<ObjectiveCatalog>({
+      queryKey: keys.telemetryObjectiveCatalog,
+      queryFn: ({ signal }) => rift.telemetryObjectiveCatalog(signal),
+      staleTime: 5 * 60_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useTelemetryObjectives(service: string | undefined, events = false) {
+  return shape(
+    useQuery<ObjectiveStatusPayload>({
+      queryKey: service ? keys.telemetryObjectives(service, events) : ["rift", "telemetry", "objectives", "none", events],
+      queryFn: ({ signal }) => rift.telemetryObjectives(service!, { events }, signal),
+      enabled: Boolean(service),
+      staleTime: 1_000,
+      refetchInterval: 2_000,
+      retry: false,
+    }),
+  );
+}
+
 export function useResourceReports(service?: string) {
   return shape(
     useQuery<ResourceReport[]>({
@@ -272,6 +339,17 @@ export function useResourceReports(service?: string) {
       retry: false,
     }),
   );
+}
+
+export function useResourceHistory(sessionId: string | undefined, metric: string, seconds: number) {
+  return shape(useQuery({
+    queryKey: ["rift", "telemetry", "history", sessionId, metric, seconds],
+    queryFn: ({ signal }) => rift.resourceHistory(sessionId!, metric, seconds, signal),
+    enabled: Boolean(sessionId),
+    staleTime: 5_000,
+    refetchInterval: 10_000,
+    retry: false,
+  }));
 }
 
 export function useServiceTelemetryAccounting(service: string | undefined) {
@@ -401,6 +479,18 @@ export function useTuningRuns(options: { service?: string; profile?: "speed" | "
       queryFn: ({ signal }) => rift.listTuningRuns(options, signal),
       staleTime: 2_000,
       refetchInterval: 5_000,
+      retry: false,
+    }),
+  );
+}
+
+export function useTuningCapabilities(service: string | undefined) {
+  return shape(
+    useQuery({
+      queryKey: ["rift", "tuning", "capabilities", service ?? "none"],
+      queryFn: ({ signal }) => rift.tuningCapabilities(service!, signal),
+      enabled: !!service,
+      staleTime: 30_000,
       retry: false,
     }),
   );

@@ -22,6 +22,23 @@ assert.deepEqual(planRequest("run-123", "fastest"), {
 });
 
 assert.deepEqual(
+    planRequest("run-123", "fastest", {
+        serviceName: "chat",
+        monitoringProfile: "cost",
+        monitoringMetrics: ["gpu_power_watts", "process_rss_bytes"],
+        monitoringObjectives: [{ id: "ttft", metric: "inference.ttft_ms", operator: "<=", threshold: 500 }],
+    }),
+    {
+        recommendation_run_id: "run-123",
+        selector: "fastest",
+        service_name: "chat",
+        monitoring_profile: "cost",
+        monitoring_metrics: "gpu_power_watts,process_rss_bytes",
+        monitoring_objectives: JSON.stringify([{ id: "ttft", metric: "inference.ttft_ms", operator: "<=", threshold: 500 }]),
+    },
+);
+
+assert.deepEqual(
     applyRequest("C:/rift/generated/recommendation-run-123.yaml", {
         allowDownload: true,
         allowInstall: true,

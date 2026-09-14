@@ -169,7 +169,91 @@ export interface TelemetrySample {
   gpuVramTotalBytes?: number;
   gpuVramPressurePercent?: number;
   gpuPowerWatts?: number;
+  requestErrorRatio?: number;
+  serviceAvailabilityRatio?: number;
+  requestAverageLatencySeconds?: number;
+  requestLastLatencySeconds?: number;
   availability?: Record<string, string>;
+}
+
+export interface TelemetryMetricDefinition {
+  id: string;
+  label: string;
+  description: string;
+  unit: string;
+  kind: "gauge" | "counter" | "histogram";
+  scope: "host" | "service" | "node" | string;
+  source: string;
+  default?: boolean;
+}
+
+export interface TelemetryProfile {
+  id: string;
+  name: string;
+  description: string;
+  metrics: string[];
+}
+
+export type ObjectiveStatus = "pass" | "warning" | "breach" | "unknown";
+
+export interface MonitoringObjective {
+  id: string;
+  metric: string;
+  operator: string;
+  threshold: number;
+  aggregation?: string;
+  windowSeconds?: number;
+  consecutiveBreaches?: number;
+  recoveryConsecutive?: number;
+  warningThreshold?: number;
+  recoveryThreshold?: number;
+  alerts?: string[];
+}
+
+export interface ObjectiveEvaluation {
+  objectiveId: string;
+  metric: string;
+  status: ObjectiveStatus;
+  value?: number;
+  operator?: string;
+  threshold?: number;
+  warningThreshold?: number;
+  aggregation?: string;
+  windowSeconds?: number;
+  sampleCount?: number;
+  observedAt?: string;
+  reason?: string;
+}
+
+export interface ObjectiveEvent extends ObjectiveEvaluation {
+  eventId?: string;
+  previousStatus?: ObjectiveStatus;
+  serviceName?: string;
+  nodeId?: string;
+}
+
+export interface ObjectiveStatusPayload {
+  apiVersion: string;
+  service?: string;
+  nodeId?: string;
+  session?: { sessionId?: string; status?: string; startedAt?: string; stoppedAt?: string } | null;
+  objectives: MonitoringObjective[];
+  evaluations: ObjectiveEvaluation[];
+  events: ObjectiveEvent[];
+}
+
+export interface ObjectiveCatalog {
+  apiVersion: string;
+  operators: string[];
+  aggregations: string[];
+  metrics: TelemetryMetricDefinition[];
+}
+
+export interface TelemetryCatalog {
+  apiVersion: string;
+  defaultProfile: string;
+  metrics: TelemetryMetricDefinition[];
+  profiles: TelemetryProfile[];
 }
 
 export interface TelemetrySession {
@@ -180,6 +264,18 @@ export interface TelemetrySession {
   startedAt: string;
   stoppedAt?: string;
   sampleCount?: number;
+}
+
+export interface ResourceHistory {
+  session_id: string;
+  metric: string;
+  since: number;
+  until: number;
+  bucket_seconds: number;
+  source: string;
+  aggregation: string;
+  scope: string;
+  points: { observed_at: number; count: number; mean: number | null; minimum: number | null; maximum: number | null }[];
 }
 
 export interface ResourceReport {
@@ -201,6 +297,8 @@ export interface ResourceReport {
     basis?: string;
   };
   coverage?: Record<string, unknown>;
+  objectives?: ObjectiveEvaluation[];
+  objectiveEvents?: ObjectiveEvent[];
 }
 
 export interface Service {
@@ -230,6 +328,18 @@ export interface Service {
     serving?: Record<string, unknown>;
     gateway?: Record<string, unknown>;
     launchPlan?: Record<string, unknown>;
+    monitoring?: {
+      enabled?: boolean;
+      resources?: {
+        enabled?: boolean;
+        profile?: string;
+        metrics?: string[];
+        sampleIntervalSeconds?: number;
+        [key: string]: unknown;
+      };
+      objectives?: MonitoringObjective[];
+      [key: string]: unknown;
+    };
   };
 }
 
@@ -663,6 +773,32 @@ export interface MeshServiceGroup {
   serviceIds: string[];
   defaultService?: string;
   gatewayPath?: string;
+}
+
+export interface GatewayGroupStatus {
+  kind: "group";
+  groupId: string;
+  status: string;
+  processAlive: boolean;
+  host?: string;
+  port?: number;
+  gatewayPath?: string;
+  statePath?: string;
+  serviceName?: string;
+}
+
+export interface GatewayStatus {
+  kind: "main";
+  status: string;
+  configured: boolean;
+  processAlive: boolean;
+  host?: string;
+  port?: number;
+  serviceName?: string;
+  statePath?: string;
+  metricsPath?: string;
+  metrics?: Record<string, unknown>;
+  groups?: GatewayGroupStatus[];
 }
 
 export type EnrollmentState =

@@ -55,6 +55,43 @@ published, estimated, and emulated evidence separately.
 See the [Project Status](#project-status) section for current support levels
 and unresolved production gates.
 
+### Deployment automation upgrade (in progress)
+
+The working tree now includes the shared llama.cpp/vLLM tuning coordinator and
+session-based resource history charts in Fleet. The charts show recorded values
+and missing-data gaps, with a table for inspection; host/GPU readings are not
+exclusive service attribution.
+
+The easy-path workload deployment bridge is available behind an explicit
+review and approval envelope. It reuses RIFT's recommendation, immutable
+plan/apply, health, benchmark, evaluation, and tuning primitives; the
+remaining release gates are documented in the [implementation status](docs/implementation/one-click-deployment-progress.md).
+
+The workload compiler prepares an immutable, reviewable contract locally:
+
+```powershell
+rift workload compile --text "coding assistant; at least 30 tok/s; 8K context; offline"
+rift workload compile --file workload.json
+rift workload show DRAFT_ID
+```
+
+Compilation records an immutable contract hash, field-level provenance,
+ambiguity questions, and unsupported requirements for review. It never grants
+download/install/launch authority. After explicit approval, the easy path can
+start a bounded local or approved-source run and journal its progress; no
+action outside the approved envelope is permitted. The current execution
+bridge is intentionally conservative and does not yet claim full workload
+conformance for every backend or evaluator. Approval itself remains a review
+record (`deployment_started: false`); execution is a separate, bounded run.
+
+A live natural-language CLI run covering compilation, approval, local model/backend
+selection, plan/apply, readiness, acceptance, bounded tuning, rollback, and
+cleanup is recorded in [workload CLI end-to-end evidence](docs/evidence/workload-cli-e2e-2026-09-14.md).
+
+The medical-summarizer preflight is recorded separately because RIFT correctly
+blocks it until a versioned EHR schema evaluator and an uptime observation
+window are supplied: [medical workload evidence](docs/evidence/workload-medical-summarizer-2026-09-14.md).
+
 ## Fresh Clone
 
 The intended first-run workflow requires only Python 3.10+ and network access
@@ -398,7 +435,7 @@ part of the general-purpose results above.
 
 ```text
 Core workflow
-  init, start, discover, plan, apply, status, dashboard, stop, doctor, tune
+  init, start, discover, plan, apply, status, dashboard, stop, doctor, tune, gateway
 
 Model operations
   rift model recommend|pull|inspect|verify
@@ -407,7 +444,9 @@ Provider operations
   rift backend list|inspect|doctor|detect|install-plan|install|health
 
 Service operations
-  rift service benchmark|tune|logs|restart|rollback|gateway
+  rift service benchmark|tune|logs|restart|rollback|gateway run
+  rift gateway start|stop|status
+  rift gateway group start|stop|status GROUP
   rift tune profiles|status|watch|report|cancel
 
 Cluster operations

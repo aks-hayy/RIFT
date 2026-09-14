@@ -99,10 +99,10 @@ def probe_command_flags(command: list[str], flags: tuple[str, ...]) -> JsonDict:
         return {"probed": False, "command": command, "error": str(exc), "flags": {}}
     text = f"{completed.stdout}\n{completed.stderr}"
     return {
-        "probed": completed.returncode == 0 or bool(text.strip()),
+        "probed": completed.returncode == 0,
         "command": command,
         "returncode": completed.returncode,
-        "flags": {flag: flag in text for flag in flags},
+        "flags": {flag: completed.returncode == 0 and bool(re.search(r"(?<![\w-])" + re.escape(flag) + r"(?![\w-])", text)) for flag in flags},
         "output_sha256": __import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
     }
 
@@ -398,7 +398,15 @@ def install_python_packages_wsl(
     args = [str(wsl["executable"]), "--", "bash", "-lc", script]
     started = time.perf_counter()
     try:
-        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=1800)
+        completed = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1800,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"installed": False, "changed": False, "command": args, "error": str(exc)}
     match = re.search(r"RIFT_WSL_PYTHON=(.+)", completed.stdout)
@@ -513,6 +521,10 @@ def openai_benchmark(
     max_tokens: int,
     timeout_seconds: float = 60.0,
     credential_ref: str | None = None,
+    seed: int | None = None,
+    temperature: float | None = None,
+    ignore_eos: bool = False,
+    stream: bool = False,
 ) -> JsonDict:
     model_id = resolve_openai_model_id(
         base_url=base_url,
@@ -523,8 +535,16 @@ def openai_benchmark(
         "model": model_id or "rift-managed",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "stream": False,
+        "stream": stream,
     }
+    if seed is not None:
+        payload["seed"] = seed
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if ignore_eos:
+        payload["ignore_eos"] = True
+    if stream:
+        payload["stream_options"] = {"include_usage": True}
     data = json.dumps(payload).encode("utf-8")
     request = Request(
         _openai_route(base_url, "/v1/chat/completions"),
@@ -536,14 +556,57 @@ def openai_benchmark(
         },
     )
     started = time.perf_counter()
+    first_token = None
+    finish_reason = None
+    completion_text = ""
+    reported_tokens = None
     with urlopen(request, timeout=timeout_seconds) as response:
-        raw = response.read().decode("utf-8", errors="replace")
+        if stream and "text/event-stream" in response.headers.get("Content-Type", ""):
+            chunks = []
+            for line in response:
+                line = line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_line = line[5:].strip()
+                if data_line == "[DONE]":
+                    break
+                record = json.loads(data_line)
+                usage = record.get("usage") or {}
+                if type(usage.get("completion_tokens")) is int:
+                    reported_tokens = usage["completion_tokens"]
+                for choice in record.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    part = delta.get("content") or ""
+                    if part:
+                        if first_token is None:
+                            first_token = time.perf_counter() - started
+                        chunks.append(part)
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = choice["finish_reason"]
+            completion_text = "".join(chunks)
+            raw = json.dumps({"choices": [{"message": {"content": completion_text}, "finish_reason": finish_reason}], "usage": {"completion_tokens": reported_tokens}})
+        else:
+            raw = response.read().decode("utf-8", errors="replace")
+            record = json.loads(raw)
+            choices = record.get("choices") or []
+            if choices:
+                completion_text = (choices[0].get("message") or {}).get("content") or ""
+                finish_reason = choices[0].get("finish_reason")
+            reported_tokens = (record.get("usage") or {}).get("completion_tokens")
     elapsed = max(time.perf_counter() - started, 1.0e-9)
     generated = count_generated_tokens(raw)
     return {
         "backend": backend,
         "status_code": int(response.status),
         "elapsed_seconds": elapsed,
+        "first_token_seconds": first_token,
+        "text": completion_text,
+        "finish_reason": finish_reason,
+        "generated_tokens": reported_tokens,
+        "token_count_source": "server_usage" if type(reported_tokens) is int else "text_estimate",
+        "decode_tokens_per_second": ((reported_tokens - 1) / (elapsed - first_token)) if type(reported_tokens) is int and reported_tokens > 1 and first_token is not None and elapsed > first_token else None,
+        "itl_seconds": None,
+        "itl_unavailable_reason": "SSE chunks may contain multiple tokens",
         "generated_tokens_estimate": generated,
         "tokens_per_second_estimate": generated / elapsed if generated else None,
         "model_id": model_id or "rift-managed",

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, StatDot, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
+import { ResourceHistoryPanel } from "@/components/rift/resource-history";
 import {
   useService,
   useRevisions,
@@ -15,6 +16,9 @@ import {
   useServiceTelemetryAccounting,
   useBenchmarkProfiles,
   useBenchmarkSuiteRuns,
+  useTelemetryCatalog,
+  useTelemetryObjectives,
+  useGatewayStatus,
 } from "@/lib/rift/hooks";
 import { rift } from "@/lib/rift/client";
 import { bytes, relativeTime } from "@/lib/rift/format";
@@ -33,7 +37,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { Service } from "@/lib/rift/types";
+import type { Service, TelemetrySample, ObjectiveEvaluation, MonitoringObjective } from "@/lib/rift/types";
 
 const searchSchema = z.object({
   tab: z
@@ -42,6 +46,7 @@ const searchSchema = z.object({
       "playground",
       "benchmarking",
       "performance",
+      "monitoring",
       "tuning",
       "logs",
       "configuration",
@@ -66,6 +71,7 @@ const TABS = [
   { id: "playground", label: "Playground" },
   { id: "benchmarking", label: "Benchmarking" },
   { id: "performance", label: "Performance" },
+  { id: "monitoring", label: "Monitoring" },
   { id: "tuning", label: "Tuning" },
   { id: "logs", label: "Logs" },
   { id: "configuration", label: "Configuration" },
@@ -154,6 +160,7 @@ function DeploymentDetail() {
         {service && tab === "playground" && <PlaygroundTab s={service} />}
         {service && tab === "benchmarking" && <BenchmarkingTab service={service} />}
         {service && tab === "performance" && <PerformanceTab s={service} />}
+        {service && tab === "monitoring" && <MonitoringTab service={service} />}
         {service && tab === "tuning" && <DeploymentTuningTab service={service} />}
         {service && tab === "logs" && <LogsTab service={service} />}
         {service && tab === "configuration" && <ConfigurationTab s={service} />}
@@ -737,6 +744,114 @@ function BenchmarkingTab({ service }: { service: Service }) {
   );
 }
 
+const monitoringSampleFields: Record<string, keyof TelemetrySample> = {
+  cpu_percent: "cpuPercent",
+  process_cpu_percent: "processCpuPercent",
+  process_rss_bytes: "processRssBytes",
+  host_ram_pressure_percent: "hostRamPressurePercent",
+  cpu_temperature_c: "cpuTemperatureC",
+  gpu_utilization_percent: "gpuUtilizationPercent",
+  gpu_temperature_c: "gpuTemperatureC",
+  gpu_vram_used_bytes: "gpuVramUsedBytes",
+  gpu_vram_pressure_percent: "gpuVramPressurePercent",
+  gpu_power_watts: "gpuPowerWatts",
+  "request.error_ratio": "requestErrorRatio",
+  "service.availability_ratio": "serviceAvailabilityRatio",
+  "request.average_latency_seconds": "requestAverageLatencySeconds",
+  "request.last_latency_seconds": "requestLastLatencySeconds",
+};
+
+function MonitoringTab({ service }: { service: Service }) {
+  const latest = useTelemetryLatest(service.name);
+  const reports = useResourceReports(service.name);
+  const catalog = useTelemetryCatalog();
+  const objectives = useTelemetryObjectives(service.name, true);
+  const resources = service.details?.monitoring?.resources ?? {};
+  const profile = resources.profile ?? catalog.data?.defaultProfile ?? "default";
+  const profileDefinition = catalog.data?.profiles.find((item) => item.id === profile);
+  const metricIds = resources.metrics?.length
+    ? resources.metrics
+    : profileDefinition?.metrics ?? catalog.data?.metrics.filter((item) => item.default).map((item) => item.id) ?? [];
+  const definitions = new Map((catalog.data?.metrics ?? []).map((item) => [item.id, item]));
+  const live = latest.data?.[0]?.sample;
+  const displayValue = (id: string, raw: number | undefined) => {
+    if (raw == null || Number.isNaN(raw)) return "unavailable";
+    if (id.endsWith("_bytes")) return bytes(raw);
+    const definition = definitions.get(id);
+    const decimals = id.includes("temperature") || id.includes("power") ? 1 : 0;
+    return `${raw.toFixed(decimals)}${definition?.unit === "%" ? "%" : definition?.unit === "°C" ? "°C" : definition?.unit === "W" ? " W" : ""}`;
+  };
+  return (
+    <div className="grid gap-4">
+      <Panel title="Service objectives" aside={<span className="rift-mono text-[11px] text-ink-secondary">metric policy</span>}>
+        {objectives.unavailable ? <p className="text-[12px] text-ink-secondary">Objective status is unavailable from this controller.</p> : !objectives.data?.objectives.length ? <p className="text-[12px] text-ink-secondary">No objectives configured for this service. Add them during setup or provide a monitoring policy to the CLI.</p> : <>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {objectives.data.evaluations.map((evaluation) => <ObjectiveCard key={evaluation.objectiveId} evaluation={evaluation} objective={objectives.data?.objectives.find((item) => item.id === evaluation.objectiveId)} />)}
+          </div>
+          {objectives.data.events.length > 0 && <div className="mt-4 border-t border-border pt-3"><div className="rift-label">Recent transitions</div><ul className="mt-2 grid gap-1 text-[11px] rift-mono">{objectives.data.events.slice(0, 8).map((event, index) => <li key={`${event.objectiveId}-${event.observedAt}-${index}`} className="flex gap-2"><span className={event.status === "breach" ? "text-error" : event.status === "warning" ? "text-attention" : "text-secondary"}>{event.status}</span><span>{event.objectiveId}</span><span className="text-ink-secondary">{event.previousStatus ? `${event.previousStatus} → ${event.status}` : "entered"}</span></li>)}</ul></div>}
+        </>}
+      </Panel>
+      <Panel title="Monitoring profile" aside={<span className="rift-mono text-[11px] text-ink-secondary">service-scoped</span>}>
+        <div className="grid gap-4 sm:grid-cols-3">
+          <KV label="Profile" value={profile} />
+          <KV label="Metrics collected" value={String(metricIds.length)} />
+          <KV label="Sampling" value={`${resources.sampleIntervalSeconds ?? 2}s`} />
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          {metricIds.map((id) => (
+            <span key={id} className="rounded-full border border-border bg-muted px-2.5 py-1 text-[11px] rift-mono">
+              {definitions.get(id)?.label ?? id}
+            </span>
+          ))}
+        </div>
+        <p className="mt-3 text-[11px] text-ink-secondary">
+          Only selected metrics are persisted for this service. Alert rules and notification adapters
+          Objective thresholds are evaluated from the same selected telemetry stream; derived request metrics become available when the gateway reports them.
+        </p>
+      </Panel>
+      <Panel title="Live telemetry" aside={<span className="rift-mono text-[11px] text-ink-secondary">{live ? `sampled ${relativeTime(live.observedAt)}` : "waiting"}</span>}>
+        {latest.unavailable ? (
+          <p className="text-[13px] text-ink-secondary">Live telemetry is unavailable from this controller.</p>
+        ) : !live ? (
+          <p className="text-[13px] text-ink-secondary">Waiting for the first selected telemetry sample.</p>
+        ) : (
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
+            {metricIds.map((id) => {
+              const field = monitoringSampleFields[id];
+              const raw = field ? (live[field] as number | undefined) : undefined;
+              return <KV key={id} label={definitions.get(id)?.label ?? id} value={displayValue(id, raw)} />;
+            })}
+          </div>
+        )}
+      </Panel>
+      <ResourceHistoryPanel serviceName={service.name} allowedMetrics={metricIds} />
+      <Panel title="Completed resource reports" bodyClassName="p-0">
+        {reports.unavailable ? (
+          <p className="px-4 py-6 text-[12px] text-ink-secondary">Completed reports are unavailable.</p>
+        ) : !reports.data?.length ? (
+          <p className="px-4 py-6 text-[12px] text-ink-secondary">No completed monitoring sessions yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[720px] text-[12px] rift-mono">
+              <thead className="rift-label"><tr className="border-b border-border"><th className="text-left px-4 h-9 font-normal">Stopped</th><th className="text-left px-4 font-normal">Node</th><th className="text-left px-4 font-normal">Samples</th><th className="text-left px-4 font-normal">Duration</th><th className="text-left px-4 font-normal">GPU energy</th><th className="text-left px-4 font-normal">Cost</th><th className="text-left px-4 font-normal">Average / peak</th></tr></thead>
+              <tbody>{reports.data.map((report) => <tr key={report.reportId} className="border-b border-border last:border-0"><td className="px-4 py-2">{relativeTime(report.stoppedAt)}</td><td className="px-4">{report.nodeId}</td><td className="px-4">{report.sampleCount}</td><td className="px-4">{report.durationSeconds.toFixed(1)}s</td><td className="px-4">{report.costs?.energyJoules == null ? "unavailable" : `${report.costs.energyJoules.toFixed(1)} J`}</td><td className="px-4">{report.costs?.totalCost == null ? "unconfigured" : report.costs.totalCost.toFixed(4)}</td><td className="px-4 py-2"><div className="flex max-w-[620px] flex-wrap gap-1.5">{Object.entries(report.metrics).map(([id, aggregate]) => <span key={id} className="rounded-full border border-border bg-muted px-2 py-1 text-[10px] whitespace-nowrap">{definitions.get(id)?.label ?? id}: {displayValue(id, aggregate.average)} avg · {displayValue(id, aggregate.peak)} peak</span>)}</div></td></tr>)}</tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+function ObjectiveCard({ evaluation, objective }: { evaluation: ObjectiveEvaluation; objective?: MonitoringObjective }) {
+  const tone = evaluation.status === "breach" ? "text-error border-error/40 bg-error/5" : evaluation.status === "warning" ? "text-attention border-attention/40 bg-attention/5" : evaluation.status === "pass" ? "text-secondary border-secondary/40 bg-secondary/5" : "text-ink-secondary border-border bg-muted";
+  const value = evaluation.value == null ? "unavailable" : `${evaluation.value.toFixed(Math.abs(evaluation.value) >= 100 ? 0 : 2)}${evaluation.metric.includes("percent") ? "%" : evaluation.metric.includes("ms") ? " ms" : ""}`;
+  const operator = evaluation.operator ?? objective?.operator;
+  const threshold = evaluation.threshold ?? objective?.threshold;
+  const aggregation = evaluation.aggregation ?? objective?.aggregation ?? "latest";
+  return <div className={`rounded border px-3 py-2 ${tone}`}><div className="flex items-center justify-between gap-2"><span className="text-[12px] font-medium text-ink">{evaluation.objectiveId}</span><span className="rift-mono text-[10px] uppercase">{evaluation.status}</span></div><div className="mt-2 rift-mono text-[13px] text-ink">{value}</div><div className="mt-1 rift-mono text-[10px] text-ink-secondary">{operator ?? "target"} {threshold ?? "—"} · {aggregation}</div></div>;
+}
+
 function PerformanceTab({ s }: { s: Service }) {
   const { data, unavailable, refetch } = useBenchmarks(s.id);
   const telemetry = useTelemetryLatest(s.name);
@@ -1278,6 +1393,7 @@ function LogsTab({ service }: { service: Service }) {
 }
 
 function ConfigurationTab({ s }: { s: Service }) {
+  const controllerGateway = useGatewayStatus();
   const details = s.details ?? {};
   const model = details.model ?? {};
   const serving = details.serving ?? {};
@@ -1366,7 +1482,11 @@ ${s.assignments.map((a) => `  - node: ${a.nodeId}\n    gpus: [${a.gpuIndices.joi
           <KV label="Process" value={details.pid == null ? "not running" : `PID ${details.pid}`} />
           <KV
             label="Gateway"
-            value={gateway.status == null ? "not configured" : String(gateway.status)}
+            value={controllerGateway.data?.status ?? (gateway.status == null ? "not configured" : String(gateway.status))}
+          />
+          <KV
+            label="Gateway endpoint"
+            value={controllerGateway.data?.host ? `http://${controllerGateway.data.host}:${controllerGateway.data.port ?? "—"}` : "not running"}
           />
         </div>
         <details className="mt-4 border-t border-border pt-3">
