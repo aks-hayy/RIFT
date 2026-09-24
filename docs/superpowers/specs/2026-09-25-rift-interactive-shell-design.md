@@ -10,7 +10,7 @@ Give RIFT operators a persistent, discoverable terminal workspace for deploying 
 - On Linux and macOS, bare `rift` opens the shell in the current terminal; RIFT does not guess which terminal application to launch.
 - Existing one-shot commands remain valid and unchanged, for example `rift model recommend`.
 - The shell uses `prompt_toolkit`, with the current `argparse` command definitions and command handlers as the source of truth. The shell does not duplicate command semantics.
-- Inside the shell, command groups retain their existing hierarchy without the `rift` prefix: `model recommend`, `service list`, and similar.
+- Inside the shell, command groups retain their existing hierarchy without the `rift` prefix: `model recommend`, `mesh service list`, and similar.
 - The status display stays visible and dynamic, but compact. Command output receives the main area.
 - CPU and memory are sampled once per second; GPU metrics are shown when available. Service and node state refresh every five seconds. Unavailable sources display `unknown` and do not prevent command use.
 - Help has three levels: `help`, `help <group>`, and `help <group> <command>`. It covers shell controls, command groups/subcommands, then options and usage examples.
@@ -48,7 +48,7 @@ rift> help
 rift> help model
 rift> help model recommend
 rift> model recommend --task chat
-rift> service list
+rift> mesh service list
 rift> exit
 ```
 
