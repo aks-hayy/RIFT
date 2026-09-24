@@ -69,6 +69,8 @@ def test_shell_help_levels_follow_the_existing_parser() -> None:
 
     assert "model" in main_help
     assert "shell" in main_help
+    assert "exit" in main_help
+    assert "Ctrl+C" in main_help
     assert "recommend" in model_help
     assert "--task" in recommend_help
 

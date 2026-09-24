@@ -38,7 +38,15 @@ def shell_help_text(parser: argparse.ArgumentParser, path: Sequence[str]) -> str
             target = f"{parent} {name}".strip()
             return f"No help available for: {target}\n"
         current = child
-    return current.format_help()
+    text = current.format_help()
+    if not path:
+        text += (
+            "\nInteractive shell controls:\n"
+            "  help [GROUP [COMMAND]]  Show main, group, or command help\n"
+            "  exit, quit, Ctrl+C      Leave the RIFT shell\n"
+            "  Tab                     Complete commands and options\n"
+        )
+    return text
 
 
 class ShellCompleter(Completer):
