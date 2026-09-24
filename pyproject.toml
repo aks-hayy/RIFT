@@ -12,7 +12,8 @@ dependencies = [
     "PyYAML>=6.0.2",
     "zeroconf>=0.132.0",
     "cryptography>=42.0",
-    "psutil>=5.9.0"
+    "psutil>=5.9.0",
+    "prompt_toolkit>=3.0.50,<4"
 ]
 license = "Apache-2.0"
 authors = [

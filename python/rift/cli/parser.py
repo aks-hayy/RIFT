@@ -354,6 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_mesh_group(commands)
     _add_workload_group(commands)
     _add_system_group(commands)
+    _parser(commands, "shell", "Open the interactive RIFT shell")
     return parser
 
 

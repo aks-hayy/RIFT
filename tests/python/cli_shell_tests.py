@@ -7,6 +7,8 @@ import sqlite3
 import types
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
@@ -66,6 +68,7 @@ def test_shell_help_levels_follow_the_existing_parser() -> None:
     recommend_help = shell_help_text(parser, ["model", "recommend"])
 
     assert "model" in main_help
+    assert "shell" in main_help
     assert "recommend" in model_help
     assert "--task" in recommend_help
 
@@ -95,6 +98,358 @@ def test_shell_parser_errors_return_status_two_instead_of_exiting(capsys) -> Non
 
     assert code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_shell_completer_uses_nested_parser_commands_and_options() -> None:
+    from prompt_toolkit.completion import CompleteEvent
+    from prompt_toolkit.document import Document
+
+    from rift.cli.shell_commands import ShellCompleter
+
+    completer = ShellCompleter(build_parser())
+
+    def completions(text: str) -> set[str]:
+        return {
+            item.text
+            for item in completer.get_completions(Document(text), CompleteEvent())
+        }
+
+    assert "model" in completions("")
+    assert "recommend" in completions("model ")
+    assert "--task" in completions("model recommend ")
+    assert completions("model pull C:\\models\\custom.gguf") == set()
+
+
+def test_shell_prompt_uses_ephemeral_history_completion_and_refreshing_toolbar(monkeypatch) -> None:
+    from prompt_toolkit.input import DummyInput
+    from prompt_toolkit.output import DummyOutput
+
+    from rift.cli import shell
+
+    captured = {}
+
+    class FakeStatus:
+        def __init__(self, paths):
+            self.stopped = []
+
+        def snapshot(self):
+            return {"system": {}, "rift": {}}
+
+        async def run_system(self, stop_event):
+            await stop_event.wait()
+            self.stopped.append("system")
+
+        async def run_rift(self, stop_event):
+            await stop_event.wait()
+            self.stopped.append("rift")
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.lines = iter(["exit"])
+
+        async def prompt_async(self, prompt):
+            captured["prompt"] = prompt
+            return next(self.lines)
+
+    async def direct_terminal(callback, *, in_executor):
+        return callback()
+
+    monkeypatch.setattr(shell, "run_in_terminal", direct_terminal)
+
+    result = shell.run_shell(
+        parser=build_parser(),
+        no_color=True,
+        session_factory=lambda **kwargs: FakeSession(**kwargs),
+        status_factory=FakeStatus,
+        input=DummyInput(),
+        output=DummyOutput(),
+    )
+
+    assert result == 0
+    assert captured["prompt"] == "rift> "
+    assert captured["refresh_interval"] == 1.0
+    assert captured["history"].__class__.__name__ == "InMemoryHistory"
+    assert captured["completer"].__class__.__name__ == "ShellCompleter"
+    assert captured["bottom_toolbar"]()  # toolbar is computed from current status
+
+
+def test_default_prompt_session_handles_eof_without_creating_rift_state() -> None:
+    from prompt_toolkit.input import DummyInput
+    from prompt_toolkit.output import DummyOutput
+
+    from rift.cli.shell import run_shell
+
+    assert run_shell(
+        parser=build_parser(), input=DummyInput(), output=DummyOutput()
+    ) == 0
+
+
+def test_shell_prompt_remains_usable_when_status_refresh_fails(monkeypatch) -> None:
+    from rift.cli import shell
+
+    prompts = []
+
+    class FailingStatus:
+        def __init__(self, paths):
+            pass
+
+        def snapshot(self):
+            return {"system": {}, "rift": {}}
+
+        async def run_system(self, stop_event):
+            raise RuntimeError("telemetry unavailable")
+
+        async def run_rift(self, stop_event):
+            raise RuntimeError("state unavailable")
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+
+        async def prompt_async(self, prompt):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return "help model recommend"
+            return "exit"
+
+    async def direct_terminal(callback, *, in_executor):
+        return callback()
+
+    monkeypatch.setattr(shell, "run_in_terminal", direct_terminal)
+    monkeypatch.setattr(shell, "execute_shell_line", lambda *args: 0)
+    assert shell.run_shell(
+        parser=build_parser(),
+        session_factory=lambda **kwargs: FakeSession(**kwargs),
+        status_factory=FailingStatus,
+    ) == 0
+    assert prompts == ["rift> ", "rift> "]
+
+
+def test_shell_ctrl_c_and_eof_close_prompt_and_sampler(monkeypatch) -> None:
+    from rift.cli import shell
+
+    for raised in (KeyboardInterrupt(), EOFError()):
+        stopped = []
+
+        class FakeStatus:
+            def __init__(self, paths):
+                pass
+
+            def snapshot(self):
+                return {"system": {}, "rift": {}}
+
+            async def run_system(self, stop_event):
+                try:
+                    await stop_event.wait()
+                finally:
+                    stopped.append("system")
+
+            async def run_rift(self, stop_event):
+                try:
+                    await stop_event.wait()
+                finally:
+                    stopped.append("rift")
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                pass
+
+            async def prompt_async(self, prompt):
+                await asyncio.sleep(0)
+                raise raised
+
+        assert shell.run_shell(
+            parser=build_parser(),
+            session_factory=lambda **kwargs: FakeSession(**kwargs),
+            status_factory=FakeStatus,
+        ) == 0
+        assert sorted(stopped) == ["rift", "system"]
+
+
+def test_shell_command_runs_in_terminal_executor_and_recovers_from_error(monkeypatch) -> None:
+    from rift.cli import shell
+
+    lines = iter(["model recommend --task chat", "exit"])
+    captured = []
+
+    class FakeStatus:
+        def __init__(self, paths):
+            pass
+
+        def snapshot(self):
+            return {"system": {}, "rift": {}}
+
+        async def run_system(self, stop_event):
+            await stop_event.wait()
+
+        async def run_rift(self, stop_event):
+            await stop_event.wait()
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+
+        async def prompt_async(self, prompt):
+            return next(lines)
+
+    async def fake_run_in_terminal(callback, *, in_executor):
+        captured.append(in_executor)
+        return callback()
+
+    monkeypatch.setattr(shell, "run_in_terminal", fake_run_in_terminal)
+    monkeypatch.setattr(
+        shell,
+        "execute_shell_line",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("command failed")),
+    )
+    assert shell.run_shell(
+        parser=build_parser(),
+        session_factory=lambda **kwargs: FakeSession(**kwargs),
+        status_factory=FakeStatus,
+    ) == 0
+    assert captured == [True]
+
+
+def test_shell_parser_errors_return_to_prompt(monkeypatch, capsys) -> None:
+    from rift.cli import shell
+
+    lines = iter(["model recommend --not-a-real-option", "exit"])
+    prompts = []
+
+    class FakeStatus:
+        def __init__(self, paths):
+            pass
+
+        def snapshot(self):
+            return {"system": {}, "rift": {}}
+
+        async def run_system(self, stop_event):
+            await stop_event.wait()
+
+        async def run_rift(self, stop_event):
+            await stop_event.wait()
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            pass
+
+        async def prompt_async(self, prompt):
+            prompts.append(prompt)
+            return next(lines)
+
+    async def direct_terminal(callback, *, in_executor):
+        return callback()
+
+    monkeypatch.setattr(shell, "run_in_terminal", direct_terminal)
+    assert shell.run_shell(
+        parser=build_parser(),
+        session_factory=lambda **kwargs: FakeSession(**kwargs),
+        status_factory=FakeStatus,
+    ) == 0
+    assert prompts == ["rift> ", "rift> "]
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_shell_toolbar_adapts_to_normal_and_narrow_widths() -> None:
+    snapshot = {
+        "system": {"cpu_percent": 24, "host_ram_pressure_percent": 61},
+        "rift": {"service_count": 2, "node_count": 3},
+        "cpu_history": [10, 20, 30],
+        "memory_history": [50, 60, 70],
+    }
+
+    for width in (100, 60):
+        toolbar = format_status_toolbar(snapshot, width)[0][1]
+        assert "CPU" in toolbar
+        assert "MEM" in toolbar
+        assert "SVC" in toolbar or "SERVICES" in toolbar
+        assert "NODE" in toolbar
+        assert len(toolbar) <= width
+
+
+def test_cli_one_shot_command_does_not_open_shell(monkeypatch) -> None:
+    from rift import cli
+
+    called = []
+    monkeypatch.setattr(cli, "execute", lambda args, console: called.append(args) or 9)
+    monkeypatch.setattr("rift.cli.shell.run_shell", lambda **kwargs: pytest.fail("shell called"), raising=False)
+
+    assert cli.main(["model", "recommend", "--task", "chat"]) == 9
+    assert called[0].command == "model"
+    assert called[0].model_command == "recommend"
+
+
+def test_explicit_shell_uses_current_console_and_forwards_no_color(monkeypatch) -> None:
+    from rift import cli
+    from rift.cli import shell
+
+    calls = []
+    monkeypatch.setattr(shell, "run_shell", lambda **kwargs: calls.append(kwargs) or 4)
+
+    assert cli.main(["--no-color", "shell"]) == 4
+    assert calls == [{"parser": calls[0]["parser"], "no_color": True}]
+    assert calls[0]["parser"].parse_args(["shell"]).command == "shell"
+
+
+def test_non_tty_bare_invocation_prints_help_without_running_shell(monkeypatch, capsys) -> None:
+    from rift import cli
+
+    monkeypatch.setattr(cli, "_stdin_stdout_are_ttys", lambda: False)
+    monkeypatch.setattr(cli, "_launch_shell_window", lambda: pytest.fail("window launched"))
+    monkeypatch.setattr(cli, "_is_windows", lambda: True)
+
+    assert cli.main([]) == 0
+    assert "RIFT fits LLM deployments" in capsys.readouterr().out
+
+
+def test_bare_windows_tty_launches_one_shell_child(monkeypatch) -> None:
+    from rift import cli
+
+    calls = []
+    monkeypatch.setattr(cli, "_stdin_stdout_are_ttys", lambda: True)
+    monkeypatch.setattr(cli, "_is_windows", lambda: True)
+    monkeypatch.setattr(cli, "_launch_shell_window", lambda: calls.append("new-window") or 0)
+    monkeypatch.setattr("rift.cli.shell.run_shell", lambda **kwargs: pytest.fail("parent prompt started"), raising=False)
+
+    assert cli.main([]) == 0
+    assert calls == ["new-window"]
+
+
+def test_windows_launcher_opens_one_child_with_shell_subcommand(monkeypatch) -> None:
+    from rift import cli
+
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "CREATE_NEW_CONSOLE", 0x10, raising=False)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda args, **kwargs: calls.append((args, kwargs)))
+
+    assert cli._launch_shell_window() == 0
+    assert calls == [
+        (
+            [sys.executable, "-m", "rift.cli", "shell"],
+            {"creationflags": 0x10, "close_fds": True},
+        )
+    ]
+
+
+def test_json_mode_rejects_interactive_shell(monkeypatch, capsys) -> None:
+    from rift import cli
+
+    assert cli.main(["--json", "shell"]) == 2
+    assert "cannot emit a single JSON response" in capsys.readouterr().err
+
+
+def test_bare_posix_tty_runs_shell_in_process(monkeypatch) -> None:
+    from rift import cli
+    from rift.cli import shell
+
+    calls = []
+    monkeypatch.setattr(cli, "_stdin_stdout_are_ttys", lambda: True)
+    monkeypatch.setattr(cli, "_is_windows", lambda: False)
+    monkeypatch.setattr(shell, "run_shell", lambda **kwargs: calls.append(kwargs) or 0)
+
+    assert cli.main([]) == 0
+    assert calls == [{"parser": calls[0]["parser"]}]
 
 
 def test_status_snapshot_reads_sqlite_without_rewriting_state_or_mirror(tmp_path) -> None:

@@ -457,9 +457,24 @@ Node agent
 
 System and support
   rift system backup|restore|diagnostics|migrate
+  rift shell
 ```
 
 Run `rift COMMAND --help` for permission requirements and examples.
+
+### Interactive shell
+
+On Windows, bare `rift` opens the interactive shell in a new console window;
+`rift shell` keeps it in the current console. On Linux and macOS, bare `rift`
+uses the current terminal. Existing one-shot commands such as
+`rift model recommend --task chat` keep their normal behavior.
+
+Inside the shell, use `help`, `help model`, or `help model recommend` for the
+main and nested command help. Type `exit`, `quit`, or press Ctrl+C to leave.
+The status strip refreshes host and RIFT service/node information while keeping
+the command area available for output. Starting the shell does not install a
+backend, download a model, launch a service, start the controller, or create a
+history file.
 
 ## Dashboard
 

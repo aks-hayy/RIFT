@@ -11,6 +11,9 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from typing import Any
 
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
+
 from .commands import execute
 from .console import RiftConsole
 
@@ -36,6 +39,51 @@ def shell_help_text(parser: argparse.ArgumentParser, path: Sequence[str]) -> str
             return f"No help available for: {target}\n"
         current = child
     return current.format_help()
+
+
+class ShellCompleter(Completer):
+    """Complete parser subcommands and options without guessing values."""
+
+    def __init__(self, parser: argparse.ArgumentParser) -> None:
+        self.parser = parser
+
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        try:
+            tokens = shlex.split(text, posix=(os.name != "nt"))
+        except ValueError:
+            return
+        if text and text[-1].isspace():
+            current = ""
+        elif tokens:
+            current = tokens.pop()
+        else:
+            current = ""
+        if tokens and tokens[0].lower() == "rift":
+            tokens.pop(0)
+
+        help_mode = bool(tokens and tokens[0].lower() == "help")
+        if help_mode:
+            tokens = tokens[1:]
+        target = self.parser
+        for token in tokens:
+            if token.startswith("-"):
+                return
+            child = _subparser_for(target, token)
+            if child is None:
+                return
+            target = child
+
+        candidates: list[str] = []
+        for action in target._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                candidates.extend(action.choices.keys())
+            elif not help_mode:
+                candidates.extend(action.option_strings)
+        prefix = current.casefold()
+        for candidate in dict.fromkeys(candidates):
+            if candidate.casefold().startswith(prefix):
+                yield Completion(candidate[len(current):], start_position=-len(current))
 
 
 def execute_shell_line(
@@ -81,4 +129,4 @@ def execute_shell_line(
     return int(executor(args, console))
 
 
-__all__ = ["execute_shell_line", "shell_help_text"]
+__all__ = ["ShellCompleter", "execute_shell_line", "shell_help_text"]

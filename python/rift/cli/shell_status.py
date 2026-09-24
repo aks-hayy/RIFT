@@ -210,7 +210,7 @@ class StatusCollector:
 
 
 def _sparkline(values: Any) -> str:
-    numbers = [float(value) for value in values if isinstance(value, (int, float))]
+    numbers = [float(value) for value in (values or ()) if isinstance(value, (int, float))]
     if not numbers:
         return ""
     low = min(numbers)
