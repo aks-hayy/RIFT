@@ -455,7 +455,7 @@ class VllmProvider(ProviderLifecycleMixin):
             )
             if not linux_model_path:
                 raise ValueError("model path could not be translated for the WSL2 launch path")
-            wsl_python = str(tuning.get("wsl_python") or (detect.get("wsl_install") or {}).get("python") or "python3")
+            wsl_python = str((detect.get("wsl_install") or {}).get("python") or tuning.get("wsl_python") or "python3")
             args = [str(wsl["executable"])]
             if tuning.get("wsl_distribution"):
                 args.extend(["--distribution", str(tuning["wsl_distribution"])])

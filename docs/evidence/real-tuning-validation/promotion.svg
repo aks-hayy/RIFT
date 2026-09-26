@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520">
+  <rect width="900" height="520" fill="#0b1220"/>
+  <text x="48" y="52" fill="#f8fafc" font-family="Segoe UI,Arial" font-size="26" font-weight="700">Verified Speed Promotion · Qwen2.5 3B · llama.cpp</text>
+  <text x="48" y="82" fill="#94a3b8" font-family="Segoe UI,Arial" font-size="15">Same Q4_K_M artifact · same context and workload · 8 repeated measurement windows</text>
+  <line x1="110" y1="425" x2="820" y2="425" stroke="#475569" stroke-width="2"/>
+  <line x1="110" y1="145" x2="110" y2="425" stroke="#475569" stroke-width="2"/>
+  <text x="58" y="430" fill="#94a3b8" font-family="Segoe UI,Arial" font-size="13">0</text>
+  <text x="46" y="290" fill="#94a3b8" font-family="Segoe UI,Arial" font-size="13">50</text>
+  <text x="46" y="150" fill="#94a3b8" font-family="Segoe UI,Arial" font-size="13">100</text>
+  <text x="15" y="260" fill="#cbd5e1" font-family="Segoe UI,Arial" font-size="13" transform="rotate(-90 15 260)">tokens / second</text>
+  <rect x="235" y="179.5" width="150" height="245.5" rx="8" fill="#64748b"/>
+  <rect x="555" y="168.2" width="150" height="256.8" rx="8" fill="#22c55e"/>
+  <text x="310" y="160" text-anchor="middle" fill="#e2e8f0" font-family="Segoe UI,Arial" font-size="22" font-weight="700">87.66</text>
+  <text x="630" y="149" text-anchor="middle" fill="#bbf7d0" font-family="Segoe UI,Arial" font-size="22" font-weight="700">91.71</text>
+  <text x="310" y="458" text-anchor="middle" fill="#cbd5e1" font-family="Segoe UI,Arial" font-size="15">Baseline · Flash Off</text>
+  <text x="630" y="458" text-anchor="middle" fill="#bbf7d0" font-family="Segoe UI,Arial" font-size="15">Promoted · Flash Auto</text>
+  <text x="450" y="115" text-anchor="middle" fill="#86efac" font-family="Segoe UI,Arial" font-size="19" font-weight="700">+4.62% final throughput</text>
+  <text x="450" y="490" text-anchor="middle" fill="#94a3b8" font-family="Segoe UI,Arial" font-size="13">95% improvement interval: +4.03% to +8.32% · lower bound remains positive</text>
+</svg>

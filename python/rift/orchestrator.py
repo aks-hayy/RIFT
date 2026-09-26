@@ -5594,9 +5594,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             recipe = BenchmarkRecipe(
                 prompt=prompt,
                 max_tokens=max_tokens,
-                concurrency=max(1, int(launch_plan.get("concurrency") or 1)),
+                concurrency=max(1, int(launch_plan.get("concurrency") or 1)) if usage == "shared" else 1,
                 usage=usage,
-                requests_per_window=max(1, int(requests_per_window), int(launch_plan.get("concurrency") or 1)),
+                requests_per_window=max(1, int(requests_per_window), int(launch_plan.get("concurrency") or 1)) if usage == "shared" else max(1, int(requests_per_window)),
             )
             windowed = run_windows(
                 provider.benchmark,
