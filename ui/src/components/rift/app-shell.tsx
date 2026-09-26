@@ -9,36 +9,36 @@ import {
   Activity,
   Settings2,
   CircleDot,
-  Terminal,
   Menu,
   X,
   SlidersHorizontal,
   Layers3,
-  WandSparkles,
+  ChevronDown,
+  Workflow,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { DEFAULT_ROUTE, NAVIGATION } from "@/lib/rift/navigation";
 import { rift } from "@/lib/rift/client";
 import type { RiftEvent } from "@/lib/rift/types";
 import { useQueryClient } from "@tanstack/react-query";
 import { keys } from "@/lib/rift/hooks";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
-type NavItem = {
-  to: "/" | "/deployments" | "/nodes" | "/models" | "/groups" | "/operations" | "/settings" | "/tuning" | "/workloads";
-  label: string;
-  icon: typeof Home;
-  exact?: boolean;
-};
-const NAV: readonly NavItem[] = [
-  { to: "/", label: "Home", icon: Home, exact: true },
-  { to: "/deployments", label: "Deployments", icon: Boxes },
-  { to: "/nodes", label: "Nodes", icon: Server },
-  { to: "/models", label: "Models", icon: Package },
-  { to: "/groups", label: "Groups", icon: Layers3 },
-  { to: "/operations", label: "Operations", icon: Activity },
-  { to: "/tuning", label: "Tuning", icon: SlidersHorizontal },
-  { to: "/workloads", label: "Easy deploy", icon: WandSparkles },
-  { to: "/settings", label: "Settings", icon: Settings2 },
-];
+const NAV_ICONS = {
+  Overview: Home,
+  Services: Boxes,
+  Nodes: Server,
+  Models: Package,
+  Groups: Layers3,
+  Operations: Activity,
+  Tuning: SlidersHorizontal,
+  Settings: Settings2,
+} as const;
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
@@ -56,6 +56,10 @@ export function AppShell({ children }: { children: ReactNode }) {
       // Coarse invalidations per event kind — cheap for the small resource
       // set the controller exposes and keeps the UI honest with server state.
       switch (e.kind) {
+        case "controller.connected":
+          qc.invalidateQueries({ queryKey: keys.health });
+          qc.invalidateQueries({ queryKey: keys.services });
+          break;
         case "health":
           qc.setQueryData(keys.health, e.health);
           break;
@@ -79,34 +83,35 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [qc]);
 
   return (
-    <div className="min-h-dvh flex flex-col bg-canvas">
-      <header className="border-b border-border bg-raised" role="banner">
-        <div className="max-w-[1400px] mx-auto flex items-center gap-6 px-4 h-14">
+    <div className="rift-shell min-h-dvh flex flex-col bg-canvas">
+      <header
+        className="rift-topbar border-b border-border bg-raised/90 backdrop-blur-xl"
+        role="banner"
+      >
+        <div className="max-w-[1560px] mx-auto flex items-center gap-4 px-4 h-[68px]">
           <Link
-            to="/"
-            className="flex items-center gap-2 font-mono text-[13px] tracking-[0.14em] font-medium text-ink"
-            aria-label="RIFT home"
+            to={DEFAULT_ROUTE}
+            className="flex shrink-0 items-center gap-2.5 font-mono text-[13px] tracking-[0.14em] font-medium text-ink"
+            aria-label="RIFT Workload Deploy"
           >
-            <RiftMark />
+            <img src="/rift-logo-concept-v9.png" alt="" className="size-9 object-contain" />
             <span>RIFT</span>
-            <span className="text-ink-secondary font-normal">controller</span>
+            <span className="hidden 2xl:inline text-ink-secondary font-normal">control plane</span>
           </Link>
 
-          <nav className="hidden lg:flex items-center gap-0.5 ml-4" aria-label="Primary">
-            {NAV.map((item) => {
-              const Icon = item.icon;
-              const active = item.exact
-                ? pathname === item.to
-                : pathname === item.to || pathname.startsWith(item.to + "/");
+          <nav className="hidden xl:flex min-w-0 items-center gap-0.5 ml-3" aria-label="Primary">
+            {NAVIGATION.primary.map((item) => {
+              const Icon = (NAV_ICONS as Record<string, typeof Home>)[item.label];
+              const active = pathname === item.to || pathname.startsWith(item.to + "/");
               return (
                 <Link
                   key={item.to}
                   to={item.to}
                   className={cn(
-                    "px-3 h-9 inline-flex items-center gap-2 text-[13px] rounded-[4px] transition-colors",
+                    "px-2.5 h-9 inline-flex items-center gap-2 text-[12.5px] rounded-lg transition-colors",
                     active
-                      ? "bg-muted text-ink font-medium"
-                      : "text-ink-secondary hover:text-ink hover:bg-muted",
+                      ? "bg-primary/10 text-primary font-semibold"
+                      : "text-ink-secondary hover:text-ink hover:bg-muted/75",
                   )}
                 >
                   <Icon className="size-3.5" aria-hidden />
@@ -114,22 +119,52 @@ export function AppShell({ children }: { children: ReactNode }) {
                 </Link>
               );
             })}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className={cn(
+                    "inline-flex h-9 items-center gap-2 rounded-lg px-2.5 text-[12.5px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    pathname.startsWith("/workloads") || pathname.startsWith("/setup")
+                      ? "bg-primary/10 font-semibold text-primary"
+                      : "text-ink-secondary hover:bg-muted/75 hover:text-ink",
+                  )}
+                  aria-label="Deployment paths"
+                >
+                  <Workflow className="size-3.5" aria-hidden />
+                  Deployment
+                  <ChevronDown className="size-3.5 opacity-70" aria-hidden />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="min-w-52 rounded-xl border-white/70 bg-surface/95 p-1.5 shadow-xl backdrop-blur-xl"
+              >
+                {NAVIGATION.deployment.map((item) => (
+                  <DropdownMenuItem key={item.to} asChild>
+                    <Link
+                      to={item.to}
+                      className={cn(
+                        "cursor-pointer rounded-lg px-3 py-2.5 text-[13px]",
+                        pathname === item.to ? "bg-primary/10 font-medium text-primary" : "",
+                      )}
+                    >
+                      {item.label}
+                    </Link>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
           </nav>
 
           <div className="ml-auto flex items-center gap-3 text-[12px] rift-mono">
             <ControllerStatus stale={stale} />
             <button
               type="button"
-              className="hidden lg:inline-flex items-center gap-1.5 text-ink-secondary hover:text-ink"
-              aria-label="Open CLI reference"
-            >
-              <Terminal className="size-3.5" aria-hidden /> CLI
-            </button>
-            <button
-              type="button"
-              className="lg:hidden inline-flex size-9 items-center justify-center rounded-[4px] border border-border text-ink-secondary hover:bg-muted hover:text-ink"
+              className="xl:hidden inline-flex size-10 items-center justify-center rounded-xl border border-border/70 bg-surface/80 text-ink-secondary shadow-sm hover:bg-muted hover:text-ink"
               aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
               aria-expanded={mobileOpen}
+              aria-controls="rift-mobile-navigation"
               onClick={() => setMobileOpen((open) => !open)}
             >
               {mobileOpen ? <X className="size-4" /> : <Menu className="size-4" />}
@@ -138,22 +173,23 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
         {mobileOpen && (
           <nav
-            className="lg:hidden border-t border-border px-3 py-2 grid grid-cols-2 gap-1"
+            id="rift-mobile-navigation"
+            className="xl:hidden border-t border-border/70 bg-surface/90 px-4 py-3 grid grid-cols-2 gap-1.5 backdrop-blur-xl"
             aria-label="Mobile primary"
           >
-            {NAV.map((item) => {
-              const Icon = item.icon;
-              const active = item.exact
-                ? pathname === item.to
-                : pathname === item.to || pathname.startsWith(item.to + "/");
+            {NAVIGATION.primary.map((item) => {
+              const Icon = (NAV_ICONS as Record<string, typeof Home>)[item.label];
+              const active = pathname === item.to || pathname.startsWith(item.to + "/");
               return (
                 <Link
                   key={item.to}
                   to={item.to}
                   onClick={() => setMobileOpen(false)}
                   className={cn(
-                    "h-9 px-3 inline-flex items-center gap-2 rounded-[4px] text-[13px]",
-                    active ? "bg-muted text-ink font-medium" : "text-ink-secondary hover:bg-muted",
+                    "h-10 px-3 inline-flex items-center gap-2 rounded-xl text-[13px] transition-colors",
+                    active
+                      ? "bg-primary/10 text-primary font-semibold"
+                      : "text-ink-secondary hover:bg-muted",
                   )}
                 >
                   <Icon className="size-3.5" aria-hidden />
@@ -161,6 +197,22 @@ export function AppShell({ children }: { children: ReactNode }) {
                 </Link>
               );
             })}
+            {NAVIGATION.deployment.map((item) => (
+              <Link
+                key={item.to}
+                to={item.to}
+                onClick={() => setMobileOpen(false)}
+                className={cn(
+                  "h-10 px-3 inline-flex items-center gap-2 rounded-xl text-[13px] transition-colors",
+                  pathname === item.to
+                    ? "bg-primary/10 text-primary font-semibold"
+                    : "text-ink-secondary hover:bg-muted",
+                )}
+              >
+                <Workflow className="size-3.5" aria-hidden />
+                {item.label}
+              </Link>
+            ))}
           </nav>
         )}
       </header>
@@ -173,11 +225,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
           <span>{connection.root}</span>
           <span className="hidden sm:inline">compatibility adapter</span>
-          {connection.previewEnabled && (
-            <span className="ml-auto text-attention">
-              preview-only surfaces are explicitly labeled
-            </span>
-          )}
         </div>
       </div>
 
@@ -185,8 +232,8 @@ export function AppShell({ children }: { children: ReactNode }) {
         {children}
       </main>
 
-      <footer className="border-t border-border bg-raised">
-        <div className="max-w-[1400px] mx-auto px-4 h-9 flex items-center justify-between text-[11px] rift-mono text-ink-secondary">
+      <footer className="border-t border-border/70 bg-raised/75 backdrop-blur-xl">
+        <div className="max-w-[1560px] mx-auto px-4 h-10 flex items-center justify-between text-[11px] rift-mono text-ink-secondary">
           <span>RIFT · operator console</span>
           <span>Controller binds locally by default</span>
         </div>
@@ -218,20 +265,5 @@ function ControllerStatus({ stale }: { stale: boolean | null }) {
       <CircleDot className="size-3.5" aria-hidden />
       {state}
     </span>
-  );
-}
-
-function RiftMark() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden className="text-primary">
-      <path
-        d="M1 10 L4 10 L5.5 5 L7 15 L8.5 7 L10 13 L11.5 6 L13 14 L14.5 9 L16 11 L19 10"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.25"
-        strokeLinecap="square"
-        strokeLinejoin="miter"
-      />
-    </svg>
   );
 }

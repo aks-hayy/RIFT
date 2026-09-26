@@ -48,6 +48,11 @@ include = ["rift*"]
 
 [tool.setuptools.package-data]
 "rift" = ["web/static/**/*", "web/static/*"]
+"rift.backends" = ["*/manifest.json"]
+"rift.backends.llama_cpp" = ["manifest.json"]
+"rift.backends.vllm" = ["manifest.json"]
+"rift.backends.sglang" = ["manifest.json"]
+"rift.backends.mlx_lm" = ["manifest.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/python"]

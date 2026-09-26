@@ -7,7 +7,7 @@ import { Unavailable } from "@/components/rift/unavailable";
 import { rift } from "@/lib/rift/client";
 import { useActiveTuningRun, useServices, useTuningCapabilities, useTuningRuns } from "@/lib/rift/hooks";
 import { tuningOutcomeTone, tuningProfileLabel } from "@/lib/rift/tuning-contract";
-import type { TuningProfile, TuningRun } from "@/lib/rift/types";
+import type { TuningCapabilities, TuningProfile, TuningRun } from "@/lib/rift/types";
 
 type TuningPreview = {
   mode: string;
@@ -221,6 +221,20 @@ function TuningPage() {
                     <span>Capability status: {String(capabilities.data?.qualification)}</span>
                   )}
                 </div>
+                {Array.isArray((capabilities.data as TuningCapabilities | undefined)?.parameters) &&
+                  ((capabilities.data as TuningCapabilities).parameters?.length ?? 0) > 0 && (
+                    <div className="rounded-[4px] border border-border bg-muted px-3.5 py-3 text-[11px] text-ink-secondary">
+                      <div className="rift-label">Backend-owned tuning surface</div>
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {(capabilities.data as TuningCapabilities).parameters?.map((parameter) => (
+                          <span key={parameter.name} className="rounded-full border border-border bg-raised px-2 py-1 font-mono text-[10.5px] text-ink">
+                            {parameter.name}
+                          </span>
+                        ))}
+                      </div>
+                      <p className="mt-2">RIFT keeps this page backend-neutral; these descriptors come from the selected backend folder and are only used when supported by the installed runtime.</p>
+                    </div>
+                  )}
                 <label className="grid gap-1 text-[12px] sm:max-w-xs">
                   <span className="rift-label">Usage mode</span>
                   <select value={usage} onChange={(event) => setUsage(event.target.value as "auto" | "interactive" | "shared")} className="h-9 rounded-[4px] border border-border bg-raised px-2">

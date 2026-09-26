@@ -91,31 +91,36 @@ def execute(args: Any, console: RiftConsole) -> int:
         automatic_pull = args.command == "pull"
         dry_run = bool(getattr(args, "dry_run", False))
         source = str(getattr(args, "source", "huggingface") or "huggingface")
-        if source == "local" and not automatic_pull:
-            result = orchestrator.generate_config(
-                task=args.task,
-                source="local",
-                models_dir=getattr(args, "models_dir", None),
-                output=args.output or ".rift/generated/rift.generated.yaml",
-                top=args.top,
-                candidate_limit=args.candidate_limit,
-                max_download_gb=args.max_download_gb or 12.0,
-                write=True,
+        workload_contract = None
+        workload_revision = None
+        if getattr(args, "workload_id", None):
+            draft = WorkloadStore(orchestrator.rift_dir / "workloads.db").get_draft(
+                str(args.workload_id), revision=getattr(args, "workload_revision", None)
             )
-            selected = dict(result.get("selected") or {})
-            service = dict((result.get("config") or {}).get("services", {}).get("chat", {}))
-            result["source"] = "local"
-            result["recommendations"] = [
-                {
-                    "rank": 1,
-                    "id": selected.get("path"),
-                    "format": selected.get("format"),
-                    "backend": dict(service.get("policy") or {}).get("backend"),
-                    "decision": dict(service.get("model") or {}).get("decision"),
-                }
-            ]
+            workload_contract = draft["contract"]
+            workload_revision = draft["revision"]
+        if source == "local" and not automatic_pull:
+            result = orchestrator.recommend_local_models(
+                task=args.task,
+                models_dir=getattr(args, "models_dir", None),
+                top=args.top,
+                workload_contract=workload_contract,
+            )
+            result["workload_revision"] = workload_revision
+            shortlist = result.get("recommendations") or []
+            if shortlist:
+                generated = orchestrator.generate_config(
+                    task=str(result.get("task") or args.task),
+                    source="local",
+                    models_dir=getattr(args, "models_dir", None),
+                    output=args.output or ".rift/generated/rift.generated.yaml",
+                    selected_candidate=shortlist[0],
+                    workload_contract=workload_contract,
+                    write=True,
+                )
+                result.update({key: generated[key] for key in ("path", "config", "discovery", "selected")})
             console.render(result, view="result", title="Local model recommendation")
-            return 0
+            return 0 if shortlist else 1
         simulated_hardware = getattr(args, "simulate_hardware", None)
         if simulated_hardware and (automatic_pull or bool(getattr(args, "verify", False))):
             console.error(
@@ -141,7 +146,12 @@ def execute(args: Any, console: RiftConsole) -> int:
             token=args.token,
             simulated_hardware=simulated_hardware,
             benchmark_snapshots=getattr(args, "benchmark_snapshot", None),
+            model_ref=getattr(args, "model_ref", None),
+            workload_contract=workload_contract,
+            search_candidate_limit=getattr(args, "search_candidate_limit", args.candidate_limit),
         )
+        if workload_revision is not None:
+            result["workload_revision"] = workload_revision
         if args.command == "recommend" and args.verify:
             verify_top = args.verify_top if args.verify_top is not None else args.verify_finalists
             result["verification"] = orchestrator.verify_recommendation_run(
@@ -542,7 +552,24 @@ def _workload(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -
             request = read_yaml(path)
         else:
             request = args.text
-        compiled = compile_workload(request, confirm_default_quality=bool(args.confirm_default_quality))
+        output_schema = None
+        output_schema_filename = None
+        schema_arg = getattr(args, "output_schema", None)
+        if schema_arg:
+            schema_path = Path(schema_arg)
+            if not schema_path.is_file():
+                raise ValueError(f"output schema file was not found: {schema_path}")
+            try:
+                output_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"output schema is not valid JSON: {exc}") from exc
+            output_schema_filename = schema_path.name
+        compiled = compile_workload(
+            request,
+            confirm_default_quality=bool(args.confirm_default_quality),
+            output_schema=output_schema,
+            output_schema_filename=output_schema_filename,
+        )
         if args.no_save:
             console.render(compiled, title="Compiled workload (not saved)")
             return 0

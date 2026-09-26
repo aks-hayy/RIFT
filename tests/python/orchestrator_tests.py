@@ -96,6 +96,225 @@ def test_plan_hash_is_stable_after_persistence_normalizes_sets(tmp_path):
     assert orchestrator._plan_hash(persisted) == before_persistence
 
 
+def test_structured_output_evaluation_requires_live_gateway_route(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    service = {
+        "gateway": {"structured_output_enforced": True, "host": "127.0.0.1", "port": 11734},
+    }
+    orch.gateway_status = lambda: {
+        "status": "running", "process_alive": True,
+        "state": {"service_name": "chat", "host": "127.0.0.1", "port": 11734},
+    }
+    endpoint = orch._evaluation_endpoint(
+        service_name="chat", service=service, backend_api_base="http://127.0.0.1:11735"
+    )
+    assert endpoint == {
+        "url": "http://127.0.0.1:11734",
+        "kind": "gateway",
+        "available": True,
+        "reason": None,
+    }
+
+
+def test_structured_output_evaluation_does_not_bypass_stopped_gateway(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    service = {"gateway": {"structured_output_enforced": True}}
+    orch.gateway_status = lambda: {
+        "status": "stale", "process_alive": False,
+        "state": {"service_name": "chat", "host": "127.0.0.1", "port": 11734},
+    }
+    endpoint = orch._evaluation_endpoint(
+        service_name="chat", service=service, backend_api_base="http://127.0.0.1:11735"
+    )
+    assert endpoint["available"] is False
+    assert endpoint["kind"] == "gateway"
+    assert "gateway" in endpoint["reason"].lower()
+
+
+def test_local_recommendation_prefers_capable_fitting_model_without_size_limit(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    artifacts = [
+        {"path": "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", "format": "gguf", "quantization": "Q4_K_M", "size": 1},
+        {"path": "Qwen2.5-7B-Instruct-Q4_K_M.gguf", "format": "gguf", "quantization": "Q4_K_M", "size": 7},
+        {"path": "Qwen2.5-3B-Instruct-Q4_K_M.gguf", "format": "gguf", "quantization": "Q4_K_M", "size": 3},
+    ]
+    orch.discover = lambda **_kwargs: {"nodes": [{"hardware": {"total_vram_bytes": 8 * 1024**3}}]}
+    orch.scan_local_models = lambda _models_dir: artifacts
+    orch._select_provider_for_model = lambda **_kwargs: {
+        "backend": "llama.cpp",
+        "candidates": [{"backend": "llama.cpp", "fits": True, "score": 0.95, "reason": "fits"}],
+    }
+    result = orch.recommend_local_models(task="documents", models_dir=str(tmp_path), top=3)
+    assert [Path(item["selected_file"]).name for item in result["recommendations"]] == [
+        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+    ]
+
+
+def test_local_config_materializes_the_selected_recommendation_candidate(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    path = str(tmp_path / "models" / "Mamba-2-7B-Q4_K_M.gguf")
+    model = {"path": path, "format": "gguf", "quantization": "Q4_K_M", "size": 7}
+    orch.discover = lambda **_kwargs: {"nodes": [{
+        "hardware": {"total_vram_bytes": 8 * 1024**3}, "models": [model],
+    }]}
+    orch._select_provider_for_model = lambda **kwargs: {
+        "backend": kwargs["requested"] if kwargs["requested"] != "auto" else "llama.cpp",
+        "candidates": [{"backend": "llama.cpp", "fits": True, "score": 0.9, "reason": "fits"}],
+    }
+    result = orch.generate_config(
+        source="local",
+        models_dir=str(tmp_path / "models"),
+        selected_candidate={"local_path": path, "selected_file": path, "backend": "llama.cpp"},
+        write=False,
+    )
+    assert result["selected"]["path"] == path
+    assert result["config"]["services"]["chat"]["model"]["id"] == path
+
+
+def test_local_inventory_does_not_merge_models_from_child_directories(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    models = tmp_path / "models"
+    first = models / "Qwen-3B-GGUF"
+    second = models / "Qwen-7B-GGUF"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "qwen-3b-q4_k_m.gguf").write_bytes(b"gguf-3b")
+    (second / "qwen-7b-q4_k_m.gguf").write_bytes(b"gguf-7b")
+
+    inventory = orch.scan_local_models(str(models))
+
+    assert len(inventory) == 2
+    assert {Path(item["path"]).name for item in inventory} == {
+        "qwen-3b-q4_k_m.gguf",
+        "qwen-7b-q4_k_m.gguf",
+    }
+    assert all(Path(item["path"]).parent.name in {"Qwen-3B-GGUF", "Qwen-7B-GGUF"} for item in inventory)
+
+
+def test_provider_probe_cache_avoids_reprobing_backend_within_search(tmp_path):
+    class CountingProvider:
+        name = "test-backend"
+        manifest = None
+
+        def __init__(self):
+            self.probes = 0
+
+        def evaluate_fit(self, *, artifact, hardware, workload):
+            return {"fits": True, "reason": "test fit"}
+
+        def probe(self, *, search_root=None):
+            self.probes += 1
+            return {"available": True, "search_root": search_root}
+
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    provider = CountingProvider()
+    orch.providers = {provider.name: provider}
+    probe_cache = {}
+
+    for _ in range(3):
+        orch._select_provider_for_model(
+            model={"format": "gguf"},
+            hardware={},
+            requested="auto",
+            probe_cache=probe_cache,
+        )
+
+    assert provider.probes == 1
+
+
+def test_best_fit_config_carries_public_evaluation_evidence(tmp_path):
+    comparison = {
+        "score": 1.0,
+        "benchmark_count": 1,
+        "metric_count": 2,
+        "method": "percentile among current shortlist for shared benchmark/task/metric",
+    }
+    evidence = {"metrics": [{"benchmark_id": "public/code", "name": "pass@1", "value": 0.9}]}
+    selected = {
+        "repo_id": "org/coder-model",
+        "backend": "llama.cpp",
+        "selected_file": "model-q4_k_m.gguf",
+        "format": "gguf",
+        "artifact_selection": {"artifact_id": "artifact-1", "total_bytes": 4 * 1024**3},
+        "quality_evidence": {"score": None, "public_comparison": comparison},
+        "public_evaluation_comparison": comparison,
+        "evaluation_evidence": evidence,
+        "evidence": ["shared public coding benchmark evidence"],
+        "warnings": [],
+    }
+
+    class Engine:
+        def recommend_models(self, **_kwargs):
+            return {
+                "best_for_hardware": {"absolute_best": selected},
+                "recommendations": [selected],
+            }
+
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path, engine=Engine())
+    orch.discover = lambda **_kwargs: {"nodes": [{"hardware": {"total_vram_bytes": 8 * 1024**3}}]}
+    result = orch.generate_config(source="huggingface", task="coding", write=False)
+    decision = result["config"]["services"]["chat"]["model"]["decision"]
+
+    assert decision["public_evaluation_comparison"] == comparison
+    assert decision["evaluation_evidence"] == evidence
+
+
+def test_workload_recommendation_plan_retains_public_evaluation_evidence(tmp_path):
+    comparison = {
+        "score": 0.75,
+        "benchmark_count": 1,
+        "metric_count": 1,
+        "method": "percentile among current shortlist for shared benchmark/task/metric",
+    }
+    evaluation = {"metrics": [{"benchmark_id": "public/rag", "name": "ndcg@10", "value": 0.75}]}
+    candidate = {
+        "repo_id": "org/rag-model",
+        "revision": "commit123",
+        "backend": "llama.cpp",
+        "format": "gguf",
+        "selected_file": "model-q4_k_m.gguf",
+        "selected_files": ["model-q4_k_m.gguf"],
+        "selected_artifact": {
+            "artifact_id": "artifact-rag",
+            "format": "gguf",
+            "total_bytes": 4 * 1024**3,
+            "validation": {"serving_ready": True},
+        },
+        "selected_download_bytes": 4 * 1024**3,
+        "final_score": 0.8,
+        "confidence": 0.7,
+        "scores": {"quality_proxy": 0.75},
+        "quality_evidence": {"public_comparison": comparison},
+        "public_evaluation_comparison": comparison,
+        "evaluation_evidence": evaluation,
+        "support_level": "INSTALLABLE_BACKEND",
+        "evidence": ["public RAG benchmark comparison"],
+        "warnings": [],
+        "backend_candidates": [],
+    }
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path)
+    orch.recommendation_store.save_recommendation(
+        {
+            "recommendation_run_id": "public-eval-workload",
+            "task": "rag",
+            "recommendation_contract": "RECOMMENDATION_V2_ADAPTER_GRAPH",
+            "discovery": {"source": "https://huggingface.co"},
+            "recommendations": [candidate],
+            "categories": {},
+            "hardware_profile": {},
+        }
+    )
+
+    plan = orch.plan_recommendation_run(run_id="public-eval-workload", selector="best_estimated")
+    materialized = orchestrator_mod.read_yaml(plan["materialized_config"])
+    decision = materialized["services"]["chat"]["model"]["decision"]
+
+    assert decision["public_evaluation_comparison"] == comparison
+    assert decision["evaluation_evidence"] == evaluation
+
+
 class FakeInstallableProvider:
     name = "llama.cpp"
 
@@ -434,6 +653,37 @@ def test_hub_exact_artifact_flows_from_generate_to_launch():
         )
         assert reapplied["applied"] is True
         assert orch.engine.pull_calls == 1
+
+
+def test_hub_endpoint_url_source_requires_download_before_launch(tmp_path):
+    orch = orchestrator_mod.RiftOrchestrator(root=tmp_path, engine=FakeRecommendationEngine())
+    provider = FakeInstallableProvider()
+    provider.installed = True
+    orch.providers["llama.cpp"] = provider
+
+    generated = orch.generate_config(
+        source="huggingface",
+        output="generated.yaml",
+        candidate_limit=10,
+    )
+    generated["config"]["services"]["chat"]["model"]["source"] = "https://huggingface.co"
+    orch._write_yaml_atomic(tmp_path / "generated.yaml", generated["config"])
+
+    plan = orch.plan(config_path="generated.yaml")
+    download = next(action for action in plan["actions"] if action["kind"] == "download")
+    assert download["permission"] == "allow_download"
+    assert download["selected_file"] == "model-Q4_K_M.gguf"
+
+    result = orch.apply(
+        config_path="generated.yaml",
+        permissions=orchestrator_mod.ApplyPermissions(
+            allow_download=True,
+            allow_launch=True,
+        ),
+    )
+    assert result["applied"] is True
+    assert provider.last_model_path.endswith("model-Q4_K_M.gguf")
+    assert Path(provider.last_model_path).is_file()
 
 
 def test_plan_source_helpers_accept_hub_urls_and_local_model_inputs():

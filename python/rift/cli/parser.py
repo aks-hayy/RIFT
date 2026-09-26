@@ -390,8 +390,13 @@ def _add_model_group(commands) -> None:
         help="Model source to rank; local uses artifacts found under --models-dir",
     )
     recommend.add_argument("--models-dir", help="Local model directory used with --source local")
+    recommend.add_argument("--model-ref", help="Inspect one exact Hugging Face repository")
     recommend.add_argument("--top", type=int, default=10)
     recommend.add_argument("--candidate-limit", type=int, default=250)
+    recommend.add_argument("--search-candidate-limit", type=int, default=250,
+                           help="Maximum Hub candidates to inspect before returning the shortlist")
+    recommend.add_argument("--workload-id", help="Use a saved workload draft as discovery intent")
+    recommend.add_argument("--workload-revision", type=int, help="Exact saved workload revision to inspect")
     recommend.add_argument("--max-download-gb", type=float)
     recommend.add_argument("--formats")
     recommend.add_argument("--include-gated", action="store_true")
@@ -827,6 +832,7 @@ def _add_workload_group(commands) -> None:
             "Examples:\n"
             "  rift workload compile --text \"coding assistant, 30 tok/s, 8K context, offline\" --confirm-default-quality\n"
             "  rift workload compile --file workload.json\n"
+            "  rift workload compile --text \"invoice extraction with strict JSON\" --output-schema ehr.schema.json\n"
             "  rift workload show DRAFT_ID\n"
             "  rift workload approve DRAFT_ID --allow-launch --yes\n"
             "  rift workload run --approval-id APPROVAL_ID --models-dir .rift/models"
@@ -839,6 +845,7 @@ def _add_workload_group(commands) -> None:
     source.add_argument("--file", help="UTF-8 JSON/YAML workload file")
     compile_parser.add_argument("--no-save", action="store_true", help="Print the draft without persisting it")
     compile_parser.add_argument("--confirm-default-quality", action="store_true", help="Accept rift-text-core/v1 at 0.90 when the request does not name a suite")
+    compile_parser.add_argument("--output-schema", metavar="FILE", help="Attach a local JSON Schema for strict JSON output requirements")
     show = _parser(sub, "show", "Show a saved workload draft")
     show.add_argument("draft_id")
     approve = _parser(sub, "approve", "Approve a draft with explicit permissions and budgets")

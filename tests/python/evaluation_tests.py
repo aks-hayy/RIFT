@@ -72,6 +72,66 @@ def test_nonempty_case_supports_minimal_workload_quality_pack():
     assert result.summary["pass"] == 1
 
 
+def test_uploaded_json_schema_case_checks_structure_and_required_fields():
+    from rift.evaluation import EvaluationSuite, evaluate_suite
+
+    schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+    suite = EvaluationSuite.from_mapping(
+        {"id": "schema", "version": "v1", "cases": [{
+            "id": "ehr", "prompt": "return summary", "kind": "json_schema", "schema": schema,
+        }]}
+    )
+    passing = evaluate_suite(suite, lambda _prompt, _max_tokens: '{"summary":"stable"}')
+    failing = evaluate_suite(suite, lambda _prompt, _max_tokens: '{"summary":3,"unexpected":true}')
+    assert passing.summary["pass"] == 1
+    assert failing.summary["fail"] == 1
+
+
+def test_empty_json_schema_is_a_valid_permissive_schema():
+    from rift.evaluation import EvaluationSuite, evaluate_suite
+
+    suite = EvaluationSuite.from_mapping(
+        {"id": "permissive", "version": "v1", "cases": [{"id": "any", "prompt": "return", "kind": "json_schema", "schema": {}}]}
+    )
+    result = evaluate_suite(suite, lambda _prompt, _max_tokens: "[1, 2]")
+    assert result.summary["pass"] == 1
+
+
+def test_json_schema_date_format_is_checked():
+    from rift.evaluation import EvaluationSuite, evaluate_suite
+
+    schema = {"type": "object", "properties": {"summary_date": {"type": "string", "format": "date"}}, "required": ["summary_date"]}
+    suite = EvaluationSuite.from_mapping(
+        {"id": "ehr-date", "version": "v1", "cases": [{"id": "date", "prompt": "return", "kind": "json_schema", "schema": schema}]}
+    )
+    passing = evaluate_suite(suite, lambda _prompt, _max_tokens: '{"summary_date":"2026-09-19"}')
+    failing = evaluate_suite(suite, lambda _prompt, _max_tokens: '{"summary_date":"19-09-2026"}')
+    assert passing.summary["pass"] == 1
+    assert failing.summary["fail"] == 1
+
+
+def test_structured_output_evaluation_can_request_large_json_budget():
+    from rift.evaluation import EvaluationSuite, evaluate_suite
+
+    suite = EvaluationSuite.from_mapping(
+        {"id": "large-json", "version": "v1", "cases": [{"id": "one", "prompt": "return", "kind": "nonempty"}]}
+    )
+    seen = []
+
+    def invoke(_prompt, max_tokens):
+        seen.append(max_tokens)
+        return "{}"
+
+    result = evaluate_suite(suite, invoke, max_tokens=512)
+    assert result.summary["pass"] == 1
+    assert seen == [512]
+
+
 def test_judge_assessment_is_separate_and_schema_validated():
     from rift.evaluation import EvaluationSuite, evaluate_suite
 

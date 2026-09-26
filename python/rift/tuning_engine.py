@@ -781,6 +781,44 @@ class TuningStore:
         with self._connection() as connection:
             connection.execute("DELETE FROM tuning_leases WHERE run_id = ?", (run_id,))
 
+    def reclaim_orphaned_leases(self) -> list[str]:
+        """Release leases whose owning controller process is no longer alive.
+
+        Leases are intentionally non-expiring while a tuning process is
+        active.  A controller crash or service deletion can, however, leave a
+        terminal run without the normal ``finally`` cleanup path.  Startup
+        calls this method after interrupted-run recovery so a dead controller
+        cannot permanently block future tuning on the device.
+        """
+
+        with self._connection() as connection:
+            rows = connection.execute("SELECT DISTINCT run_id FROM tuning_leases").fetchall()
+        reclaimed: list[str] = []
+        for row in rows:
+            run_id = str(row[0])
+            if self.owner_alive(run_id):
+                continue
+            try:
+                run = self.get_run(run_id)
+            except KeyError:
+                run = None
+            status = str((run or {}).get("status") or "").upper()
+            if status in {"QUEUED", "RUNNING", "ROLLBACK_FAILED"}:
+                self.update_run(
+                    run_id,
+                    {
+                        "status": "INTERRUPTED",
+                        "outcome": "interrupted",
+                        "applied": False,
+                        "baseline_restored": False,
+                        "lease_reclaimed": True,
+                        "decision": "The tuning owner exited before releasing its device lease; the controller reclaimed the stale reservation.",
+                    },
+                )
+            self.release(run_id)
+            reclaimed.append(run_id)
+        return reclaimed
+
     def owner_alive(self, run_id: str) -> bool:
         import psutil
         with self._connection() as connection:

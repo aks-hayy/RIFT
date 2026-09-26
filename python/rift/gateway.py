@@ -25,6 +25,7 @@ from .orchestrator import RiftOrchestrator
 from .rift_yaml import read_yaml
 from .runtime_paths import RiftPaths
 from .mesh.services import ServiceCatalog
+from .evaluation import validate_json_response
 
 
 JsonDict = dict[str, Any]
@@ -386,6 +387,10 @@ class RiftGatewayRuntime:
                 continue
             runtime = service.get("runtime") or {}
             launch_plan = service.get("launch_plan") or {}
+            gateway = service.get("gateway") if isinstance(service.get("gateway"), dict) else {}
+            artifact = gateway.get("output_schema")
+            schema = artifact.get("schema") if isinstance(artifact, dict) and "schema" in artifact else artifact
+            enforce_schema = bool(gateway.get("structured_output_enforced")) and isinstance(schema, dict)
             base_url = runtime.get("api_base") or launch_plan.get("api_base")
             if not base_url:
                 continue
@@ -398,6 +403,9 @@ class RiftGatewayRuntime:
                     "base_url": str(base_url).rstrip("/"),
                     "status": service.get("status"),
                     "model": (service.get("model") or {}).get("id"),
+                    "output_schema": schema if enforce_schema else None,
+                    "output_schema_sha256": gateway.get("output_schema_sha256") if enforce_schema else None,
+                    "structured_output_enforced": enforce_schema,
                 }
             )
         return routes
@@ -502,13 +510,16 @@ class RiftGatewayRuntime:
         failures = []
         for index, route in enumerate(routes):
             target = f"{route['base_url']}{upstream_path}"
+            forwarded_body = self._apply_output_schema(body, route)
             headers = {
                 "Accept": "text/event-stream" if stream_requested else "application/json",
                 "Content-Type": "application/json",
                 "User-Agent": "RIFT-Gateway/1.0",
                 "X-Request-ID": request_id,
             }
-            request = Request(target, data=body, headers=headers, method=method)
+            if route.get("structured_output_enforced") and route.get("output_schema_sha256"):
+                headers["X-RIFT-Output-Schema-SHA256"] = str(route["output_schema_sha256"])
+            request = Request(target, data=forwarded_body, headers=headers, method=method)
             try:
                 response = urlopen(request, timeout=self.policy.request_timeout_seconds)
             except HTTPError as exc:
@@ -520,6 +531,12 @@ class RiftGatewayRuntime:
                 error_body = exc.read(self.policy.max_body_bytes)
                 content_type = exc.headers.get("Content-Type", "application/json")
                 exc.close()
+                if route.get("structured_output_enforced") and status in {400, 422}:
+                    self._record_schema_violation(
+                        route,
+                        request_id,
+                        f"backend rejected the structured-output request (HTTP {status})",
+                    )
                 return GatewayResponse(
                     status=status,
                     content_type=content_type,
@@ -556,6 +573,29 @@ class RiftGatewayRuntime:
             content_type = response.headers.get("Content-Type", "application/json")
             is_stream = stream_requested or content_type.lower().startswith("text/event-stream")
             if is_stream:
+                if route.get("structured_output_enforced"):
+                    streamed = response.read(self.policy.max_body_bytes + 1)
+                    response.close()
+                    valid, detail = self._validate_schema_response(streamed, content_type, route)
+                    if not valid:
+                        self._record_schema_violation(route, request_id, detail)
+                        return GatewayResponse(
+                            status=HTTPStatus.BAD_GATEWAY.value,
+                            content_type="application/json",
+                            backend_service=str(route["service"]),
+                            backend_url=target,
+                            body=json.dumps({"error": "backend response violates the configured output schema", "detail": detail, "request_id": request_id}).encode("utf-8"),
+                            fallback_count=index,
+                            error="output schema violation",
+                        )
+                    return GatewayResponse(
+                        status=status,
+                        content_type=content_type,
+                        backend_service=str(route["service"]),
+                        backend_url=target,
+                        body=streamed,
+                        fallback_count=index,
+                    )
                 return GatewayResponse(
                     status=status,
                     content_type=content_type,
@@ -576,6 +616,19 @@ class RiftGatewayRuntime:
                     fallback_count=index,
                     error="upstream response body too large",
                 )
+            if route.get("structured_output_enforced"):
+                valid, detail = self._validate_schema_response(response_body, content_type, route)
+                if not valid:
+                    self._record_schema_violation(route, request_id, detail)
+                    return GatewayResponse(
+                        status=HTTPStatus.BAD_GATEWAY.value,
+                        content_type="application/json",
+                        backend_service=str(route["service"]),
+                        backend_url=target,
+                        body=json.dumps({"error": "backend response violates the configured output schema", "detail": detail, "request_id": request_id}).encode("utf-8"),
+                        fallback_count=index,
+                        error="output schema violation",
+                    )
             return GatewayResponse(
                 status=status,
                 content_type=content_type,
@@ -592,6 +645,85 @@ class RiftGatewayRuntime:
             body=json.dumps({"error": "no backend route completed"}).encode("utf-8"),
             error="routing exhausted",
         )
+
+    @staticmethod
+    def _apply_output_schema(body: bytes | None, route: JsonDict) -> bytes | None:
+        if not body or not route.get("structured_output_enforced"):
+            return body
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body
+        if not isinstance(payload, dict):
+            return body
+        schema = route.get("output_schema")
+        backend = str(route.get("backend") or "").casefold()
+        if backend == "vllm":
+            # vLLM's structured_outputs API is preferred; response_format is
+            # retained for older OpenAI-compatible builds.
+            payload["structured_outputs"] = {"json": schema}
+            payload["response_format"] = {"type": "json_object"}
+        else:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "rift_output", "schema": schema, "strict": True},
+            }
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    @staticmethod
+    def _response_text(body: bytes, content_type: str) -> str:
+        try:
+            if content_type.lower().startswith("text/event-stream"):
+                pieces: list[str] = []
+                for line in body.decode("utf-8", errors="replace").splitlines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (chunk.get("choices") or [{}])[0] if isinstance(chunk, dict) else {}
+                    delta = choice.get("delta") if isinstance(choice, dict) else {}
+                    pieces.append(str((delta or {}).get("content") or choice.get("text") or ""))
+                return "".join(pieces)
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        choice = choices[0]
+        message = choice.get("message")
+        if isinstance(message, dict):
+            return str(message.get("content") or "")
+        return str(choice.get("text") or "")
+
+    def _validate_schema_response(self, body: bytes, content_type: str, route: JsonDict) -> tuple[bool, str]:
+        return validate_json_response(self._response_text(body, content_type), route.get("output_schema") or {})
+
+    def _record_schema_violation(self, route: JsonDict, request_id: str, detail: str) -> None:
+        try:
+            orchestrator = self.orchestrator_factory()
+            orchestrator.record_incident(
+                str(route.get("service") or "unknown"),
+                reason="structured output schema violation",
+                action="alert",
+                details={
+                    "request_id": request_id,
+                    "detail": detail,
+                    "schema_sha256": route.get("output_schema_sha256"),
+                    "source": "gateway_runtime_guard",
+                },
+            )
+        except Exception:
+            # Validation remains fail-closed even if persistence/alerting is
+            # temporarily unavailable.
+            return
 
     def _route_bucket_locked(self, route_scope: str | None) -> JsonDict | None:
         if not route_scope:

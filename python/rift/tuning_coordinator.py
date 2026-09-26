@@ -492,8 +492,18 @@ class TuningCoordinatorMixin:
                 tuning=unique[0],
             )
             baseline_plan_normalized["tuning_usage"] = usage
-            if ngram_speculation is not None:
-                baseline_plan = baseline_plan_normalized
+            # Candidate plans are rebuilt from the materialized artifact, so
+            # keep that same normalized plan as the rollback baseline. Older
+            # deployments may store only a repository-relative filename in
+            # their launch summary; restoring that stale summary makes the
+            # backend look in its working directory after a no-improvement
+            # tuning run and leaves the service failed.
+            baseline_plan = baseline_plan_normalized
+            baseline_tuning = {
+                key: value
+                for key, value in dict(baseline_plan.get("tuning") or {}).items()
+                if value is not None
+            }
             # A CLI/config speculation override changes the baseline itself,
             # not just the candidate list. Ensure the live process is replaced
             # before measuring it; otherwise an inherited optimized server

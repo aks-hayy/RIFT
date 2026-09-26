@@ -86,6 +86,16 @@ class BackendProvider(Protocol):
     def capabilities(self) -> JsonDict:
         ...
 
+    def verify_tool_capability(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        identity: JsonDict | None = None,
+        timeout_seconds: float = 60.0,
+    ) -> JsonDict:
+        ...
+
 
 _CAPABILITIES: dict[str, JsonDict] = {
     "llama.cpp": {
@@ -186,6 +196,42 @@ class ProviderLifecycleMixin:
         values.setdefault("status", "experimental")
         values["backend"] = self.name
         return values
+
+    def verify_tool_capability(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        identity: JsonDict | None = None,
+        timeout_seconds: float = 60.0,
+    ) -> JsonDict:
+        """Verify core tool-call emission for this exact live endpoint.
+
+        Backend providers may override this when their protocol needs an
+        adapter-specific probe.  The default is deliberately OpenAI-shaped
+        and capability-only: RIFT supplies synthetic schemas and never runs a
+        user tool or grants execution permissions.
+        """
+
+        from ..evaluation import evaluate_tool_capability, invoke_openai_tool_compatible
+        from urllib.parse import urlsplit
+
+        host = urlsplit(str(base_url)).hostname
+        if not host:
+            raise ValueError("tool capability endpoint must include a host")
+        invoke = invoke_openai_tool_compatible(
+            base_url,
+            model=model,
+            timeout_seconds=min(30.0, max(1.0, float(timeout_seconds))),
+            allowed_hosts=[host],
+        )
+        return evaluate_tool_capability(
+            invoke,
+            model=model,
+            backend=self.name,
+            identity=identity,
+            total_deadline_seconds=timeout_seconds,
+        )
 
     def readiness(self, *, base_url: str, timeout_seconds: float = 2.0) -> JsonDict:
         result = dict(self.health(base_url=base_url, timeout_seconds=timeout_seconds))

@@ -7,8 +7,8 @@
 /*
  * RIFT — Seismic Lab design system.
  *
- * Light-first, instrument/laboratory aesthetic. No gradients, no glass,
- * no glow. Thin rules, restrained ticks, oxide coral primary action.
+ * Light-first seismic instrument aesthetic: warm white glass, signal red,
+ * fine waveform rules, and restrained motion.
  * IBM Plex Sans/Mono with robust system fallbacks — no external fonts.
  */
 
@@ -71,46 +71,50 @@
   --color-sidebar-border: var(--border);
   --color-sidebar-ring: var(--oxide);
 
-  --color-chart-1: var(--verdigris);
-  --color-chart-2: var(--oxide);
+  --color-chart-1: var(--oxide);
+  --color-chart-2: var(--verdigris);
   --color-chart-3: var(--saffron);
-  --color-chart-4: var(--success);
-  --color-chart-5: var(--ink-secondary);
+  --color-chart-4: #6869b8;
+  --color-chart-5: #2f7ea0;
 }
 
 :root {
-  --canvas: #eef1ec;
-  --background: #eef1ec;
-  --surface: #f8faf6;
-  --raised: #ffffff;
-  --foreground: #252b27;
-  --ink: #252b27;
-  --ink-secondary: #69716c;
-  --ink-muted: #8a9089;
-  --muted: #f1f4ef;
-  --oxide: #d94f3d;
-  --oxide-deep: #b8402f;
-  --verdigris: #158577;
-  --saffron: #d2a11d;
-  --success: #3b8c57;
-  --error: #bf3f48;
-  --border: #cdd3cc;
-  --border-strong: #b3b9b2;
-  --tick: #9aa198;
-  --radius: 4px;
+  --canvas: #f5f5f7;
+  --background: #f5f5f7;
+  --surface: rgba(255, 255, 255, 0.72);
+  --raised: rgba(255, 255, 255, 0.9);
+  --foreground: #202126;
+  --ink: #202126;
+  --ink-secondary: #686a73;
+  --ink-muted: #90919a;
+  --muted: rgba(240, 240, 244, 0.82);
+  --oxide: #d72f40;
+  --oxide-deep: #aa1d30;
+  --verdigris: #248b7a;
+  --saffron: #c18b18;
+  --success: #31825c;
+  --error: #c3243b;
+  --border: rgba(73, 36, 42, 0.13);
+  --border-strong: rgba(73, 36, 42, 0.23);
+  --tick: rgba(113, 57, 65, 0.24);
+  --rift-glass-shadow: 0 18px 48px rgba(47, 25, 31, 0.075), 0 2px 8px rgba(47, 25, 31, 0.035);
+  --rift-glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+  --rift-motion-fast: 160ms;
+  --rift-motion-smooth: 260ms;
+  --radius: 14px;
 }
 
 .dark {
-  /* RIFT does not ship a dark theme in v1. Kept as no-op for compat. */
-  --canvas: #eef1ec;
-  --background: #eef1ec;
-  --surface: #f8faf6;
-  --raised: #ffffff;
-  --foreground: #252b27;
-  --ink: #252b27;
-  --ink-secondary: #69716c;
-  --muted: #f1f4ef;
-  --border: #cdd3cc;
+  /* Dark mode remains light-compatible until the controller supports it. */
+  --canvas: #f5f5f7;
+  --background: #f5f5f7;
+  --surface: rgba(255, 255, 255, 0.72);
+  --raised: rgba(255, 255, 255, 0.9);
+  --foreground: #202126;
+  --ink: #202126;
+  --ink-secondary: #686a73;
+  --muted: rgba(240, 240, 244, 0.82);
+  --border: rgba(73, 36, 42, 0.13);
 }
 
 @layer base {
@@ -128,6 +132,10 @@
     color: var(--color-ink);
     font-size: 14px;
     line-height: 1.5;
+    background-image:
+      radial-gradient(ellipse at 8% 0%, rgba(215, 47, 64, 0.085), transparent 31rem),
+      radial-gradient(ellipse at 96% 11%, rgba(193, 139, 24, 0.055), transparent 30rem);
+    background-attachment: fixed;
   }
   ::selection {
     background: color-mix(in oklab, var(--oxide) 22%, transparent);
@@ -158,13 +166,23 @@
 @utility rift-panel {
   background: var(--raised);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 16px;
+  box-shadow: var(--rift-glass-shadow), var(--rift-glass-highlight);
+  backdrop-filter: blur(18px) saturate(1.18);
+  -webkit-backdrop-filter: blur(18px) saturate(1.18);
+  transition:
+    border-color var(--rift-motion-smooth) ease,
+    box-shadow var(--rift-motion-smooth) ease,
+    transform var(--rift-motion-smooth) ease;
 }
 
 @utility rift-surface {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 4px;
+  border-radius: 14px;
+  box-shadow: var(--rift-glass-highlight);
+  backdrop-filter: blur(14px) saturate(1.12);
+  -webkit-backdrop-filter: blur(14px) saturate(1.12);
 }
 
 @utility rift-hairline {
@@ -176,10 +194,56 @@
   position: relative;
   height: 12px;
   background-image: linear-gradient(to right, var(--tick) 1px, transparent 1px);
-  background-size: 12px 100%;
+  background-size: 10px 100%;
   background-position: 0 50%;
   background-repeat: repeat-x;
   mask-image: linear-gradient(to right, transparent, black 8%, black 92%, transparent);
+}
+
+@utility rift-seismic-rule {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+@utility rift-glass-hover {
+  transition:
+    transform var(--rift-motion-fast) ease,
+    box-shadow var(--rift-motion-smooth) ease,
+    border-color var(--rift-motion-fast) ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .rift-glass-hover:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 22px 52px rgba(47, 25, 31, 0.11), var(--rift-glass-highlight);
+    border-color: rgba(215, 47, 64, 0.25);
+  }
+}
+
+.rift-seismic-rule::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 50%;
+  right: 1.25rem;
+  width: min(24vw, 18rem);
+  height: 1.25rem;
+  opacity: 0.22;
+  transform: translateY(-50%);
+  background: var(--oxide);
+  clip-path: polygon(0 48%, 16% 48%, 20% 34%, 24% 85%, 29% 10%, 34% 68%, 38% 48%, 56% 48%, 60% 35%, 64% 78%, 69% 19%, 74% 60%, 78% 48%, 100% 48%, 100% 55%, 79% 55%, 74% 68%, 69% 27%, 64% 88%, 60% 44%, 56% 55%, 39% 55%, 34% 78%, 29% 20%, 24% 94%, 20% 44%, 16% 55%, 0 55%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 @utility rift-mono {

@@ -44,6 +44,7 @@ export const keys = {
   gateway: ["rift", "gateway"] as const,
   gatewayGroups: ["rift", "gateway", "groups"] as const,
   services: ["rift", "services"] as const,
+  localArtifacts: ["rift", "artifacts", "local"] as const,
   deploymentRecords: ["rift", "deployment-records"] as const,
   service: (id: string) => ["rift", "service", id] as const,
   revisions: (id: string) => ["rift", "revisions", id] as const,
@@ -66,7 +67,8 @@ export const keys = {
   telemetryLatest: (service?: string) => ["rift", "telemetry", "latest", service ?? "all"] as const,
   telemetryCatalog: ["rift", "telemetry", "catalog"] as const,
   telemetryObjectiveCatalog: ["rift", "telemetry", "objectives", "catalog"] as const,
-  telemetryObjectives: (service: string, events = false) => ["rift", "telemetry", "objectives", service, events] as const,
+  telemetryObjectives: (service: string, events = false) =>
+    ["rift", "telemetry", "objectives", service, events] as const,
   telemetryReports: (service?: string) =>
     ["rift", "telemetry", "reports", service ?? "all"] as const,
   telemetryAccounting: (service: string) => ["rift", "telemetry", "accounting", service] as const,
@@ -186,25 +188,41 @@ export function useMeshTopology() {
   );
 }
 export function useMeshServices() {
-  return shape(useQuery<MeshService[]>({
-    queryKey: keys.meshServices,
-    queryFn: ({ signal }) => rift.listMeshServices(signal),
-    staleTime: 5_000,
-    refetchInterval: 10_000,
-    retry: false,
-  }));
+  return shape(
+    useQuery<MeshService[]>({
+      queryKey: keys.meshServices,
+      queryFn: ({ signal }) => rift.listMeshServices(signal),
+      staleTime: 5_000,
+      refetchInterval: 10_000,
+      retry: false,
+    }),
+  );
 }
 export function useMeshServiceGroups() {
-  return shape(useQuery<MeshServiceGroup[]>({
-    queryKey: keys.meshGroups,
-    queryFn: ({ signal }) => rift.listMeshServiceGroups(signal),
-    staleTime: 5_000,
-    refetchInterval: 10_000,
-    retry: false,
-  }));
+  return shape(
+    useQuery<MeshServiceGroup[]>({
+      queryKey: keys.meshGroups,
+      queryFn: ({ signal }) => rift.listMeshServiceGroups(signal),
+      staleTime: 5_000,
+      refetchInterval: 10_000,
+      retry: false,
+    }),
+  );
 }
 export function useServices() {
   return shape(useQuery(servicesOptions));
+}
+
+export function useLocalArtifacts() {
+  return shape(
+    useQuery({
+      queryKey: keys.localArtifacts,
+      queryFn: ({ signal }) => rift.listLocalArtifacts(signal),
+      staleTime: 10_000,
+      refetchInterval: 30_000,
+      retry: false,
+    }),
+  );
 }
 
 export function useDeploymentRecords() {
@@ -319,7 +337,9 @@ export function useTelemetryObjectiveCatalog() {
 export function useTelemetryObjectives(service: string | undefined, events = false) {
   return shape(
     useQuery<ObjectiveStatusPayload>({
-      queryKey: service ? keys.telemetryObjectives(service, events) : ["rift", "telemetry", "objectives", "none", events],
+      queryKey: service
+        ? keys.telemetryObjectives(service, events)
+        : ["rift", "telemetry", "objectives", "none", events],
       queryFn: ({ signal }) => rift.telemetryObjectives(service!, { events }, signal),
       enabled: Boolean(service),
       staleTime: 1_000,
@@ -342,14 +362,16 @@ export function useResourceReports(service?: string) {
 }
 
 export function useResourceHistory(sessionId: string | undefined, metric: string, seconds: number) {
-  return shape(useQuery({
-    queryKey: ["rift", "telemetry", "history", sessionId, metric, seconds],
-    queryFn: ({ signal }) => rift.resourceHistory(sessionId!, metric, seconds, signal),
-    enabled: Boolean(sessionId),
-    staleTime: 5_000,
-    refetchInterval: 10_000,
-    retry: false,
-  }));
+  return shape(
+    useQuery({
+      queryKey: ["rift", "telemetry", "history", sessionId, metric, seconds],
+      queryFn: ({ signal }) => rift.resourceHistory(sessionId!, metric, seconds, signal),
+      enabled: Boolean(sessionId),
+      staleTime: 5_000,
+      refetchInterval: 10_000,
+      retry: false,
+    }),
+  );
 }
 
 export function useServiceTelemetryAccounting(service: string | undefined) {
@@ -523,6 +545,7 @@ export type RecommendInput = {
   localPath?: string;
   endpointUrl?: string;
   modelRef?: string;
+  refresh?: boolean;
 };
 
 export function recommendationKey(input: RecommendInput) {

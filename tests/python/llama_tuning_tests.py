@@ -240,6 +240,58 @@ def test_capability_parser_reads_cache_types_from_continuation_lines() -> None:
     assert capabilities["cache_types"]["cache_type_v"] == ["f16", "q4_1"]
 
 
+def test_capability_parser_exposes_json_schema_file_support() -> None:
+    provider = LlamaCppProvider()
+    capabilities = provider._parse_tuning_capabilities(
+        "-j, --json-schema SCHEMA\n"
+        "-jf, --json-schema-file FILE\n"
+    )
+    assert capabilities["supports_json_schema"] is True
+    assert capabilities["supports_json_schema_file"] is True
+
+
+def test_launch_plan_attaches_schema_file_only_when_runtime_supports_it(tmp_path) -> None:
+    provider = LlamaCppProvider()
+    schema_path = tmp_path / "ehr.schema.json"
+    schema_path.write_text('{"type":"object"}', encoding="utf-8")
+    capabilities = {
+        "flags": {"json-schema-file", "no-jinja"},
+        "probed": True,
+        "supports_json_schema": False,
+        "supports_json_schema_file": True,
+    }
+    with patch.object(provider, "probe_tuning_capabilities", return_value=capabilities):
+        plan = provider.plan_launch(
+            model_path="model.gguf", host="127.0.0.1", port=18080,
+            context_length=32768, concurrency=1,
+            hardware={"total_vram_bytes": 8 * 1024**3},
+            tuning={"json_schema_file": str(schema_path)},
+        )
+    args = plan["command"]
+    assert args[args.index("--json-schema-file") + 1] == str(schema_path)
+    assert "--no-jinja" in args
+    assert plan["structured_output"]["schema_file"] == str(schema_path)
+
+
+def test_launch_plan_rejects_schema_file_when_runtime_does_not_support_it(tmp_path) -> None:
+    provider = LlamaCppProvider()
+    schema_path = tmp_path / "ehr.schema.json"
+    schema_path.write_text('{"type":"object"}', encoding="utf-8")
+    capabilities = {"flags": {"batch-size"}, "probed": True}
+    with patch.object(provider, "probe_tuning_capabilities", return_value=capabilities):
+        try:
+            provider.plan_launch(
+                model_path="model.gguf", host="127.0.0.1", port=18080,
+                context_length=32768, concurrency=1,
+                hardware={"total_vram_bytes": 8 * 1024**3},
+                tuning={"json_schema_file": str(schema_path)},
+            )
+        except ValueError as exc:
+            assert "json-schema-file" in str(exc)
+        else:
+            raise AssertionError("unsupported schema enforcement must fail before launch")
+
+
 def test_capability_probe_returns_nested_copies() -> None:
     provider = LlamaCppProvider()
     with patch("rift.providers.llama_cpp.subprocess.run") as run:

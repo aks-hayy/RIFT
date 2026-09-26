@@ -57,7 +57,7 @@ import {
 export const Route = createFileRoute("/setup")({
   head: () => ({
     meta: [
-      { title: "Guided setup — RIFT" },
+      { title: "Best Fit Setup — RIFT" },
       {
         name: "description",
         content: "Discover hardware, choose a model, review the plan, and deploy in one flow.",
@@ -1253,6 +1253,7 @@ function StepRecommendation({
         source,
         localPath: source === "local" ? sourceReference : undefined,
         modelRef: source === "huggingface" && sourceReference ? sourceReference : undefined,
+        refresh: attempt > 0,
       })
       .then((r) => alive && setResult(r))
       .catch((e) => alive && setErr(e));
@@ -1328,6 +1329,16 @@ function StepRecommendation({
                 Retry
               </button>
             </div>
+          )}
+          {result.cacheProvenance?.source === "huggingface" && (
+            <p className="mt-3 text-[11px] text-ink-muted">
+              Hub metadata: {result.cacheProvenance.refreshed
+                ? "refreshed for this search"
+                : result.cacheProvenance.oldestEntryAgeSeconds == null
+                  ? "no cached metadata was available"
+                  : `cached; oldest entry ${Math.floor(result.cacheProvenance.oldestEntryAgeSeconds / 3600)}h old`}
+              {" · "}refresh window {Math.floor(result.cacheProvenance.ttlSeconds / 3600)}h
+            </p>
           )}
           <div className="mt-6 grid gap-3">
             {result.recommendations.map((r) => (

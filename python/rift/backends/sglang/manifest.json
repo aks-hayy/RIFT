@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "backend_id": "sglang",
+  "display_name": "SGLang",
+  "adapter_api_version": "1.0",
+  "upstream_project": "sgl-project/sglang",
+  "module": "rift.backends.sglang.backend",
+  "supported_tasks": ["chat", "completion", "structured", "tool-use", "vision-language"],
+  "supported_formats": ["safetensors", "awq", "gptq", "fp8"],
+  "quantizations": ["awq", "gptq", "fp8", "fp16", "bf16"],
+  "operating_systems": ["linux", "wsl2", "container"],
+  "accelerators": ["cuda", "rocm"],
+  "installation_methods": ["isolated-python", "container", "wsl2"],
+  "endpoints": ["openai"],
+  "features": ["structured-output", "tool-use", "continuous-batching", "radix-cache", "tensor-parallelism"],
+  "tuning_profiles": [],
+  "topology_modes": ["single_node", "replicated", "tensor_parallel"],
+  "evidence_status": "implemented_unverified",
+  "multi_gpu": true,
+  "streaming": true,
+  "description": "Structured and tool-aware serving backend operated through an OpenAI-compatible runtime."
+}

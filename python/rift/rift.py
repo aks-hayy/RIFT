@@ -6,6 +6,7 @@ are capability providers, while serving remains adapter-managed.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -30,6 +31,7 @@ else:
     from ._fallback_core import ControlPlaneRuntime
 from .adapters.artifacts import artifact_adapter_host, source_from_candidate
 from .adapters.contracts import ArtifactVariant, ModelIdentity, WorkloadProfile
+from .discovery import assess_metadata_capabilities, model_family_matches, normalize_workload
 from .benchmark_catalog import benchmark_site_catalog
 from .evidence import EvidenceEngine
 from .evidence_sources import JsonEvidenceSource
@@ -1138,16 +1140,21 @@ class RiftEngine:
         artifact_enrichment_cap: int = 20,
         download_root: Optional[str] = None,
         disk_reserve_gb: float = 2.0,
+        allowed_licenses: Optional[Iterable[str]] = None,
         run_store_root: Optional[str] = None,
         persist_run: bool = True,
         simulated_hardware: str | dict[str, Any] | None = None,
         benchmark_snapshots: Optional[Iterable[str | Path]] = None,
         model_ref: Optional[str] = None,
+        workload_contract: Optional[dict[str, Any]] = None,
+        search_candidate_limit: Optional[int] = None,
     ) -> dict[str, Any]:
         if top <= 0:
             raise ValueError("top must be positive")
         if candidate_limit <= 0:
             raise ValueError("candidate_limit must be positive")
+        if search_candidate_limit is not None and search_candidate_limit <= 0:
+            raise ValueError("search_candidate_limit must be positive")
         if enrichment_cap <= 0:
             raise ValueError("enrichment_cap must be positive")
         if artifact_enrichment_cap <= 0:
@@ -1157,7 +1164,11 @@ class RiftEngine:
         if simulated_hardware is not None and pull_best:
             raise ValueError("simulated hardware is read-only; remove --pull-best before downloading")
 
-        task_key = (task or "chat").strip().lower()
+        workload = normalize_workload(task=task, workload_contract=workload_contract)
+        if workload.network_policy == "offline":
+            raise ValueError("offline workload requires local model discovery")
+        task_key = workload.task
+        search_limit = int(search_candidate_limit or candidate_limit)
         mode_key = (mode or "balanced").strip().upper()
         formats_explicit = formats is not None
         format_set = self._normalize_recommendation_formats(formats)
@@ -1165,6 +1176,9 @@ class RiftEngine:
         if max_gb <= 0.0:
             raise ValueError("max_download_gb must be positive")
         max_bytes = int(max_gb * _GIB)
+        allowed_license_set = {
+            str(item).strip().lower() for item in (allowed_licenses or ()) if str(item).strip()
+        }
         hardware = self.hardware_profile(simulation=simulated_hardware)
         reserve_bytes = int(float(disk_reserve_gb) * _GIB)
         if simulated_hardware is not None:
@@ -1186,14 +1200,15 @@ class RiftEngine:
             task_key,
             format_set,
             include_format_arms=True,
-            include_family_arms=candidate_limit >= 50,
+            include_family_arms=True,
+            family_preference=workload.model_family_preference,
         )
         raw_candidates: dict[str, dict[str, Any]] = {}
         arm_results: list[dict[str, Any]] = []
         arm_candidates: list[list[dict[str, Any]]] = []
         per_arm_limit = min(
             50,
-            max(10, math.ceil(candidate_limit / max(1, len(arms))) * 2),
+            max(10, math.ceil(search_limit / max(1, len(arms))) * 2),
         )
         if model_ref:
             reference = str(model_ref).strip().strip("/")
@@ -1225,14 +1240,17 @@ class RiftEngine:
                     expand=("tags", "downloads", "likes", "lastModified", "siblings"),
                 )
             except Exception as exc:
-                arm_results.append({"name": arm["name"], "status": "error", "error": str(exc)})
+                arm_results.append({"name": arm["name"], "status": "error", "error": str(exc),
+                                    "search": arm.get("search"), "pipeline_tag": arm.get("pipeline_tag")})
                 arm_candidates.append([])
                 continue
-            arm_results.append({"name": arm["name"], "status": "ok", "count": len(models)})
+            arm_results.append({"name": arm["name"], "status": "ok", "count": len(models),
+                                "search": arm.get("search"), "pipeline_tag": arm.get("pipeline_tag"),
+                                "sort": arm.get("sort")})
             arm_candidates.append(models)
 
         round_index = 0
-        while len(raw_candidates) < candidate_limit:
+        while len(raw_candidates) < search_limit:
             added = False
             for models in arm_candidates:
                 if round_index >= len(models):
@@ -1242,7 +1260,7 @@ class RiftEngine:
                 if repo_id and repo_id not in raw_candidates:
                     raw_candidates[repo_id] = model
                     added = True
-                    if len(raw_candidates) >= candidate_limit:
+                    if len(raw_candidates) >= search_limit:
                         break
             if not added and all(round_index >= len(models) - 1 for models in arm_candidates):
                 break
@@ -1260,6 +1278,8 @@ class RiftEngine:
                 include_gated=include_gated,
                 disk_profile=disk,
                 external_evidence=external_evidence,
+                workload_profile=workload if workload_contract else None,
+                allowed_licenses=allowed_license_set,
             )
             if not scored["excluded"]:
                 cheap_ranked.append(scored)
@@ -1325,6 +1345,8 @@ class RiftEngine:
                 include_gated=include_gated,
                 disk_profile=disk,
                 external_evidence=external_evidence,
+                workload_profile=workload if workload_contract else None,
+                allowed_licenses=allowed_license_set,
             )
             if tree_error:
                 rescored["warnings"].append(
@@ -1340,6 +1362,11 @@ class RiftEngine:
             item for item in cheap_ranked if item["repo_id"] not in already_enriched
             and item["repo_id"] not in excluded_after_enrichment
         ]
+        ranked = self._rank_with_public_evaluations(
+            ranked,
+            task=task_key,
+            objective=workload.objective,
+        )
         ranked.sort(key=lambda item: item["final_score"], reverse=True)
         recommendations = [self._public_recommendation(item) for item in ranked[:top]]
         best_for_hardware = self._recommendation_best_for_hardware(ranked)
@@ -1356,7 +1383,21 @@ class RiftEngine:
                 sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()[:20]
-        workload_profile = WorkloadProfile(task=task_key)
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "workload": workload.to_dict(),
+                    "source": endpoint.rstrip("/"),
+                    "model_ref": model_ref,
+                    "formats": sorted(format_set),
+                    "hardware": hardware.get("fingerprint"),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        workload_profile = workload
+        cache_status = client.cache_status()
         result: dict[str, Any] = {
             "rift_product": self.product.name,
             "rift_phase": "M3_EXACT_ARTIFACT",
@@ -1365,10 +1406,18 @@ class RiftEngine:
             "recommendation_run_id": run_id,
             "task": task_key,
             "workload_profile": workload_profile.to_dict(),
+            "workload_contract_hash": (
+                hashlib.sha256(json.dumps(workload_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+                if workload_contract is not None
+                else None
+            ),
+            "request_fingerprint": request_fingerprint,
+            "model_ref": model_ref,
             "mode_preference": mode_key,
             "mode_preference_deprecated": True,
             "top": top,
             "candidate_limit": candidate_limit,
+            "search_candidate_limit": search_limit,
             "enrichment_cap": enrichment_cap,
             "artifact_enrichment_cap": artifact_enrichment_cap,
             "max_download_gb": max_gb,
@@ -1377,6 +1426,13 @@ class RiftEngine:
             "formats_explicit_constraint": formats_explicit,
             "include_gated": include_gated,
             "refresh": refresh,
+            "cache_provenance": {
+                "source": "huggingface",
+                "refreshed": bool(refresh),
+                "ttl_seconds": cache_ttl_seconds,
+                "entry_count": cache_status.get("entry_count", 0),
+                "oldest_entry_age_seconds": cache_status.get("oldest_entry_age_seconds"),
+            },
             "hardware_profile": hardware,
             "hardware_simulation": hardware.get(
                 "simulation",
@@ -1476,6 +1532,8 @@ class RiftEngine:
                 "performance_estimate": item.get("performance_estimate"),
                 "resource_estimate": item.get("resource_estimate"),
                 "quality_evidence": item.get("quality_evidence", {}),
+                "public_evaluation_comparison": item.get("public_evaluation_comparison", {}),
+                "evaluation_evidence": item.get("evaluation_evidence", {}),
                 "evidence_freshness": item.get("evidence_freshness", "unknown"),
                 "evidence_coverage": item.get("evidence_coverage", 0),
             }
@@ -1487,12 +1545,19 @@ class RiftEngine:
         ]
         runnable = [item for item in feasible if item.get("support_level") == "AVAILABLE_NOW"]
         installable = [item for item in feasible if item.get("support_level") == "INSTALLABLE_BACKEND"]
-        published = [
+        normalized_published = [
             item
             for item in feasible
             if (item.get("quality_evidence") or {}).get("score") is not None
             and (item.get("quality_evidence") or {}).get("published_records", 0) > 0
         ]
+        public_published = [
+            item for item in feasible
+            if (item.get("public_evaluation_comparison") or {}).get("score") is not None
+        ]
+        # Do not compare a normalized curated score directly with a peer
+        # percentile derived from the current recommendation shortlist.
+        published = normalized_published or public_published
         dimensions = (
             "quality_proxy",
             "expected_speed",
@@ -1521,7 +1586,11 @@ class RiftEngine:
         best_published = max(
             published,
             key=lambda item: (
-                float((item.get("quality_evidence") or {}).get("score") or 0.0),
+                float(
+                    (item.get("quality_evidence") or {}).get("score")
+                    if normalized_published
+                    else (item.get("public_evaluation_comparison") or {}).get("score") or 0.0
+                ),
                 float(item.get("confidence") or 0.0),
             ),
         ) if published else None
@@ -2034,6 +2103,7 @@ class RiftEngine:
         *,
         include_format_arms: bool = False,
         include_family_arms: bool = True,
+        family_preference: str | None = None,
     ) -> list[dict[str, Any]]:
         task_terms = {
             "chat": "instruct",
@@ -2048,6 +2118,11 @@ class RiftEngine:
             "vlm": "vision",
             "structured": "instruct",
             "tool-use": "tools",
+            "documents": "",
+            "document": "",
+            "rag": "",
+            "retrieval": "",
+            "agent": "tools",
         }
         search_term = task_terms.get(task, task)
         pipeline_tags = {
@@ -2112,16 +2187,15 @@ class RiftEngine:
         # Family arms reduce popularity/fine-tune monoculture in the bounded
         # Hub window. They are discovery hints only; artifact and backend fit
         # still decide whether a candidate can be recommended.
-        if include_family_arms and task in {"chat", "general", "coding", "code", "structured", "tool-use"}:
-            for family in ("qwen", "llama", "mistral", "gemma", "phi"):
-                arms.append(
-                    {
-                        "name": f"family_{family}",
-                        "pipeline_tag": pipeline_tags[0],
-                        "search": family,
-                        "sort": "downloads",
-                    }
-                )
+        if include_family_arms and family_preference:
+            arms.append(
+                {
+                    "name": "family_preference",
+                    "pipeline_tag": pipeline_tags[0],
+                    "search": str(family_preference).strip(),
+                    "sort": "downloads",
+                }
+            )
         arms.append(
             {
                 "name": "small_parameter_band",
@@ -2322,6 +2396,7 @@ class RiftEngine:
         model_bytes: int,
         workload: str,
         artifact: Optional[dict[str, Any]] = None,
+        workload_profile: WorkloadProfile | None = None,
     ) -> dict[str, Any]:
         model_type = self._candidate_model_type(candidate)
         artifact_payload = {
@@ -2330,6 +2405,10 @@ class RiftEngine:
             "quantization": None,
             "architecture": model_type,
             "total_bytes": model_bytes,
+            **({
+                "context_length": workload_profile.context_length,
+                "concurrency": workload_profile.concurrency,
+            } if workload_profile else {}),
             **dict(artifact or {}),
         }
         ranked = self.backend_adapters.rank(
@@ -2354,7 +2433,12 @@ class RiftEngine:
             }
             for item in ranked
         ]
-        winner = next((item for item in candidates if item["feasible"]), None)
+        preferred = str(workload_profile.backend_preference or "").strip().lower() if workload_profile else ""
+        winner = next(
+            (item for item in candidates if item["feasible"] and item["backend"].lower() == preferred),
+            None,
+        ) if preferred else None
+        winner = winner or next((item for item in candidates if item["feasible"]), None)
         if winner is None:
             return {
                 "backend": BackendKind.NONE.value,
@@ -2386,49 +2470,272 @@ class RiftEngine:
 
         metrics: list[dict[str, Any]] = []
 
-        def walk(value: Any, source: str | None = None) -> None:
+        def source_details(value: Any) -> tuple[str, str | None]:
+            if isinstance(value, dict):
+                return (
+                    str(value.get("name") or value.get("id") or "model card"),
+                    str(value.get("url")) if value.get("url") else None,
+                )
+            return str(value or "model card"), None
+
+        def append_metric(
+            *, context: dict[str, Any], name: Any, value: Any, source: Any, verification: Any
+        ) -> None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return
+            if not math.isfinite(float(value)):
+                return
+            benchmark_id = str(
+                context.get("benchmark_id") or context.get("benchmark_name") or ""
+            ).strip()
+            metric_name = str(name or "").strip()
+            if not benchmark_id or not metric_name:
+                return
+            source_name, source_url = source_details(source)
+            verification_text = str(verification or "").lower()
+            if verification is True or "verified" in verification_text:
+                verification_status = "verified"
+            elif "community" in verification_text or "community" in source_name.lower():
+                verification_status = "community"
+            else:
+                verification_status = "unverified"
+            metrics.append(
+                {
+                    "benchmark_id": benchmark_id,
+                    "benchmark_name": context.get("benchmark_name") or benchmark_id,
+                    "task_id": str(context.get("task_id") or "").strip(),
+                    "task_type": str(context.get("task_type") or "").strip(),
+                    "name": metric_name,
+                    "value": float(value),
+                    "source": source_name,
+                    "source_url": source_url,
+                    "verification": verification_status,
+                }
+            )
+
+        def walk(value: Any, inherited: dict[str, Any] | None = None) -> None:
             if isinstance(value, list):
                 for item in value:
-                    walk(item, source)
+                    walk(item, inherited)
                 return
             if not isinstance(value, dict):
                 return
-            source_value = value.get("source")
-            if isinstance(source_value, dict):
-                source = str(source_value.get("name") or source_value.get("url") or source or "")
+            context = dict(inherited or {})
+            dataset = value.get("dataset")
+            if isinstance(dataset, dict):
+                context["benchmark_id"] = (
+                    dataset.get("id") or dataset.get("type") or dataset.get("name")
+                    or context.get("benchmark_id")
+                )
+                context["benchmark_name"] = dataset.get("name") or context.get("benchmark_name")
+                context["task_id"] = dataset.get("task_id") or context.get("task_id")
+            elif isinstance(dataset, str):
+                context["benchmark_id"] = dataset
+            for source_key in ("dataset_id", "dataset_name"):
+                if value.get(source_key):
+                    context["benchmark_id" if source_key.endswith("_id") else "benchmark_name"] = value[source_key]
+            task = value.get("task")
+            if isinstance(task, dict):
+                context["task_id"] = task.get("id") or task.get("name") or context.get("task_id")
+                context["task_type"] = task.get("type") or context.get("task_type")
+            for task_key in ("task_id", "task_type", "task_name"):
+                if value.get(task_key):
+                    context["task_type" if task_key == "task_type" else "task_id"] = value[task_key]
+            source_value = value.get("source") or value.get("source_name")
+            verification = value.get("verification") or value.get("status")
+            if value.get("verifyToken") or value.get("verified") is True:
+                verification = "verified"
+
+            direct_metric_name = (
+                value.get("metric_name") or value.get("metric_type") or value.get("metric")
+            )
+            if isinstance(direct_metric_name, dict):
+                direct_metric_name = direct_metric_name.get("name") or direct_metric_name.get("type")
+            if value.get("value") is not None:
+                append_metric(
+                    context=context,
+                    name=direct_metric_name,
+                    value=value.get("value"),
+                    source=source_value,
+                    verification=verification,
+                )
             metric_values = value.get("metrics")
             if isinstance(metric_values, list):
                 for metric in metric_values:
                     if not isinstance(metric, dict):
                         continue
-                    metric_value = metric.get("value")
-                    if isinstance(metric_value, (int, float)):
-                        metrics.append(
-                            {
-                                "name": str(metric.get("name") or metric.get("type") or "metric"),
-                                "value": float(metric_value),
-                                "source": source or "model_card",
-                            }
-                        )
+                    append_metric(
+                        context=context,
+                        name=metric.get("name") or metric.get("type"),
+                        value=metric.get("value"),
+                        source=metric.get("source") or source_value,
+                        verification=metric.get("verification") or verification,
+                    )
             for key, nested in value.items():
                 if key not in ("metrics", "source") and isinstance(nested, (list, dict)):
-                    walk(nested, source)
+                    walk(nested, context)
 
         walk(raw)
-        independent = sum(
-            1
-            for metric in metrics
-            if any(
-                marker in str(metric.get("source") or "").lower()
-                for marker in ("leaderboard", "lighteval", "open llm", "community")
-            )
-        )
         return {
             "metric_count": len(metrics),
-            "independent_metric_count": independent,
+            "independent_metric_count": sum(
+                1 for metric in metrics if metric["verification"] == "verified"
+            ),
+            "metrics": metrics,
             "sample": metrics[:5],
             "present": bool(metrics),
         }
+
+    @staticmethod
+    def _public_eval_task_relevant(metric: dict[str, Any], task: str) -> bool:
+        text = " ".join(
+            str(metric.get(key) or "")
+            for key in ("benchmark_id", "benchmark_name", "task_id", "task_type", "name")
+        ).lower().replace("_", "-")
+        task_markers = {
+            "chat": ("chat", "instruction", "mmlu", "ifeval", "hellaswag", "truthfulqa", "mt-bench", "gpqa"),
+            "coding": ("code", "coding", "humaneval", "mbpp", "swe-bench", "bigcodebench"),
+            "documents": ("document", "summarization", "long-context", "extraction", "document-qa"),
+            "rag": ("rag", "retrieval-augmented", "grounded", "citation", "retrieval-qa"),
+            "embeddings": ("embedding", "mteb", "beir", "sentence-similarity", "semantic-search", "retrieval"),
+        }
+        markers = task_markers.get(str(task).lower(), ())
+        return any(marker in text for marker in markers)
+
+    @staticmethod
+    def _public_eval_metric_direction(metric_name: str) -> int:
+        name = str(metric_name or "").lower().replace("_", "-")
+        if any(marker in name for marker in ("loss", "perplexity", "-ppl", "wer", "error-rate", "latency")):
+            return -1
+        if any(
+            marker in name
+            for marker in (
+                "accuracy", "-acc", "acc-", "f1", "exact-match", "pass@", "bleu",
+                "rouge", "recall", "precision", "ndcg", "mrr", "map",
+            )
+        ):
+            return 1
+        return 0
+
+    def _rank_with_public_evaluations(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        task: str,
+        objective: str = "balanced",
+    ) -> list[dict[str, Any]]:
+        """Use only shared, task-relevant Hub metrics as relative shortlist evidence."""
+        ranked = [copy.deepcopy(item) for item in candidates]
+        groups: dict[tuple[str, str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+        for candidate in ranked:
+            evaluation = candidate.get("evaluation_evidence") or {}
+            metrics = evaluation.get("metrics") if isinstance(evaluation, dict) else []
+            relevant: list[dict[str, Any]] = []
+            for metric in metrics or []:
+                if not isinstance(metric, dict) or not self._public_eval_task_relevant(metric, task):
+                    continue
+                direction = self._public_eval_metric_direction(str(metric.get("name") or ""))
+                if direction == 0:
+                    continue
+                key = (
+                    str(metric.get("benchmark_id") or "").lower(),
+                    str(metric.get("task_id") or metric.get("task_type") or "").lower(),
+                    str(metric.get("name") or "").lower(),
+                )
+                if not key[0]:
+                    continue
+                relevant.append(metric)
+                groups.setdefault(key, []).append((candidate, metric))
+        percentile_scores: dict[int, list[tuple[float, dict[str, Any]]]] = {}
+        for key, observations in groups.items():
+            # A candidate's duplicate card entries for one benchmark are not
+            # independent votes. Retain its first public result for that key.
+            by_candidate: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+            for candidate, metric in observations:
+                by_candidate.setdefault(id(candidate), (candidate, metric))
+            if len(by_candidate) < 2:
+                continue
+            direction = self._public_eval_metric_direction(key[2])
+            observations_by_model = list(by_candidate.values())
+            values = [float(metric.get("value")) for _, metric in observations_by_model]
+            percent_scale_metrics = any(
+                marker in key[2]
+                for marker in (
+                    "accuracy", "-acc", "f1", "exact-match", "pass@", "precision",
+                    "recall", "bleu", "rouge", "ndcg", "mrr", "map",
+                )
+            )
+            if percent_scale_metrics and any(value < 0.0 or value > 100.0 for value in values):
+                continue
+            if percent_scale_metrics and any(value > 1.0 for value in values):
+                values = [value / 100.0 if 1.0 < value <= 100.0 else value for value in values]
+            for candidate, metric in by_candidate.values():
+                value = float(metric.get("value"))
+                if percent_scale_metrics and 1.0 < value <= 100.0:
+                    value /= 100.0
+                better = sum(1 for other in values if direction * other < direction * value)
+                tied = sum(1 for other in values if other == value)
+                percentile = (better + max(0, tied - 1) / 2) / (len(values) - 1)
+                percentile_scores.setdefault(id(candidate), []).append((percentile, metric))
+
+        for candidate in ranked:
+            evaluation = candidate.get("evaluation_evidence") or {}
+            all_metrics = evaluation.get("metrics", []) if isinstance(evaluation, dict) else []
+            used = percentile_scores.get(id(candidate), [])
+            public_score = (
+                round(sum(score for score, _ in used) / len(used), 6) if used else None
+            )
+            verified_count = sum(metric.get("verification") == "verified" for _, metric in used)
+            community_count = sum(metric.get("verification") == "community" for _, metric in used)
+            evidence_weight = 0.20 if verified_count else 0.10 if community_count else 0.05
+            comparison = {
+                "score": public_score,
+                "benchmark_count": len({metric.get("benchmark_id") for _, metric in used}),
+                "metric_count": len(used),
+                "verified_metric_count": verified_count,
+                "community_metric_count": community_count,
+                "ignored_metric_count": max(0, len(all_metrics) - len(used)),
+                "method": "percentile among current shortlist for shared benchmark/task/metric",
+                "claim_boundary": (
+                    "Relative public evaluation evidence only; scores are not comparable across different benchmarks "
+                    "and do not guarantee this exact artifact's quality."
+                ),
+            }
+            candidate["public_evaluation_comparison"] = comparison
+            quality_evidence = candidate.get("quality_evidence")
+            if not isinstance(quality_evidence, dict):
+                quality_evidence = {}
+                candidate["quality_evidence"] = quality_evidence
+            quality_evidence["public_comparison"] = comparison
+            if all_metrics and public_score is None:
+                candidate.setdefault("warnings", []).append(
+                    "public evaluation results were not used because no task-relevant comparable metrics were shared by this shortlist"
+                )
+            elif comparison["ignored_metric_count"]:
+                candidate.setdefault("warnings", []).append(
+                    f"{comparison['ignored_metric_count']} public evaluation result(s) were not comparable for this task and shortlist"
+                )
+            if public_score is None:
+                continue
+            scores = candidate.setdefault("scores", {})
+            previous_quality = float(scores.get("quality_proxy") or 0.0)
+            adjusted_quality = previous_quality * (1.0 - evidence_weight) + public_score * evidence_weight
+            scores["quality_proxy"] = round(self._clamp01(adjusted_quality), 6)
+            quality_weight = {"speed": 0.08, "cost": 0.18}.get(str(objective), 0.35)
+            candidate["final_score"] = round(
+                self._clamp01(float(candidate.get("final_score") or 0.0)
+                              + (adjusted_quality - previous_quality) * quality_weight),
+                6,
+            )
+            confidence_bonus = min(0.08, 0.03 * len(used))
+            candidate["confidence"] = round(
+                self._clamp01(float(candidate.get("confidence") or 0.0) + confidence_bonus), 6
+            )
+            candidate.setdefault("evidence", []).append(
+                f"public task-relevant evaluations compared on {comparison['benchmark_count']} shared benchmark(s)"
+            )
+        ranked.sort(key=lambda item: (float(item.get("final_score") or 0.0), float(item.get("confidence") or 0.0)), reverse=True)
+        return ranked
 
     def _score_hub_candidate(
         self,
@@ -2442,6 +2749,8 @@ class RiftEngine:
         include_gated: bool,
         disk_profile: Optional[dict[str, Any]] = None,
         external_evidence: Optional[list[Any]] = None,
+        workload_profile: WorkloadProfile | None = None,
+        allowed_licenses: set[str] | None = None,
     ) -> dict[str, Any]:
         repo_id = self._hub_repo_id(candidate)
         tags = self._candidate_tags(candidate)
@@ -2468,7 +2777,7 @@ class RiftEngine:
                     artifact_selection = LlamaCppProvider().select_gguf(
                         gguf_files,
                         hardware=hardware,
-                        intent=mode.lower(),
+                        intent=workload_profile.objective if workload_profile else mode.lower(),
                         disk_budget_bytes=(
                             int(disk_profile.get("usable_bytes") or 0)
                             if disk_profile
@@ -2574,6 +2883,12 @@ class RiftEngine:
         evidence: list[str] = []
         excluded = False
         exclusion_reason = ""
+        capability_status = assess_metadata_capabilities(
+            repo_id=repo_id,
+            tags=tags,
+            tool_calling=bool(workload_profile and workload_profile.tool_calling),
+            structured_output=bool(workload_profile and workload_profile.structured_output),
+        ) if workload_profile else {}
 
         if not repo_id:
             excluded = True
@@ -2584,6 +2899,13 @@ class RiftEngine:
         elif gated and not include_gated:
             excluded = True
             exclusion_reason = "gated/private model excluded"
+        elif allowed_licenses and self._candidate_license(candidate).lower() not in allowed_licenses:
+            excluded = True
+            exclusion_reason = f"license {self._candidate_license(candidate)!r} is not in the approved license set"
+        elif "unsupported" in capability_status.values():
+            excluded = True
+            unsupported = ", ".join(key for key, value in capability_status.items() if value == "unsupported")
+            exclusion_reason = f"repository metadata marks required capabilities as unsupported: {unsupported}"
         elif fmt not in allowed_formats:
             excluded = True
             exclusion_reason = f"format {fmt} is not allowed"
@@ -2678,9 +3000,9 @@ class RiftEngine:
         if task in ("coding", "code") and any(word in tag_text for word in ("code", "coder", "coding")):
             quality += 0.25
             evidence.append("coding-related tags/name matched task")
-        if task == "chat" and any(word in tag_text for word in ("chat", "instruct", "assistant")):
+        if task in ("chat", "documents", "rag", "general") and any(word in tag_text for word in ("chat", "instruct", "assistant")):
             quality += 0.22
-            evidence.append("chat/instruct tags/name matched task")
+            evidence.append(f"chat/instruct tags/name matched {task} generation workload")
         if task == "chat" and any(word in tag_text for word in ("code", "coder", "coding")):
             quality -= 0.08
             warnings.append("coding-specialized model may be less ideal for general chat")
@@ -2748,17 +3070,9 @@ class RiftEngine:
 
         eval_evidence = self._candidate_eval_evidence(candidate)
         if eval_evidence["present"]:
-            eval_bonus = min(0.10, 0.025 + eval_evidence["metric_count"] * 0.008)
-            if eval_evidence["independent_metric_count"]:
-                eval_bonus += min(
-                    0.04,
-                    eval_evidence["independent_metric_count"] * 0.01,
-                )
-            quality = self._clamp01(quality + eval_bonus)
             evidence.append(
-                "structured evaluation evidence found: "
-                f"{eval_evidence['metric_count']} metrics, "
-                f"{eval_evidence['independent_metric_count']} independently attributed"
+                f"{eval_evidence['metric_count']} public evaluation result(s) found; "
+                "ranking uses only task-relevant results comparable with another shortlist candidate"
             )
         else:
             warnings.append("no structured evaluation results found in Hub metadata")
@@ -2863,10 +3177,14 @@ class RiftEngine:
             model_bytes=effective_bytes,
             workload=task,
             artifact=selected_variant.to_dict() if selected_variant else None,
+            workload_profile=workload_profile,
         )
         backend = str(backend_decision["backend"])
         support_level = str(backend_decision["support_level"])
         evidence.append(str(backend_decision["note"]))
+        if workload_profile and support_level == "UNSUPPORTED":
+            excluded = True
+            exclusion_reason = "no backend adapter supports this artifact for the requested workload and hardware"
         support_feasibility = {
             "AVAILABLE_NOW": 1.0,
             "INSTALLABLE_BACKEND": 0.82,
@@ -2890,16 +3208,47 @@ class RiftEngine:
             + artifact_feasibility * 0.15
             + disk_feasibility * 0.10
         )
-        final = (
-            hardware_fit * 0.15
-            + deployment_feasibility * 0.10
-            + speed * 0.20
-            + quality * 0.35
-            + behavioral_safety * 0.05
-            + license_trust * 0.05
-            + artifact_integrity * 0.05
-            + popularity * 0.05
-        )
+        if workload_profile and workload_profile.objective == "speed":
+            weights = (0.12, 0.08, 0.45, 0.20, 0.05, 0.03, 0.03, 0.04)
+        elif workload_profile and workload_profile.objective == "cost":
+            # Artifact size and resource fit are cost proxies; this is not a
+            # monetary estimate.
+            weights = (0.25, 0.18, 0.10, 0.25, 0.05, 0.05, 0.07, 0.05)
+        else:
+            weights = (0.15, 0.10, 0.20, 0.35, 0.05, 0.05, 0.05, 0.05)
+        final = sum(value * weight for value, weight in zip(
+            (hardware_fit, deployment_feasibility, speed, quality, behavioral_safety,
+             license_trust, artifact_integrity, popularity), weights
+        ))
+        preference_matches: dict[str, str] = {}
+        if workload_profile:
+            family_preference = str(workload_profile.model_family_preference or "").strip().lower()
+            if family_preference:
+                family_match = model_family_matches(family_preference, repo_id)
+                preference_matches["model_family"] = "matched" if family_match else "fallback"
+                if family_match:
+                    final += 0.08
+                else:
+                    warnings.append(f"preferred model family {workload_profile.model_family_preference!r} was not matched")
+            backend_preference = str(workload_profile.backend_preference or "").strip().lower()
+            if backend_preference:
+                backend_match = backend.lower() == backend_preference
+                preference_matches["backend"] = "matched" if backend_match else "fallback"
+                if backend_match:
+                    final += 0.08
+                else:
+                    warnings.append(f"preferred backend {workload_profile.backend_preference!r} was unavailable for this artifact")
+            if workload_profile.tool_calling or workload_profile.structured_output:
+                preference_matches["capabilities"] = "supported" if all(value == "supported" for value in capability_status.values()) else "unknown"
+                if all(value == "supported" for value in capability_status.values()):
+                    final += 0.04
+                elif capability_status:
+                    warnings.append("required tool/structured-output support is unknown from model metadata and must be verified")
+            if workload_profile.minimum_decode_tokens_per_second is not None or workload_profile.maximum_ttft_seconds is not None:
+                evidence.append("throughput and latency targets require verification on the deployed backend")
+            if workload_profile.minimum_quality is not None:
+                evidence.append("quality floor requires the requested versioned evaluation suite")
+        final = self._clamp01(final)
         if support_level == "UNSUPPORTED":
             final *= 0.55
         if excluded:
@@ -2912,8 +3261,6 @@ class RiftEngine:
             confidence += 0.15
         if candidate.get("config"):
             confidence += 0.15
-        if eval_evidence["present"]:
-            confidence += 0.10
         if base_models:
             confidence += 0.05
         if tags:
@@ -2921,9 +3268,13 @@ class RiftEngine:
         if license_name != "unknown":
             confidence += 0.07
         confidence = self._clamp01(confidence)
+        resource_hardware = dict(hardware)
+        if workload_profile:
+            resource_hardware["context_length"] = workload_profile.context_length
+            resource_hardware["concurrency"] = workload_profile.concurrency
         resource_estimate = self._artifact_resource_estimate(
             selected_variant,
-            hardware=hardware,
+            hardware=resource_hardware,
         )
         performance_estimate = self._candidate_performance_estimate(
             provenance=provenance,
@@ -2958,6 +3309,11 @@ class RiftEngine:
             "excluded": excluded,
             "exclusion_reason": exclusion_reason,
             "final_score": round(final, 6),
+            "workload_match": {
+                "objective": workload_profile.objective if workload_profile else "balanced",
+                "preferences": preference_matches,
+                "capabilities": capability_status,
+            },
             "confidence": round(confidence, 6),
             "scores": {
                 "hardware_fit": round(hardware_fit, 6),
@@ -2971,7 +3327,7 @@ class RiftEngine:
                 "popularity": round(popularity, 6),
             },
             "score_boundaries": {
-                "quality_proxy": "Task/model metadata plus attributed evaluation records; not a local quality benchmark.",
+                "quality_proxy": "Task/model metadata plus comparable public evaluation evidence where available; not a local quality benchmark.",
                 "behavioral_safety": "Metadata evidence only; not a guarantee of safe outputs.",
                 "license_trust": "Presence and clarity of declared license metadata; legal review is still required.",
                 "artifact_integrity": "Required-file hash coverage and serialization safety, independent of model behavior.",
@@ -3332,6 +3688,7 @@ class RiftEngine:
             "selection_score": selection_score,
             "selection_reason": selection_reason,
             "final_score": item["final_score"],
+            "workload_match": item.get("workload_match", {"objective": "balanced", "preferences": {}}),
             "confidence": item["confidence"],
             "scores": item["scores"],
             "format": item["format"],
@@ -3352,6 +3709,7 @@ class RiftEngine:
             "backend": item["backend"],
             "backend_candidates": item.get("backend_candidates", []),
             "evaluation_evidence": item.get("evaluation_evidence", {}),
+            "public_evaluation_comparison": item.get("public_evaluation_comparison", {}),
             "evidence_provenance": item.get("evidence_provenance", {}),
             "quality_evidence": item.get("quality_evidence", {}),
             "evidence_freshness": item.get("evidence_freshness", "unknown"),
@@ -3372,6 +3730,7 @@ class RiftEngine:
             "model_identity": item.get("model_identity"),
             "revision": item.get("revision"),
             "final_score": item["final_score"],
+            "workload_match": item.get("workload_match", {"objective": "balanced", "preferences": {}}),
             "confidence": item["confidence"],
             "scores": item["scores"],
             "format": item["format"],
@@ -3399,6 +3758,7 @@ class RiftEngine:
             "backend": item["backend"],
             "backend_candidates": item.get("backend_candidates", []),
             "evaluation_evidence": item.get("evaluation_evidence", {}),
+            "public_evaluation_comparison": item.get("public_evaluation_comparison", {}),
             "evidence_provenance": item.get("evidence_provenance", {}),
             "quality_evidence": item.get("quality_evidence", {}),
             "evidence_freshness": item.get("evidence_freshness", "unknown"),

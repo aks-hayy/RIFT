@@ -16,6 +16,91 @@ ACTIONS = frozenset({"download", "install", "temporary_launch", "restart", "prom
 LIMITS = frozenset({"exploration_seconds", "max_artifacts", "tuning_candidates", "per_artifact_bytes", "total_download_bytes"})
 
 
+def validate_json_schema(value: Any, *, max_bytes: int = 256 * 1024) -> dict[str, Any]:
+    """Validate the portable JSON-Schema subset accepted by workload runs.
+
+    RIFT stores the exact schema in the contract and evaluates it locally.  A
+    full JSON-Schema implementation is intentionally not a dependency of the
+    controller, so this check validates the schema's shape and the evaluator
+    supports the common object/array/primitive keywords.  Unknown keywords are
+    retained for forward compatibility and never grant permissions.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("output schema must be a JSON object")
+    try:
+        encoded = canonical_json(value).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("output schema must contain JSON-safe values") from exc
+    if len(encoded) > max_bytes:
+        raise ValueError(f"output schema exceeds the {max_bytes // 1024} KiB limit")
+
+    def visit(node: Any, depth: int = 0) -> None:
+        if depth > 32:
+            raise ValueError("output schema nesting exceeds 32 levels")
+        if isinstance(node, bool):
+            return
+        if not isinstance(node, Mapping):
+            raise ValueError("every subschema must be an object or boolean")
+        unsupported_assertions = {
+            "$ref", "$dynamicRef", "patternProperties", "propertyNames",
+            "dependentRequired", "dependentSchemas", "discriminator",
+            "minProperties", "maxProperties", "minItems", "maxItems",
+            "uniqueItems", "minimum", "maximum", "exclusiveMinimum",
+            "exclusiveMaximum", "multipleOf", "maxLength",
+            "contentEncoding", "contentMediaType",
+        }
+        found_unsupported = sorted(unsupported_assertions.intersection(node))
+        if found_unsupported:
+            raise ValueError("output schema uses unsupported assertion(s): " + ", ".join(found_unsupported))
+        if "$schema" in node and not isinstance(node["$schema"], str):
+            raise ValueError("output schema $schema must be a string")
+        if "$id" in node and not isinstance(node["$id"], str):
+            raise ValueError("output schema $id must be a string")
+        if "format" in node and node["format"] not in {"date", "date-time"}:
+            raise ValueError("output schema format must be date or date-time")
+        schema_type = node.get("type")
+        if schema_type is not None:
+            types = schema_type if isinstance(schema_type, list) else [schema_type]
+            if not types or any(not isinstance(item, str) or item not in {"null", "boolean", "object", "array", "number", "integer", "string"} for item in types):
+                raise ValueError("output schema type contains an unsupported value")
+        required = node.get("required")
+        if required is not None and (not isinstance(required, list) or any(not isinstance(item, str) or not item for item in required) or len(set(required)) != len(required)):
+            raise ValueError("output schema required must be a unique string array")
+        if "enum" in node and (not isinstance(node["enum"], list) or not node["enum"]):
+            raise ValueError("output schema enum must be a non-empty array")
+        properties = node.get("properties")
+        if properties is not None:
+            if not isinstance(properties, Mapping):
+                raise ValueError("output schema properties must be an object")
+            for child in properties.values():
+                visit(child, depth + 1)
+        additional = node.get("additionalProperties")
+        if additional is not None and not isinstance(additional, (bool, Mapping)):
+            raise ValueError("output schema additionalProperties must be boolean or schema")
+        if isinstance(additional, Mapping):
+            visit(additional, depth + 1)
+        items = node.get("items")
+        if items is not None:
+            if isinstance(items, list):
+                for child in items:
+                    visit(child, depth + 1)
+            else:
+                visit(items, depth + 1)
+        for key in ("allOf", "anyOf", "oneOf", "prefixItems"):
+            branches = node.get(key)
+            if branches is not None:
+                if not isinstance(branches, list):
+                    raise ValueError(f"output schema {key} must be an array")
+                for child in branches:
+                    visit(child, depth + 1)
+        for key in ("not", "if", "then", "else", "contains", "propertyNames", "unevaluatedProperties", "unevaluatedItems"):
+            if key in node and isinstance(node[key], (Mapping, bool)):
+                visit(node[key], depth + 1)
+
+    visit(value)
+    return json.loads(canonical_json(value))
+
+
 def default_execution_policy(*, target: str = "local") -> dict[str, Any]:
     """Return a conservative, editable policy template for the easy path.
 
@@ -131,7 +216,13 @@ def validate_workload_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     ask questions. They cannot drop them to obtain an approvable contract.
     Numeric requirements are never accepted without units/meaning in the schema.
     """
-    result = _exact_fields(value, {"schema_version", "task", "objective", "performance", "quality", "capabilities", "policies", "service"}, "workload contract")
+    required_fields = {"schema_version", "task", "objective", "performance", "quality", "capabilities", "policies", "service"}
+    allowed_fields = required_fields | {"output_schema", "monitoring"}
+    if not isinstance(value, Mapping):
+        raise ValueError("workload contract must be an object")
+    if set(value) - allowed_fields or required_fields - set(value):
+        raise ValueError(f"workload contract: missing {sorted(required_fields - set(value))}; unsupported {sorted(set(value) - allowed_fields)}")
+    result = dict(value)
     if type(result["schema_version"]) is not int or result["schema_version"] != 1:
         raise ValueError("unsupported workload contract version")
     if result["task"] not in {"chat", "coding", "documents", "rag"} or result["objective"] not in {"balanced", "speed", "cost"}:
@@ -158,6 +249,32 @@ def validate_workload_contract(value: Mapping[str, Any]) -> dict[str, Any]:
     caps = _exact_fields(result["capabilities"], {"tool_calling", "structured_output"}, "capabilities")
     if any(type(v) is not bool for v in caps.values()):
         raise ValueError("capabilities require explicit booleans")
+    if "output_schema" in result:
+        artifact = _exact_fields(result["output_schema"], {"schema", "sha256", "filename", "media_type"}, "output_schema")
+        schema = validate_json_schema(artifact["schema"])
+        if not isinstance(artifact["sha256"], str) or artifact["sha256"] != content_hash(schema):
+            raise ValueError("output schema sha256 does not match its contents")
+        if not isinstance(artifact["filename"], str) or not artifact["filename"].strip() or artifact["filename"] != artifact["filename"].split("\\")[-1].split("/")[-1]:
+            raise ValueError("output schema filename must be a basename")
+        if artifact["media_type"] != "application/schema+json":
+            raise ValueError("output schema media_type must be application/schema+json")
+        result["output_schema"] = {"schema": schema, "sha256": artifact["sha256"], "filename": artifact["filename"], "media_type": artifact["media_type"]}
+    if "monitoring" in result:
+        monitoring = _exact_fields(
+            result["monitoring"],
+            {"objectives", "observation_window_seconds", "probe_interval_seconds", "error_budget_seconds", "source"},
+            "monitoring",
+        )
+        if not isinstance(monitoring["objectives"], list) or not monitoring["objectives"]:
+            raise ValueError("monitoring objectives must be a non-empty array")
+        from .telemetry.objectives import normalize_objectives
+        monitoring["objectives"] = normalize_objectives(monitoring["objectives"])
+        for key in ("observation_window_seconds", "probe_interval_seconds", "error_budget_seconds"):
+            if type(monitoring[key]) not in (int, float) or not math.isfinite(float(monitoring[key])) or float(monitoring[key]) <= 0:
+                raise ValueError(f"monitoring {key} must be positive and finite")
+        if not isinstance(monitoring["source"], str) or not monitoring["source"].strip():
+            raise ValueError("monitoring source is required")
+        result["monitoring"] = monitoring
     policies = _exact_fields(result["policies"], {"network", "backend", "model_family"}, "policies")
     if policies["network"] not in {"offline", "approved_sources"}:
         raise ValueError("invalid workload network policy")

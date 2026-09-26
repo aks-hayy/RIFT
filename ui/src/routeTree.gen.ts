@@ -13,6 +13,7 @@ import { Route as WorkloadsRouteImport } from './routes/workloads'
 import { Route as TuningRouteImport } from './routes/tuning'
 import { Route as SetupRouteImport } from './routes/setup'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as OverviewRouteImport } from './routes/overview'
 import { Route as OperationsRouteImport } from './routes/operations'
 import { Route as NodesRouteImport } from './routes/nodes'
 import { Route as ModelsRouteImport } from './routes/models'
@@ -22,6 +23,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as NodesIndexRouteImport } from './routes/nodes.index'
 import { Route as DeploymentsIndexRouteImport } from './routes/deployments.index'
 import { Route as NodesIdRouteImport } from './routes/nodes.$id'
+import { Route as ModelsCatalogRouteImport } from './routes/models.catalog'
 import { Route as DeploymentsIdRouteImport } from './routes/deployments.$id'
 
 const WorkloadsRoute = WorkloadsRouteImport.update({
@@ -42,6 +44,11 @@ const SetupRoute = SetupRouteImport.update({
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OverviewRoute = OverviewRouteImport.update({
+  id: '/overview',
+  path: '/overview',
   getParentRoute: () => rootRouteImport,
 } as any)
 const OperationsRoute = OperationsRouteImport.update({
@@ -89,6 +96,11 @@ const NodesIdRoute = NodesIdRouteImport.update({
   path: '/$id',
   getParentRoute: () => NodesRoute,
 } as any)
+const ModelsCatalogRoute = ModelsCatalogRouteImport.update({
+  id: '/catalog',
+  path: '/catalog',
+  getParentRoute: () => ModelsRoute,
+} as any)
 const DeploymentsIdRoute = DeploymentsIdRouteImport.update({
   id: '/$id',
   path: '/$id',
@@ -99,14 +111,16 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/deployments': typeof DeploymentsRouteWithChildren
   '/groups': typeof GroupsRoute
-  '/models': typeof ModelsRoute
+  '/models': typeof ModelsRouteWithChildren
   '/nodes': typeof NodesRouteWithChildren
   '/operations': typeof OperationsRoute
+  '/overview': typeof OverviewRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
   '/tuning': typeof TuningRoute
   '/workloads': typeof WorkloadsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
+  '/models/catalog': typeof ModelsCatalogRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments/': typeof DeploymentsIndexRoute
   '/nodes/': typeof NodesIndexRoute
@@ -114,13 +128,15 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/groups': typeof GroupsRoute
-  '/models': typeof ModelsRoute
+  '/models': typeof ModelsRouteWithChildren
   '/operations': typeof OperationsRoute
+  '/overview': typeof OverviewRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
   '/tuning': typeof TuningRoute
   '/workloads': typeof WorkloadsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
+  '/models/catalog': typeof ModelsCatalogRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments': typeof DeploymentsIndexRoute
   '/nodes': typeof NodesIndexRoute
@@ -130,14 +146,16 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/deployments': typeof DeploymentsRouteWithChildren
   '/groups': typeof GroupsRoute
-  '/models': typeof ModelsRoute
+  '/models': typeof ModelsRouteWithChildren
   '/nodes': typeof NodesRouteWithChildren
   '/operations': typeof OperationsRoute
+  '/overview': typeof OverviewRoute
   '/settings': typeof SettingsRoute
   '/setup': typeof SetupRoute
   '/tuning': typeof TuningRoute
   '/workloads': typeof WorkloadsRoute
   '/deployments/$id': typeof DeploymentsIdRoute
+  '/models/catalog': typeof ModelsCatalogRoute
   '/nodes/$id': typeof NodesIdRoute
   '/deployments/': typeof DeploymentsIndexRoute
   '/nodes/': typeof NodesIndexRoute
@@ -151,11 +169,13 @@ export interface FileRouteTypes {
     | '/models'
     | '/nodes'
     | '/operations'
+    | '/overview'
     | '/settings'
     | '/setup'
     | '/tuning'
     | '/workloads'
     | '/deployments/$id'
+    | '/models/catalog'
     | '/nodes/$id'
     | '/deployments/'
     | '/nodes/'
@@ -165,11 +185,13 @@ export interface FileRouteTypes {
     | '/groups'
     | '/models'
     | '/operations'
+    | '/overview'
     | '/settings'
     | '/setup'
     | '/tuning'
     | '/workloads'
     | '/deployments/$id'
+    | '/models/catalog'
     | '/nodes/$id'
     | '/deployments'
     | '/nodes'
@@ -181,11 +203,13 @@ export interface FileRouteTypes {
     | '/models'
     | '/nodes'
     | '/operations'
+    | '/overview'
     | '/settings'
     | '/setup'
     | '/tuning'
     | '/workloads'
     | '/deployments/$id'
+    | '/models/catalog'
     | '/nodes/$id'
     | '/deployments/'
     | '/nodes/'
@@ -195,9 +219,10 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   DeploymentsRoute: typeof DeploymentsRouteWithChildren
   GroupsRoute: typeof GroupsRoute
-  ModelsRoute: typeof ModelsRoute
+  ModelsRoute: typeof ModelsRouteWithChildren
   NodesRoute: typeof NodesRouteWithChildren
   OperationsRoute: typeof OperationsRoute
+  OverviewRoute: typeof OverviewRoute
   SettingsRoute: typeof SettingsRoute
   SetupRoute: typeof SetupRoute
   TuningRoute: typeof TuningRoute
@@ -232,6 +257,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/overview': {
+      id: '/overview'
+      path: '/overview'
+      fullPath: '/overview'
+      preLoaderRoute: typeof OverviewRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/operations': {
@@ -297,6 +329,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof NodesIdRouteImport
       parentRoute: typeof NodesRoute
     }
+    '/models/catalog': {
+      id: '/models/catalog'
+      path: '/catalog'
+      fullPath: '/models/catalog'
+      preLoaderRoute: typeof ModelsCatalogRouteImport
+      parentRoute: typeof ModelsRoute
+    }
     '/deployments/$id': {
       id: '/deployments/$id'
       path: '/$id'
@@ -321,6 +360,17 @@ const DeploymentsRouteWithChildren = DeploymentsRoute._addFileChildren(
   DeploymentsRouteChildren,
 )
 
+interface ModelsRouteChildren {
+  ModelsCatalogRoute: typeof ModelsCatalogRoute
+}
+
+const ModelsRouteChildren: ModelsRouteChildren = {
+  ModelsCatalogRoute: ModelsCatalogRoute,
+}
+
+const ModelsRouteWithChildren =
+  ModelsRoute._addFileChildren(ModelsRouteChildren)
+
 interface NodesRouteChildren {
   NodesIdRoute: typeof NodesIdRoute
   NodesIndexRoute: typeof NodesIndexRoute
@@ -337,9 +387,10 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   DeploymentsRoute: DeploymentsRouteWithChildren,
   GroupsRoute: GroupsRoute,
-  ModelsRoute: ModelsRoute,
+  ModelsRoute: ModelsRouteWithChildren,
   NodesRoute: NodesRouteWithChildren,
   OperationsRoute: OperationsRoute,
+  OverviewRoute: OverviewRoute,
   SettingsRoute: SettingsRoute,
   SetupRoute: SetupRoute,
   TuningRoute: TuningRoute,

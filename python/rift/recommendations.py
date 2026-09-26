@@ -174,6 +174,7 @@ class RecommendationStore:
                         "created_unix_seconds": payload.get("created_unix_seconds"),
                         "task": payload.get("task")
                         or (payload.get("workload_profile") or {}).get("task"),
+                        "request_fingerprint": payload.get("request_fingerprint"),
                         "status": payload.get("status"),
                         "path": str(path),
                     }

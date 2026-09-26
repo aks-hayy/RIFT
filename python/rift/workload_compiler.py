@@ -14,7 +14,7 @@ import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
-from .execution_policy import content_hash
+from .execution_policy import content_hash, validate_json_schema
 
 
 _NUMBER = r"(?:\d+(?:[.,]\d+)?)"
@@ -85,12 +85,34 @@ def _bool_explicit(value: Any) -> bool | None:
     return None
 
 
+def _schema_artifact(value: Any, *, filename: str | None = None) -> dict[str, Any]:
+    """Normalize an uploaded JSON Schema into a contract artifact."""
+    if isinstance(value, Mapping) and "schema" in value and "sha256" in value:
+        schema_value = value.get("schema")
+        filename = filename or str(value.get("filename") or "output-schema.json")
+    else:
+        schema_value = value
+        filename = filename or "output-schema.json"
+    schema = validate_json_schema(schema_value)
+    safe_name = str(filename).replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise ValueError("output schema filename must be a non-empty basename")
+    return {
+        "schema": schema,
+        "sha256": content_hash(schema),
+        "filename": safe_name,
+        "media_type": "application/schema+json",
+    }
+
+
 def compile_workload(
     request: Any,
     *,
     draft_id: str | None = None,
     revision: int = 1,
     confirm_default_quality: bool = False,
+    output_schema: Mapping[str, Any] | None = None,
+    output_schema_filename: str | None = None,
 ) -> dict[str, Any]:
     """Compile JSON/mapping or natural language into a reviewable draft."""
     structured = isinstance(request, Mapping)
@@ -114,7 +136,11 @@ def compile_workload(
     if objective_raw not in {"balanced", "speed", "cost"}:
         if re.search(r"\b(cost|joule|energy|cheap|efficient)\b", text, re.I):
             objective_raw, objective_evidence = "cost", "cost/energy language"
-        elif re.search(r"\b(speed|fast|throughput|tokens?|tok)\s*(?:/|per)?\s*s?\b|\blatency\b", text, re.I):
+        elif re.search(
+            r"\b(?:speed|fast|throughput|latency|tps)\b|\b(?:tokens?|tok)\s*(?:/|per)\s*(?:s|sec(?:ond)?)\b",
+            text,
+            re.I,
+        ):
             objective_raw, objective_evidence = "speed", "speed/throughput language"
         else:
             objective_raw, objective_evidence = "balanced", "policy default"
@@ -135,7 +161,18 @@ def compile_workload(
     decode = _number(decode_value)
     decode_evidence = f"$.{decode_key}" if decode_key else None
     if decode is None:
-        decode, decode_evidence = _first_number(text, [rf"(?:at least|minimum|min(?:imum)?|target)[^0-9]{{0,20}}({_NUMBER})\s*(?:tokens?|tok)(?:\s+per)?\s*/?\s*s", rf"(?:decode|throughput)[^0-9]{{0,20}}({_NUMBER})\s*(?:tokens?|tok)(?:\s+per)?\s*/?\s*s"])
+        # Accept the forms people naturally use in a workload request:
+        # ``tokens/s``, ``tokens per s`` and ``tokens per second``.  The
+        # previous expression only accepted the abbreviated ``s`` form, so a
+        # perfectly explicit NL requirement could silently become null.
+        rate_unit = r"(?:decode\s*)?(?:tokens?|tok)(?:\s+per)?\s*(?:/\s*)?(?:s(?:ec(?:ond)?)?)"
+        decode, decode_evidence = _first_number(
+            text,
+            [
+                rf"(?:at least|minimum|min(?:imum)?|target)[^0-9]{{0,30}}({_NUMBER})\s*{rate_unit}",
+                rf"(?:decode|throughput)[^0-9]{{0,30}}({_NUMBER})\s*{rate_unit}",
+            ],
+        )
     if decode is None:
         decode = None
         decode_evidence = None
@@ -163,7 +200,11 @@ def compile_workload(
     context = _integer(context_value)
     context_evidence = f"$.{context_key}" if context_key else None
     if context is None:
-        match = re.search(rf"({_NUMBER})\s*(k|m)?\s*(?:context|context window)", text, re.I)
+        match = re.search(
+            rf"({_NUMBER})\s*(k|m)?\s*(?:tokens?\s*)?(?:context(?:\s+window)?)",
+            text,
+            re.I,
+        )
         if not match:
             match = re.search(rf"(?:context|context window)[^0-9]{{0,10}}({_NUMBER})\s*(k|m)?", text, re.I)
         if match:
@@ -235,18 +276,39 @@ def compile_workload(
     structured_value = _nested(data, "capabilities", "structured_output") if structured else None
     structured_output = _bool_explicit(structured_value)
     if structured_output is None:
-        structured_output = bool(re.search(r"strict (?:json|schema)|structured output|gbnf|json schema", text, re.I))
+        structured_output = bool(re.search(
+            r"strict (?:json|schema)|structured output|gbnf|json schema|"
+            r"\bjson\s+(?:output|format|only|required)\b|\breturn\b[^.]{0,40}\bjson\b",
+            text,
+            re.I,
+        ))
         mark("/capabilities/structured_output", "structured-output language" if structured_output else "not required by default", "inferred" if structured_output else "default")
     else:
         mark("/capabilities/structured_output", str(structured_value), "explicit")
 
-    # A request that names an organisation's schema needs the actual,
-    # versioned schema (or a registered evaluator) before approval.  A bare
-    # JSON-validity check would not prove that the output matches an EHR
-    # contract, so keep this as an explicit review question instead of
-    # silently downgrading it to the generic text suite.
-    if structured_output and re.search(r"\b(?:ehr|electronic health record|our)\s+schema\b", text, re.I):
-        questions.append("Provide a versioned EHR JSON Schema or registered evaluator before approval; JSON syntax alone is insufficient.")
+    # A strict JSON requirement is only executable when the exact schema is
+    # attached.  The schema may arrive as a UI/API upload or as a structured
+    # workload field; the explicit function argument wins when both exist.
+    schema_value: Any = output_schema
+    if schema_value is None and structured:
+        if "output_schema" in data:
+            schema_value = data.get("output_schema")
+        elif "json_schema" in data:
+            schema_value = data.get("json_schema")
+    schema_artifact: dict[str, Any] | None = None
+    if schema_value is not None:
+        schema_artifact = _schema_artifact(schema_value, filename=output_schema_filename)
+        mark("/output_schema", f"uploaded JSON Schema {schema_artifact['filename']} ({schema_artifact['sha256'][:12]}…)", "explicit", enforcement="hard")
+    elif structured_output:
+        if re.search(r"\b(?:ehr|electronic health record|our)\s+schema\b", text, re.I):
+            questions.append("Strict JSON output is required. Upload the versioned EHR JSON Schema before approval so RIFT can validate conformance.")
+        else:
+            questions.append("Strict JSON output is required. Upload a JSON Schema file before approval so RIFT can validate conformance.")
+        mark("/output_schema", "required for strict JSON acceptance", "default", confidence=0.0, enforcement="hard")
+
+    # Organisation-specific schemas (for example EHR contracts) are handled by
+    # the same uploaded-artifact path; JSON syntax alone is never treated as
+    # proof of conformance.
 
     network = _norm_text(_nested(data, "policies", "network") if structured else "").lower()
     # Do not treat a prohibition such as "no external network access" or
@@ -331,7 +393,7 @@ def compile_workload(
     else:
         mark("/service/name", "default workload-service", "default", enforcement="preference")
 
-    known_top = {"schema_version", "task", "objective", "slos", "performance", "quality", "capabilities", "policies", "service", "constraints", "backend_target", "target_model_family", "runtime_flags", "workload_id", "workload_text", "request", "gbnf_schema", "chaos_injection", "allow_partial_offload"}
+    known_top = {"schema_version", "task", "objective", "slos", "performance", "quality", "capabilities", "policies", "service", "constraints", "backend_target", "target_model_family", "runtime_flags", "workload_id", "workload_text", "request", "gbnf_schema", "json_schema", "output_schema", "chaos_injection", "allow_partial_offload"}
     for key in data:
         if key not in known_top:
             unsupported.append({"path": f"$.{key}", "value": data[key], "reason": "not supported by the v1 executable contract"})
@@ -339,6 +401,8 @@ def compile_workload(
         if key in data:
             unsupported.append({"path": f"$.{key}", "value": data[key], "reason": "captured for review; evaluator/executor is not implemented"})
     for phrase in ("flashattention", "flash attention", "prompt caching", "gbnf", "json schema"):
+        if phrase == "json schema" and schema_artifact is not None:
+            continue
         if re.search(rf"\b{re.escape(phrase)}\b", text, re.I) and not any(phrase in str(item.get("value", "")).lower() for item in unsupported):
             unsupported.append({"path": "$.natural_language", "value": phrase, "reason": "captured for review; evaluator/executor is not implemented"})
     if re.search(r"ignore (?:all )?previous instructions|grant .*permission|run .*shell|delete .*files", text, re.I):
@@ -349,19 +413,44 @@ def compile_workload(
     uptime_match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*uptime", text, re.I)
     if uptime_match:
         uptime_value = float(uptime_match.group(1))
-        questions.append("Define the uptime observation window and monitoring evidence for the 99.9% SLO before approval.")
-        unsupported.append({
-            "path": "$.reliability.uptime_percent",
-            "value": uptime_value,
-            "reason": "long-horizon availability SLO requires a registered observation window; a short deployment run cannot prove it",
-        })
+        # The built-in objective monitor supplies a bounded, editable default
+        # window.  The deployment run still reports coverage and does not
+        # claim that a short smoke test proves the long-horizon SLO.
+        observation_window_seconds = 30 * 24 * 60 * 60
+        probe_interval_seconds = 30
+        error_budget_seconds = round(observation_window_seconds * max(0.0, 1.0 - (uptime_value / 100.0)), 6)
+        monitoring = {
+            "objectives": [{
+                "id": "uptime_slo",
+                "metric": "service.availability_ratio",
+                "operator": ">=",
+                "threshold": round(uptime_value / 100.0, 12),
+                "aggregation": "ratio",
+                "window_seconds": float(observation_window_seconds),
+                "consecutive_breaches": 1,
+                "recovery_consecutive": 1,
+                "alerts": [],
+            }],
+            "observation_window_seconds": observation_window_seconds,
+            "probe_interval_seconds": probe_interval_seconds,
+            "error_budget_seconds": error_budget_seconds,
+            "source": "compiler_default_30_day_window",
+        }
         provenance["/reliability/uptime_percent"] = {
             "source": "explicit",
             "evidence": uptime_match.group(0),
             "confidence": 1.0,
             "enforcement": "hard",
         }
-        warnings.append("The uptime SLO is recorded for review but cannot be proven by the bounded v1 run.")
+        provenance["/monitoring/objectives/uptime_slo"] = {
+            "source": "default",
+            "evidence": "built-in service objective monitor",
+            "confidence": 0.8,
+            "enforcement": "hard",
+        }
+        warnings.append("99.9% uptime was mapped to the built-in availability monitor with a default 30-day observation window; review the window before approval. A short run cannot prove the full SLO.")
+    else:
+        monitoring = None
 
     contract = {
         "schema_version": 1,
@@ -381,6 +470,20 @@ def compile_workload(
         "policies": policies,
         "service": {"name": service_name},
     }
+    if tool_required:
+        warnings.append(
+            "RIFT will verify core tool-call emission for the exact deployment; real tool execution, brokering, permissions, and side effects remain the user's harness responsibility."
+        )
+        provenance["/capabilities/tool_calling_scope"] = {
+            "source": "default",
+            "evidence": "RIFT capability boundary",
+            "confidence": 1.0,
+            "enforcement": "policy",
+        }
+    if schema_artifact is not None:
+        contract["output_schema"] = schema_artifact
+    if monitoring is not None:
+        contract["monitoring"] = monitoring
     # Explicitly preserve unsupported input as provenance, never executable fields.
     if unsupported:
         provenance["/unsupported_requirements"] = {"source": "explicit", "evidence": "structured input", "confidence": 1.0, "enforcement": "hard"}

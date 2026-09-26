@@ -481,12 +481,24 @@ class HfHubClient:
     def cache_status(self) -> dict[str, Any]:
         files = list(self.cache_dir.glob("*.json")) if self.cache_dir.is_dir() else []
         total = sum(path.stat().st_size for path in files if path.is_file())
+        created = []
+        for path in files:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                timestamp = float(value.get("created_unix_seconds") or 0.0)
+                if timestamp > 0:
+                    created.append(timestamp)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+        now = time.time()
         return {
             "path": str(self.cache_dir),
             "entry_count": len(files),
             "bytes": total,
             "maximum_bytes": self.cache_max_bytes,
             "ttl_seconds": self.cache_ttl_seconds,
+            "oldest_entry_age_seconds": max(0.0, now - min(created)) if created else None,
+            "newest_entry_age_seconds": max(0.0, now - max(created)) if created else None,
         }
 
     def _prune_cache(self) -> None:

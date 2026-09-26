@@ -99,6 +99,13 @@ class RiftServerRuntime:
                     # from coming up; the affected service remains subject to
                     # the normal degraded-state reconciliation path.
                     pass
+            if runtime_root is not None:
+                try:
+                    TuningStore(Path(runtime_root) / "tuning.db").reclaim_orphaned_leases()
+                except Exception:
+                    # Stale tuning cleanup is best effort and must not prevent
+                    # the controller from serving the rest of the API.
+                    pass
 
     @staticmethod
     def is_background_operation(path: str) -> bool:
@@ -570,16 +577,31 @@ class RiftServerRuntime:
             return orchestrator.load_evaluation(run_id)
         if path == "/api/rift/v2/tuning/capabilities":
             from .tuning_adapters import tuning_adapter
+            from .backends import backend_catalog
             name = str(((query or {}).get("service") or ["chat"])[0])
             service = (orchestrator.read_state().get("services") or {}).get(name)
             if not isinstance(service, dict):
                 raise KeyError(name)
             backend = service.get("backend")
+            static_manifest = backend_catalog().get(str(backend or ""))
             provider = orchestrator.providers.get(backend)
             adapter = tuning_adapter(backend, provider) if provider else None
             if adapter is None:
-                return {"service": name, "backend": backend, "profiles": [], "parameters": [], "available": False}
-            return {**adapter.probe(service), "service": name, "available": True}
+                return {
+                    "service": name,
+                    "backend": backend,
+                    "profiles": list(static_manifest.tuning_profiles) if static_manifest else [],
+                    "parameters": list(static_manifest.tuning_parameters) if static_manifest else [],
+                    "manifest": static_manifest.to_dict() if static_manifest else None,
+                    "available": False,
+                    "reason": "no tuning adapter is registered for this backend",
+                }
+            return {
+                **adapter.probe(service),
+                "service": name,
+                "manifest": static_manifest.to_dict() if static_manifest else None,
+                "available": True,
+            }
         if path == "/api/rift/v2/tuning/profiles":
             return {
                 "api_version": "1",
@@ -628,9 +650,13 @@ class RiftServerRuntime:
         if path in ("/api/rift/settings", "/api/rift/v2/settings"):
             return orchestrator.settings_snapshot()
         if path == "/api/rift/v2/adapters":
+            from .backends import backend_catalog
+
+            catalog = backend_catalog()
             return {
                 "api_version": "2",
                 "registry": orchestrator.backend_host.diagnostics(),
+                "backend_catalog": catalog.diagnostics(),
                 "adapters": [
                     {
                         "adapter_id": adapter_id,
@@ -746,8 +772,12 @@ class RiftServerRuntime:
                 raise KeyError(path)
             return value
         if path == "/api/rift/v2/capabilities":
+            from .backends import backend_catalog
+
+            catalog = backend_catalog()
             return {
                 "api_version": "2",
+                "backend_catalog": catalog.diagnostics(),
                 "backend_adapters": {
                     name: adapter.manifest.capability.to_dict()
                     for name, adapter in sorted(orchestrator.providers.items())
@@ -906,7 +936,12 @@ class RiftServerRuntime:
             request = payload.get("workload", payload.get("input", payload.get("request")))
             if request is None:
                 raise ValueError("workload, input, or request is required")
-            compiled = compile_workload(request)
+            schema_payload = payload.get("output_schema")
+            compiled = compile_workload(
+                request,
+                output_schema=schema_payload if isinstance(schema_payload, dict) else None,
+                output_schema_filename=str(payload.get("output_schema_filename") or "") or None,
+            )
             if bool(payload.get("persist", True)):
                 return self.workload_store().save_draft(
                     compiled["contract"],
@@ -943,6 +978,7 @@ class RiftServerRuntime:
                 models_dir=str(payload.get("models_dir") or "") or None,
                 model_ref=str(payload.get("model_ref") or "") or None,
                 candidate_limit=int(payload.get("candidate_limit") or 3),
+                search_candidate_limit=int(payload.get("search_candidate_limit") or 250),
                 tune=bool(payload.get("tune", True)),
                 progress=progress,
             )
@@ -1180,6 +1216,9 @@ class RiftServerRuntime:
                 token=payload.get("token"),
                 run_store_root=str(orchestrator.rift_dir),
                 model_ref=str(payload.get("model_ref") or "") or None,
+                workload_contract=payload.get("workload_contract"),
+                search_candidate_limit=(int(payload["search_candidate_limit"]) if payload.get("search_candidate_limit") is not None else None),
+                allowed_licenses=payload.get("allowed_licenses"),
             )
         if path == "/api/rift/v2/compatibility":
             artifact = payload.get("artifact")
@@ -1361,11 +1400,14 @@ class RiftServerRuntime:
                     task=str(payload.get("task") or "chat"),
                     models_dir=models_dir,
                     top=int(payload.get("top") or 10),
+                    workload_contract=payload.get("workload_contract"),
                 )
             return orchestrator.engine.recommend_models(
                 task=str(payload.get("task") or "chat"),
                 top=int(payload.get("top") or 10),
                 candidate_limit=int(payload.get("candidate_limit") or 200),
+                endpoint=str(payload.get("endpoint") or "https://huggingface.co"),
+                token=payload.get("token"),
                 max_download_gb=(
                     float(payload["max_download_gb"])
                     if payload.get("max_download_gb") is not None
@@ -1378,6 +1420,9 @@ class RiftServerRuntime:
                 disk_reserve_gb=float(payload.get("disk_reserve_gb") or 2.0),
                 run_store_root=str(orchestrator.rift_dir),
                 model_ref=str(payload.get("model_ref") or "") or None,
+                workload_contract=payload.get("workload_contract"),
+                search_candidate_limit=(int(payload["search_candidate_limit"]) if payload.get("search_candidate_limit") is not None else None),
+                allowed_licenses=payload.get("allowed_licenses"),
             )
         if path == "/api/rift/calibrate":
             return orchestrator.calibrate_hardware(
@@ -1623,7 +1668,24 @@ class RiftServerRuntime:
             raise ValueError("workload, input, or request is required")
         draft_id = parts[4]
         expected_revision = int(payload.get("revision") or payload.get("expected_revision") or 0)
-        compiled = compile_workload(request, draft_id=draft_id, revision=expected_revision + 1)
+        schema_payload = payload.get("output_schema")
+        # Editing a draft should not silently detach an already-approved
+        # schema.  Callers can explicitly send ``output_schema: null`` when
+        # they intend to remove it (which will make strict JSON approval block
+        # again); omission preserves the prior artifact across revisions.
+        if "output_schema" not in payload:
+            try:
+                previous = self.workload_store().get_draft(draft_id, revision=expected_revision)
+                schema_payload = (previous.get("contract") or {}).get("output_schema")
+            except KeyError:
+                schema_payload = None
+        compiled = compile_workload(
+            request,
+            draft_id=draft_id,
+            revision=expected_revision + 1,
+            output_schema=schema_payload if isinstance(schema_payload, dict) else None,
+            output_schema_filename=str(payload.get("output_schema_filename") or "") or None,
+        )
         saved = self.workload_store().save_draft(
             compiled["contract"],
             provenance=compiled["provenance"],

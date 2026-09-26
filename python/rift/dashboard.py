@@ -415,10 +415,14 @@ def _create_static_server(host: str, port: int, control_api_url: str) -> Threadi
     root = bundled_dashboard_root()
     route_files = {
         "/": "/index.html",
+        "/overview": "/overview.html",
+        "/workloads": "/workloads.html",
         "/setup": "/setup.html",
         "/deployments": "/deployments.html",
         "/nodes": "/nodes.html",
         "/models": "/models.html",
+        "/models/catalog": "/models-catalog.html",
+        "/groups": "/groups.html",
         "/operations": "/operations.html",
         "/tuning": "/tuning.html",
         "/settings": "/settings.html",
@@ -509,6 +513,12 @@ def _create_static_server(host: str, port: int, control_api_url: str) -> Threadi
                 return
             if parsed.path in route_files:
                 self.path = route_files[parsed.path]
+            elif parsed.path.startswith("/deployments/"):
+                self.path = "/deployments.html"
+            elif parsed.path.startswith("/nodes/"):
+                self.path = "/nodes.html"
+            elif parsed.path.startswith("/models/"):
+                self.path = "/models.html"
             candidate = root / urlparse(self.path).path.lstrip("/")
             if not candidate.is_file() and not parsed.path.startswith("/assets/"):
                 self.path = "/index.html"

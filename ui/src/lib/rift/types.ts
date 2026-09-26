@@ -141,6 +141,13 @@ export interface RecommendationSearchResult {
     enriched: number;
     returned: number;
   };
+  cacheProvenance?: {
+    source: string;
+    refreshed: boolean;
+    ttlSeconds: number;
+    entryCount: number;
+    oldestEntryAgeSeconds?: number;
+  };
 }
 
 export interface ServiceEndpoint {
@@ -473,6 +480,32 @@ export interface OperationRecord {
 }
 
 export type TuningProfile = "speed" | "cost";
+export interface TuningParameterDescriptor {
+  name: string;
+  flag?: string;
+  group?: string;
+  kind?: string;
+  type?: string;
+  profiles?: TuningProfile[];
+  restart_required?: boolean;
+  platforms?: string[];
+}
+
+export interface TuningCapabilities {
+  apiVersion?: string;
+  service?: string;
+  backend?: string;
+  profiles?: TuningProfile[];
+  parameters?: TuningParameterDescriptor[];
+  groups?: string[];
+  qualification?: string;
+  acceleratorFamily?: string;
+  available?: boolean;
+  manifest?: Record<string, unknown> | null;
+  runtime?: Record<string, unknown>;
+  reason?: string;
+}
+
 export type TuningOutcome =
   | "queued"
   | "running"
@@ -850,6 +883,7 @@ export interface EnrollmentApproval {
 
 /** Union of every server-sent event on /events. */
 export type RiftEvent =
+  | { kind: "controller.connected" }
   | { kind: "node.enrolled"; node: RiftNode }
   | { kind: "node.status"; nodeId: NodeId; status: NodeStatus }
   | { kind: "plan.progress"; progress: ApplyProgress }

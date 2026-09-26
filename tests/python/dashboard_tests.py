@@ -37,8 +37,8 @@ def test_bundled_dashboard_has_rift_favicon():
     bundled = ROOT / "python" / "rift" / "web" / "static"
     html = (bundled / "index.html").read_text(encoding="utf-8")
     assert 'rel="icon"' in html
-    assert 'href="/rift-mark.svg"' in html
-    assert (bundled / "rift-mark.svg").is_file()
+    assert 'href="/rift-logo-concept-v9.png"' in html
+    assert (bundled / "rift-logo-concept-v9.png").is_file()
 
 
 def test_rich_dashboard_build_plan_is_detected():
@@ -154,6 +154,27 @@ def test_bundled_dashboard_proxies_controller_api_requests():
         controller_thread.join(timeout=2)
 
 
+def test_static_launcher_maps_workload_and_overview_routes_to_their_pages():
+    static = dashboard._create_static_server("127.0.0.1", 0, "http://127.0.0.1:1")
+    static_thread = threading.Thread(target=static.serve_forever, daemon=True)
+    static_thread.start()
+    try:
+        host, port = static.server_address
+        for route, filename in (
+            ("/workloads", "workloads.html"),
+            ("/overview", "overview.html"),
+            ("/deployments/service-1", "deployments.html"),
+            ("/nodes/node-1", "nodes.html"),
+        ):
+            with urlopen(f"http://{host}:{port}{route}", timeout=2) as response:
+                assert response.status == 200
+                assert response.read() == (dashboard.bundled_dashboard_root() / filename).read_bytes()
+    finally:
+        static.shutdown()
+        static.server_close()
+        static_thread.join(timeout=2)
+
+
 def main():
     test_dashboard_source_discovery_and_launch_plan()
     test_bundled_dashboard_has_rift_favicon()
@@ -162,6 +183,7 @@ def main():
     test_dashboard_root_environment_override()
     test_dashboard_validation_errors_are_actionable()
     test_bundled_dashboard_proxies_controller_api_requests()
+    test_static_launcher_maps_workload_and_overview_routes_to_their_pages()
     print("RIFT dashboard launcher tests passed")
 
 

@@ -87,11 +87,10 @@ function ControllerTab() {
         <KV label="Status" value={controllerStatus} />
         <KV label="URL" value={connection.root} />
         <KV label="Compatibility" value="live compatibility adapter" />
-        <KV label="Preview surfaces" value={connection.previewEnabled ? "enabled" : "disabled"} />
       </div>
       <p className="mt-4 max-w-2xl text-[12.5px] text-ink-secondary">
         This dashboard is connected to the live controller. The compatibility adapter translates the
-        current controller API into the dashboard contract; preview surfaces are disabled. Set{" "}
+        current controller API into the dashboard contract. Set{" "}
         <span className="rift-mono text-ink">VITE_RIFT_CONTROLLER_URL</span> only when the
         controller is not available through the same-origin proxy.
       </p>
