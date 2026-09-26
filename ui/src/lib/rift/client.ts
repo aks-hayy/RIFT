@@ -25,6 +25,8 @@ import type {
   MeshTopology,
   MeshService,
   MeshServiceGroup,
+  GatewayStatus,
+  GatewayGroupStatus,
   ManagedEnrollment,
   ManagedEnrollmentWindow,
   OperationRecord,
@@ -35,6 +37,7 @@ import type {
   RiftNode,
   Service,
   ResourceReport,
+  ResourceHistory,
   ServiceTelemetryAccounting,
   TelemetrySample,
   TelemetrySession,
@@ -44,6 +47,12 @@ import type {
   TuningOpportunity,
   BenchmarkProfile,
   BenchmarkSuiteRun,
+  TelemetryCatalog,
+  MonitoringObjective,
+  ObjectiveEvaluation,
+  ObjectiveEvent,
+  ObjectiveStatusPayload,
+  ObjectiveCatalog,
 } from "./types";
 import {
   applyRequest,
@@ -53,6 +62,7 @@ import {
 } from "./action-contract";
 import { mapBenchmarkReport } from "./report-mapping";
 import { deriveOperationDisplay } from "./operation-state";
+import { mapLocalArtifact } from "./local-artifacts";
 
 export class RiftUnavailable extends Error {
   constructor(
@@ -89,7 +99,7 @@ export class RiftApiError extends Error {
   }
 }
 
-type HttpMethod = "GET" | "POST" | "DELETE" | "PATCH";
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
 type JsonObject = Record<string, unknown>;
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -110,17 +120,6 @@ function configuredRoot(): string {
   if (root.endsWith("/api/rift")) return root;
   if (root.endsWith("/api/rift/v1")) return root.slice(0, -3);
   return `${root}/api/rift`;
-}
-
-function previewEnabled(): boolean {
-  const env = (
-    import.meta as ImportMeta & {
-      env: Record<string, string | boolean | undefined>;
-    }
-  ).env;
-  const configured = env.VITE_RIFT_PREVIEW_DATA;
-  if (typeof configured === "string") return configured.toLowerCase() === "true";
-  return env.DEV === true;
 }
 
 async function req<T>(
@@ -287,7 +286,9 @@ function mapMeshService(value: unknown): MeshService {
     modelId: text(raw.model_id, text(raw.modelId)),
     revision: text(raw.revision),
     task: text(raw.task, "chat"),
-    groups: list(raw.groups).map((item) => text(item)).filter(Boolean),
+    groups: list(raw.groups)
+      .map((item) => text(item))
+      .filter(Boolean),
     desiredReplicas: numeric(raw.desired_replicas, numeric(raw.desiredReplicas, 1)),
     policyHash: text(raw.policy_hash, text(raw.policyHash)) || undefined,
   };
@@ -297,9 +298,43 @@ function mapMeshServiceGroup(value: unknown): MeshServiceGroup {
   const raw = object(value);
   return {
     groupId: text(raw.group_id, text(raw.groupId)),
-    serviceIds: list(raw.service_ids).map((item) => text(item)).filter(Boolean),
+    serviceIds: list(raw.service_ids)
+      .map((item) => text(item))
+      .filter(Boolean),
     defaultService: text(raw.default_service, text(raw.defaultService)) || undefined,
     gatewayPath: text(raw.gateway_path, text(raw.gatewayPath)) || undefined,
+  };
+}
+
+function mapGatewayGroupStatus(value: unknown): GatewayGroupStatus {
+  const raw = object(value);
+  return {
+    kind: "group",
+    groupId: text(raw.group_id, text(raw.groupId)),
+    status: text(raw.status, "not_started"),
+    processAlive: bool(raw.process_alive ?? raw.processAlive),
+    host: text(raw.host) || undefined,
+    port: numeric(raw.port) || undefined,
+    gatewayPath: text(raw.gateway_path, text(raw.gatewayPath)) || undefined,
+    statePath: text(raw.state_path, text(raw.statePath)) || undefined,
+    serviceName: text(raw.service_name, text(raw.serviceName)) || undefined,
+  };
+}
+
+function mapGatewayStatus(value: unknown): GatewayStatus {
+  const raw = object(value);
+  return {
+    kind: "main",
+    status: text(raw.status, "not_started"),
+    configured: bool(raw.configured),
+    processAlive: bool(raw.process_alive ?? raw.processAlive),
+    host: text(raw.host) || undefined,
+    port: numeric(raw.port) || undefined,
+    serviceName: text(raw.service_name, text(raw.serviceName)) || undefined,
+    statePath: text(raw.state_path, text(raw.statePath)) || undefined,
+    metricsPath: text(raw.metrics_path, text(raw.metricsPath)) || undefined,
+    metrics: Object.keys(object(raw.metrics)).length ? object(raw.metrics) : undefined,
+    groups: list(raw.groups).map(mapGatewayGroupStatus),
   };
 }
 
@@ -375,6 +410,8 @@ function mapService(name: string, value: unknown): Service {
   const serving = object(raw.serving);
   const model = object(raw.model);
   const placement = object(raw.placement);
+  const monitoring = object(raw.monitoring);
+  const monitoringResources = object(monitoring.resources);
   const endpointText = text(runtime.openai_base, text(launch.openai_base));
   let scheme: "http" | "https" = "http";
   let host = text(serving.host, text(launch.host, "127.0.0.1"));
@@ -437,6 +474,21 @@ function mapService(name: string, value: unknown): Service {
       serving,
       gateway: object(raw.gateway),
       launchPlan: launch,
+      monitoring: {
+        ...monitoring,
+        objectives: list(monitoring.objectives).map(mapMonitoringObjective),
+        resources: {
+          ...monitoringResources,
+          profile: text(monitoringResources.profile) || undefined,
+          metrics: list(monitoringResources.metrics)
+            .map((metric) => text(metric))
+            .filter(Boolean),
+          sampleIntervalSeconds:
+            monitoringResources.sample_interval_seconds == null
+              ? undefined
+              : numeric(monitoringResources.sample_interval_seconds),
+        },
+      },
     },
   };
 }
@@ -526,9 +578,161 @@ function mapTelemetrySample(value: unknown): TelemetrySample {
     gpuVramPressurePercent:
       raw.gpu_vram_pressure_percent == null ? undefined : numeric(raw.gpu_vram_pressure_percent),
     gpuPowerWatts: raw.gpu_power_watts == null ? undefined : numeric(raw.gpu_power_watts),
+    requestErrorRatio:
+      raw["request.error_ratio"] == null ? undefined : numeric(raw["request.error_ratio"]),
+    serviceAvailabilityRatio:
+      raw["service.availability_ratio"] == null
+        ? undefined
+        : numeric(raw["service.availability_ratio"]),
+    requestAverageLatencySeconds:
+      raw["request.average_latency_seconds"] == null
+        ? undefined
+        : numeric(raw["request.average_latency_seconds"]),
+    requestLastLatencySeconds:
+      raw["request.last_latency_seconds"] == null
+        ? undefined
+        : numeric(raw["request.last_latency_seconds"]),
     availability: Object.fromEntries(
       Object.entries(object(raw.availability)).map(([key, item]) => [key, text(item)]),
     ),
+  };
+}
+
+function mapTelemetryCatalog(value: unknown): TelemetryCatalog {
+  const raw = object(value);
+  return {
+    apiVersion: text(raw.api_version, "1"),
+    defaultProfile: text(raw.default_profile, "default"),
+    metrics: list(raw.metrics).map((item) => {
+      const metric = object(item);
+      const kind = text(metric.kind, "gauge");
+      return {
+        id: text(metric.id),
+        label: text(metric.label, text(metric.id)),
+        description: text(metric.description),
+        unit: text(metric.unit),
+        kind: kind === "counter" || kind === "histogram" ? kind : "gauge",
+        scope: text(metric.scope, "service"),
+        source: text(metric.source, "unknown"),
+        default: metric.default === true,
+      };
+    }),
+    profiles: list(raw.profiles).map((item) => {
+      const profile = object(item);
+      return {
+        id: text(profile.id),
+        name: text(profile.name, text(profile.id)),
+        description: text(profile.description),
+        metrics: list(profile.metrics)
+          .map((metric) => text(metric))
+          .filter(Boolean),
+      };
+    }),
+  };
+}
+
+function mapMonitoringObjective(value: unknown): MonitoringObjective {
+  const raw = object(value);
+  return {
+    id: text(raw.id, text(raw.name)),
+    metric: text(raw.metric),
+    operator: text(raw.operator, "<="),
+    threshold: numeric(raw.threshold),
+    aggregation: text(raw.aggregation, "latest"),
+    windowSeconds: numeric(raw.window_seconds, numeric(raw.windowSeconds)),
+    consecutiveBreaches: numeric(raw.consecutive_breaches, numeric(raw.consecutiveBreaches, 1)),
+    recoveryConsecutive: numeric(raw.recovery_consecutive, numeric(raw.recoveryConsecutive, 1)),
+    warningThreshold: raw.warning_threshold == null ? undefined : numeric(raw.warning_threshold),
+    recoveryThreshold: raw.recovery_threshold == null ? undefined : numeric(raw.recovery_threshold),
+    alerts: list(raw.alerts)
+      .map((item) => text(item))
+      .filter(Boolean),
+  };
+}
+
+function mapObjectiveEvaluation(value: unknown): ObjectiveEvaluation {
+  const raw = object(value);
+  const status = text(raw.status, "unknown");
+  return {
+    objectiveId: text(raw.objective_id, text(raw.objectiveId)),
+    metric: text(raw.metric),
+    status: status === "pass" || status === "warning" || status === "breach" ? status : "unknown",
+    value: raw.value == null ? undefined : numeric(raw.value),
+    operator: text(raw.operator) || undefined,
+    threshold: raw.threshold == null ? undefined : numeric(raw.threshold),
+    warningThreshold: raw.warning_threshold == null ? undefined : numeric(raw.warning_threshold),
+    aggregation: text(raw.aggregation) || undefined,
+    windowSeconds: raw.window_seconds == null ? undefined : numeric(raw.window_seconds),
+    sampleCount: raw.sample_count == null ? undefined : numeric(raw.sample_count),
+    observedAt: raw.observed_at == null ? undefined : iso(raw.observed_at),
+    reason: text(raw.reason) || undefined,
+  };
+}
+
+function mapObjectiveEvent(value: unknown): ObjectiveEvent {
+  const raw = object(value);
+  const evaluation = mapObjectiveEvaluation(object(raw.payload).objective_id ? raw.payload : raw);
+  const previous = text(raw.previous_status, text(object(raw.payload).previous_status));
+  return {
+    ...evaluation,
+    eventId: text(raw.event_id) || undefined,
+    previousStatus:
+      previous === "pass" ||
+      previous === "warning" ||
+      previous === "breach" ||
+      previous === "unknown"
+        ? previous
+        : undefined,
+    serviceName: text(raw.service_name) || undefined,
+    nodeId: text(raw.node_id) || undefined,
+  };
+}
+
+function mapObjectiveStatus(value: unknown): ObjectiveStatusPayload {
+  const raw = object(value);
+  const session = object(raw.session);
+  return {
+    apiVersion: text(raw.api_version, "1"),
+    service: text(raw.service) || undefined,
+    nodeId: text(raw.node_id) || undefined,
+    session: Object.keys(session).length
+      ? {
+          sessionId: text(session.session_id) || undefined,
+          status: text(session.status) || undefined,
+          startedAt: session.started_at == null ? undefined : iso(session.started_at),
+          stoppedAt: session.stopped_at == null ? undefined : iso(session.stopped_at),
+        }
+      : null,
+    objectives: list(raw.objectives).map(mapMonitoringObjective),
+    evaluations: list(raw.evaluations).map(mapObjectiveEvaluation),
+    events: list(raw.events).map(mapObjectiveEvent),
+  };
+}
+
+function mapObjectiveCatalog(value: unknown): ObjectiveCatalog {
+  const raw = object(value);
+  return {
+    apiVersion: text(raw.api_version, "1"),
+    operators: list(raw.operators)
+      .map((item) => text(item))
+      .filter(Boolean),
+    aggregations: list(raw.aggregations)
+      .map((item) => text(item))
+      .filter(Boolean),
+    metrics: list(raw.metrics).map((item) => {
+      const metric = object(item);
+      const kind = text(metric.kind, "gauge");
+      return {
+        id: text(metric.id),
+        label: text(metric.label, text(metric.id)),
+        description: text(metric.description),
+        unit: text(metric.unit),
+        kind: kind === "counter" || kind === "histogram" ? kind : "gauge",
+        scope: text(metric.scope, "service"),
+        source: text(metric.source, "unknown"),
+        default: metric.default === true,
+      };
+    }),
   };
 }
 
@@ -558,6 +762,8 @@ function mapResourceReport(value: unknown): ResourceReport {
       basis: text(rawCosts.basis) || undefined,
     },
     coverage: object(raw.coverage),
+    objectives: list(raw.objectives).map(mapObjectiveEvaluation),
+    objectiveEvents: list(raw.objective_events).map(mapObjectiveEvent),
   };
 }
 
@@ -585,10 +791,50 @@ async function telemetryLatest(
   });
 }
 
+async function telemetryCatalog(signal?: AbortSignal): Promise<TelemetryCatalog> {
+  return mapTelemetryCatalog(await req<JsonObject>("GET", "/telemetry/catalog", undefined, signal));
+}
+
+async function telemetryObjectiveCatalog(signal?: AbortSignal): Promise<ObjectiveCatalog> {
+  return mapObjectiveCatalog(
+    await req<JsonObject>("GET", "/telemetry/objectives/catalog", undefined, signal),
+  );
+}
+
+async function telemetryObjectives(
+  service: string,
+  options: { events?: boolean; sessionId?: string } = {},
+  signal?: AbortSignal,
+): Promise<ObjectiveStatusPayload> {
+  const query = new URLSearchParams({ service });
+  if (options.events) query.set("events", "true");
+  if (options.sessionId) query.set("session_id", options.sessionId);
+  return mapObjectiveStatus(
+    await req<JsonObject>("GET", `/telemetry/objectives?${query}`, undefined, signal),
+  );
+}
+
 async function resourceReports(service?: string, signal?: AbortSignal): Promise<ResourceReport[]> {
   const query = service ? `?service=${encodeURIComponent(service)}` : "";
   const payload = await req<JsonObject>("GET", `/telemetry/reports${query}`, undefined, signal);
   return list(payload.reports).map(mapResourceReport);
+}
+
+async function resourceHistory(
+  sessionId: string,
+  metric: string,
+  seconds: number,
+  signal?: AbortSignal,
+): Promise<ResourceHistory> {
+  const until = Date.now() / 1000;
+  const query = new URLSearchParams({
+    session_id: sessionId,
+    metric,
+    since: String(until - seconds),
+    until: String(until),
+    buckets: "180",
+  });
+  return req<ResourceHistory>("GET", `/v2/telemetry/history?${query}`, undefined, signal);
 }
 
 async function serviceTelemetryAccounting(
@@ -903,10 +1149,7 @@ function mapRecommendation(value: unknown, index: number, runId?: string): Model
   const artifactMetadata = object(artifactSelection.metadata);
   const artifactId = text(
     artifactSelection.artifact_id,
-    text(
-      selectedArtifact.artifact_id,
-      text(raw.artifact_id, text(raw.selected_artifact_id, repo)),
-    ),
+    text(selectedArtifact.artifact_id, text(raw.artifact_id, text(raw.selected_artifact_id, repo))),
   );
   const selectedBytes = numeric(raw.selected_download_bytes);
   const estimatedBytes =
@@ -985,16 +1228,22 @@ async function recommend(input: {
   source: ModelArtifact["source"];
   localPath?: string;
   endpointUrl?: string;
+  modelRef?: string;
+  refresh?: boolean;
 }): Promise<ModelRecommendation[]> {
   return (await recommendDetailed(input)).recommendations;
 }
 
-async function latestCachedRecommendation(task: string): Promise<JsonObject | null> {
+async function latestCachedRecommendation(
+  task: string,
+  requestFingerprint: string,
+): Promise<JsonObject | null> {
   try {
     const index = await req<JsonObject>("GET", "/v2/recommendation-runs");
     for (const entry of list(index.runs)) {
       const summary = object(entry);
       if (text(summary.task, task) !== task) continue;
+      if (text(summary.request_fingerprint) !== requestFingerprint) continue;
       const runId = text(summary.run_id);
       if (!runId) continue;
       try {
@@ -1020,16 +1269,26 @@ async function recommendDetailed(input: {
   localPath?: string;
   endpointUrl?: string;
   modelRef?: string;
+  refresh?: boolean;
+  workloadContract?: JsonObject;
 }): Promise<RecommendationSearchResult> {
+  const discoveryTask =
+    input.useCase === "coding" || input.useCase === "documents"
+      ? input.useCase
+      : input.useCase === "agent"
+        ? "agent"
+        : "chat";
   if (input.source === "local") {
     const payload = await req<JsonObject>("POST", "/recommend", {
-      task: input.useCase === "coding" ? "coding" : "chat",
+      task: discoveryTask,
+      workload_contract: input.workloadContract,
+      refresh: input.refresh ?? false,
       source: "local",
       local_path: input.localPath,
       models_dir: input.localPath,
       top: 10,
     });
-    return mapRecommendationSearchResult(payload, input.useCase === "coding" ? "coding" : "chat");
+    return mapRecommendationSearchResult(payload, discoveryTask);
   }
   if (input.source !== "huggingface" && input.source !== "catalog") {
     throw new RiftUnavailable(
@@ -1040,7 +1299,9 @@ async function recommendDetailed(input: {
     );
   }
   const payload = await req<JsonObject>("POST", "/recommend", {
-    task: input.useCase === "coding" ? "coding" : "chat",
+    task: discoveryTask,
+    workload_contract: input.workloadContract,
+    refresh: input.refresh ?? false,
     top: 10,
     candidate_limit: 200,
     max_download_gb: 12,
@@ -1049,7 +1310,7 @@ async function recommendDetailed(input: {
     model_ref: input.modelRef,
     endpoint: input.endpointUrl,
   });
-  return mapRecommendationSearchResult(payload, input.useCase === "coding" ? "coding" : "chat");
+  return mapRecommendationSearchResult(payload, discoveryTask);
 }
 
 async function mapRecommendationSearchResult(
@@ -1067,6 +1328,7 @@ async function mapRecommendationSearchResult(
     .map((arm) => `${text(arm.name, "Hub query")}: ${text(arm.error, "request failed")}`);
   const answer = object(payload.answer);
   const counts = object(payload.candidate_counts);
+  const cache = object(payload.cache_provenance);
   const base = {
     headline: text(answer.headline),
     detail: text(answer.detail, text(answer.summary)),
@@ -1077,12 +1339,26 @@ async function mapRecommendationSearchResult(
       enriched: numeric(counts.enriched),
       returned: numeric(counts.returned),
     },
+    cacheProvenance: {
+      source: text(cache.source, "unknown"),
+      refreshed: Boolean(cache.refreshed),
+      ttlSeconds: numeric(cache.ttl_seconds),
+      entryCount: numeric(cache.entry_count),
+      oldestEntryAgeSeconds:
+        cache.oldest_entry_age_seconds == null
+          ? undefined
+          : numeric(cache.oldest_entry_age_seconds),
+    },
   };
   if (liveRecommendations.length > 0) {
     return { recommendations: liveRecommendations, stale: false, ...base };
   }
 
-  const cached = await latestCachedRecommendation(task);
+  const fingerprint = text(payload.request_fingerprint);
+  const cached =
+    queryArmErrors.length > 0 && fingerprint
+      ? await latestCachedRecommendation(task, fingerprint)
+      : null;
   if (cached) {
     return {
       recommendations: list(cached.recommendations)
@@ -1539,10 +1815,45 @@ export const rift = {
   connectionInfo: () => ({
     root: configuredRoot(),
     mode: "legacy-live" as const,
-    previewEnabled: previewEnabled(),
   }),
+  listLocalArtifacts: async (signal?: AbortSignal): Promise<ModelArtifact[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/artifacts", undefined, signal);
+    return list(payload.artifacts).map(mapLocalArtifact);
+  },
 
   health: fleetHealth,
+  gatewayStatus: async (signal?: AbortSignal): Promise<GatewayStatus> =>
+    mapGatewayStatus(await req<JsonObject>("GET", "/gateway", undefined, signal)),
+  gatewayAction: async (
+    action: "start" | "stop",
+    options: { config?: string; service?: string; host?: string; port?: number } = {},
+  ): Promise<GatewayStatus> =>
+    mapGatewayStatus(
+      await req<JsonObject>("POST", "/gateway/actions", {
+        action,
+        config: options.config,
+        service: options.service,
+        host: options.host,
+        port: options.port,
+      }),
+    ),
+  gatewayGroups: async (signal?: AbortSignal): Promise<GatewayGroupStatus[]> => {
+    const payload = await req<JsonObject>("GET", "/gateway/groups", undefined, signal);
+    return list(payload.groups).map(mapGatewayGroupStatus);
+  },
+  gatewayGroupAction: async (
+    groupId: string,
+    action: "start" | "stop",
+    options: { config?: string; host?: string; port?: number } = {},
+  ): Promise<GatewayGroupStatus> =>
+    mapGatewayGroupStatus(
+      await req<JsonObject>("POST", `/gateway/groups/${encodeURIComponent(groupId)}/actions`, {
+        action,
+        config: options.config,
+        host: options.host,
+        port: options.port,
+      }),
+    ),
   listNodes,
   getNode: async (id: string, signal?: AbortSignal) => {
     const nodes = await listNodes(signal);
@@ -1685,7 +1996,11 @@ export const rift = {
     ),
 
   listServices,
+  telemetryCatalog,
+  telemetryObjectiveCatalog,
+  telemetryObjectives,
   telemetryLatest,
+  resourceHistory,
   resourceReports,
   serviceTelemetryAccounting,
   updateServiceTelemetryAccounting,
@@ -1712,6 +2027,9 @@ export const rift = {
     targetNodeId: string;
     serviceName: string;
     exposure: "local" | "lan" | "public";
+    monitoringProfile?: string;
+    monitoringMetrics?: string[];
+    monitoringObjectives?: MonitoringObjective[];
   }): Promise<Plan> => {
     if (!input.recommendationRunId) {
       throw new RiftUnavailable(
@@ -1734,6 +2052,9 @@ export const rift = {
             targetNodeId: input.targetNodeId,
             serviceName: input.serviceName,
             exposure: input.exposure,
+            monitoringProfile: input.monitoringProfile,
+            monitoringMetrics: input.monitoringMetrics,
+            monitoringObjectives: input.monitoringObjectives,
           },
         ),
       ),
@@ -1794,7 +2115,105 @@ export const rift = {
   tuningProfiles: async (signal?: AbortSignal): Promise<JsonObject> =>
     req<JsonObject>("GET", "/v2/tuning/profiles", undefined, signal),
   tuningCapabilities: async (service: string, signal?: AbortSignal): Promise<JsonObject> =>
-    req<JsonObject>("GET", `/v2/tuning/capabilities?service=${encodeURIComponent(service)}`, undefined, signal),
+    req<JsonObject>(
+      "GET",
+      `/v2/tuning/capabilities?service=${encodeURIComponent(service)}`,
+      undefined,
+      signal,
+    ),
+  compileWorkload: async (
+    workload: string | JsonObject,
+    persist = true,
+    signal?: AbortSignal,
+    outputSchema?: JsonObject,
+  ): Promise<JsonObject> =>
+    req<JsonObject>(
+      "POST",
+      "/v2/workloads/compile",
+      { workload, persist, ...(outputSchema ? { output_schema: outputSchema } : {}) },
+      signal,
+    ),
+  listWorkloadDrafts: async (signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>("GET", "/v2/workloads", undefined, signal),
+  getWorkloadDraft: async (draftId: string, signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>("GET", `/v2/workloads/${encodeURIComponent(draftId)}`, undefined, signal),
+  reviseWorkloadDraft: async (
+    draftId: string,
+    revision: number,
+    workload: string | JsonObject,
+    signal?: AbortSignal,
+    outputSchema?: JsonObject | null,
+  ): Promise<JsonObject> =>
+    req<JsonObject>(
+      "PUT",
+      `/v2/workloads/${encodeURIComponent(draftId)}`,
+      {
+        revision,
+        workload,
+        ...(outputSchema !== undefined ? { output_schema: outputSchema } : {}),
+      },
+      signal,
+    ),
+  saveWorkloadPolicy: async (
+    policy: JsonObject,
+    policyId = "easy-local",
+    expectedRevision = 0,
+    signal?: AbortSignal,
+  ): Promise<JsonObject> =>
+    req<JsonObject>(
+      "POST",
+      "/v2/workload-policies",
+      { policy, policy_id: policyId, expected_revision: expectedRevision },
+      signal,
+    ),
+  approveWorkload: async (
+    draftId: string,
+    approval: JsonObject,
+    signal?: AbortSignal,
+  ): Promise<JsonObject> =>
+    req<JsonObject>(
+      "POST",
+      `/v2/workloads/${encodeURIComponent(draftId)}/approve`,
+      approval,
+      signal,
+    ),
+  startWorkloadRun: async (
+    approvalId: string,
+    options: {
+      modelsDir?: string;
+      modelRef?: string;
+      candidateLimit?: number;
+      tune?: boolean;
+    } = {},
+    signal?: AbortSignal,
+  ): Promise<JsonObject> =>
+    req<JsonObject>(
+      "POST",
+      "/v2/workload-runs",
+      {
+        approval_id: approvalId,
+        models_dir: options.modelsDir,
+        model_ref: options.modelRef,
+        candidate_limit: options.candidateLimit ?? 3,
+        tune: options.tune ?? true,
+      },
+      signal,
+    ),
+  listWorkloadRuns: async (signal?: AbortSignal): Promise<JsonObject[]> => {
+    const payload = await req<JsonObject>("GET", "/v2/workload-runs", undefined, signal);
+    return list(payload.runs).filter(
+      (run): run is JsonObject => run !== null && typeof run === "object" && !Array.isArray(run),
+    );
+  },
+  getWorkloadRun: async (runId: string, signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>("GET", `/v2/workload-runs/${encodeURIComponent(runId)}`, undefined, signal),
+  getWorkloadRunEvents: async (runId: string, signal?: AbortSignal): Promise<JsonObject> =>
+    req<JsonObject>(
+      "GET",
+      `/v2/workload-runs/${encodeURIComponent(runId)}/events`,
+      undefined,
+      signal,
+    ),
   listTuningRuns: async (
     options: { service?: string; profile?: TuningProfile; limit?: number } = {},
     signal?: AbortSignal,
@@ -2076,10 +2495,13 @@ export const rift = {
     let closed = false;
     const poll = async () => {
       try {
-        const health = await fleetHealth();
+        // A connectivity pulse must stay cheap. Fleet health performs hardware
+        // discovery and telemetry aggregation; use the small services endpoint
+        // here and let the page query those expensive views only when needed.
+        await req<JsonObject>("GET", "/services");
         if (!closed) {
           onStale(false);
-          onEvent({ kind: "health", health });
+          onEvent({ kind: "controller.connected" });
         }
       } catch {
         if (!closed) onStale(true);

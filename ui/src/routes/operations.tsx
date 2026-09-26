@@ -5,6 +5,7 @@ import { PageHeader, Panel, StatDot, SourceBadge } from "@/components/rift/primi
 import { Unavailable } from "@/components/rift/unavailable";
 import {
   useIncidents,
+  useGatewayStatus,
   useLatestPlan,
   useLogs,
   useOperations,
@@ -103,11 +104,13 @@ function OperationsTab() {
     );
   const operations = data ?? [];
   return (
-    <Panel
-      title={`${operations.length} durable operation${operations.length === 1 ? "" : "s"}`}
-      aside={<SourceBadge source="live" />}
-      bodyClassName="p-0"
-    >
+    <>
+      <GatewayCard />
+      <Panel
+        title={`${operations.length} durable operation${operations.length === 1 ? "" : "s"}`}
+        aside={<SourceBadge source="live" />}
+        bodyClassName="p-0"
+      >
       {isLoading ? (
         <div className="px-4 py-12 text-center text-[13px] text-ink-secondary">
           Loading operations...
@@ -149,6 +152,44 @@ function OperationsTab() {
             </tbody>
           </table>
         </div>
+      )}
+      </Panel>
+    </>
+  );
+}
+
+function GatewayCard() {
+  const gateway = useGatewayStatus();
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const status = gateway.data?.status ?? "not_started";
+  const metrics = gateway.data?.metrics ?? {};
+  const total = Number(metrics.requests_total ?? 0);
+  const failed = Number(metrics.requests_failed ?? 0);
+  const completed = Number(metrics.requests_succeeded ?? 0) + failed;
+  const errorRatio = completed > 0 ? failed / completed : null;
+  const running = status === "running" && gateway.data?.processAlive;
+  return (
+    <Panel
+      title="Controller gateway"
+      aside={<span className="inline-flex items-center gap-2 text-[11px] uppercase tracking-[0.12em]"><StatDot tone={running ? "ok" : status === "stale" ? "error" : "attention"} /> {status}</span>}
+    >
+      {gateway.unavailable || gateway.error ? (
+        <Unavailable endpoint="/gateway" resource="Controller gateway" reason={gateway.unavailable?.detail ?? gateway.error?.message} />
+      ) : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-4 text-[12px]">
+            <div><div className="rift-label">Endpoint</div><div className="mt-1 rift-mono">{gateway.data?.host ? `http://${gateway.data.host}:${gateway.data.port ?? "—"}` : "not configured"}</div></div>
+            <div><div className="rift-label">Requests</div><div className="mt-1 rift-mono">{total}</div></div>
+            <div><div className="rift-label">Failures</div><div className="mt-1 rift-mono">{failed}</div></div>
+            <div><div className="rift-label">Error ratio</div><div className="mt-1 rift-mono">{errorRatio == null ? "unknown" : `${(errorRatio * 100).toFixed(2)}%`}</div></div>
+          </div>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <button type="button" disabled={busy || running} onClick={async () => { setBusy(true); setMessage(null); try { await rift.gatewayAction("start"); gateway.refetch(); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); } }} className="h-8 px-3 rounded-[4px] bg-primary text-primary-foreground text-[12px] disabled:opacity-50">{busy ? "Working…" : "Start gateway"}</button>
+            <button type="button" disabled={busy || !running} onClick={async () => { if (!window.confirm("Stop the shared controller gateway?")) return; setBusy(true); setMessage(null); try { await rift.gatewayAction("stop"); gateway.refetch(); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { setBusy(false); } }} className="h-8 px-3 rounded-[4px] border border-border text-[12px] disabled:opacity-50">Stop gateway</button>
+            {message && <span className="text-[11px] text-error" role="alert">{message}</span>}
+          </div>
+        </>
       )}
     </Panel>
   );

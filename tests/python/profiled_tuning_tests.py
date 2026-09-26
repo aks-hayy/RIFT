@@ -218,6 +218,51 @@ def test_profiled_tuning_omits_unset_optional_controls_before_launch():
         assert service["launch_plan"]["tuning"]["batch"] == 128
 
 
+def test_profiled_tuning_restores_materialized_model_path_after_no_improvement():
+    """Rollback must reuse the absolute downloaded artifact path."""
+
+    with tempfile.TemporaryDirectory() as root:
+        root_path = Path(root)
+        orchestrator, _state, service = make_orchestrator(root_path)
+        absolute_model = root_path / "model-Q4_K_M.gguf"
+        service["launch_plan"]["model_path"] = absolute_model.name
+        service["model"]["local_path"] = str(absolute_model)
+        service["model"]["selected_file"] = absolute_model.name
+        service["download"] = {"local_dir": str(root_path)}
+
+        replacements = []
+
+        def replace(**kwargs):
+            replacements.append(dict(kwargs["launch_plan"]))
+            return {
+                "ready": True,
+                "runtime": {"pid": len(replacements) + 1, "api_base": kwargs["launch_plan"].get("api_base")},
+            }
+
+        orchestrator._replace_service_runtime = replace
+        result = orchestrator.profiled_tune_service(
+            service_name="chat",
+            profile="speed",
+            allow_restart=True,
+            candidate_limit=2,
+            target_tokens_per_second=10_000.0,
+            write=False,
+            measurement_runner=lambda _plan, _profile: {
+                "latency_seconds": 1.0,
+                "ttft_seconds": 0.1,
+                "tokens": 32,
+                "failures": 0,
+                "replicates": [1.0, 1.0],
+            },
+        )
+
+        assert result["outcome"] == "no_improvement"
+        assert result["baseline_restored"] is True
+        assert replacements
+        assert replacements[-1]["model_path"] == str(absolute_model)
+        assert service["launch_plan"]["model_path"] == str(absolute_model)
+
+
 def test_candidate_accuracy_probe_failure_is_rejected_without_aborting_run():
     """A backend HTTP/quality probe error should reject only that candidate."""
 

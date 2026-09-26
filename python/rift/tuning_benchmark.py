@@ -104,8 +104,12 @@ def run_windows(benchmark: Callable[..., dict], *, base_url: str, recipe: Benchm
                 raw = {"available": False, "error": str(exc)}
             elapsed = time.perf_counter() - entered
             # Prefer backend usage counts; never manufacture counts from chunks.
-            tokens = raw.get("generated_tokens") or raw.get("generated_tokens_estimate") or 0
-            if not isinstance(tokens, (int, float)) or not math.isfinite(tokens) or tokens < 0:
+            tokens = raw.get("generated_tokens")
+            count_source = "server_usage"
+            if tokens is None:
+                tokens = raw.get("generated_tokens_estimate", 0)
+                count_source = "estimate"
+            if type(tokens) not in (int, float) or not math.isfinite(tokens) or tokens < 0:
                 tokens = 0
             success = raw.get("available", True) and raw.get("status_code", 200) == 200 and tokens > 0
             ttft = raw.get("first_token_seconds")
@@ -121,7 +125,7 @@ def run_windows(benchmark: Callable[..., dict], *, base_url: str, recipe: Benchm
             if recipe.max_latency_seconds is not None:
                 qualified = qualified and latency <= recipe.max_latency_seconds
             return {**raw, "request_index": index, "success": bool(success), "slo_passed": bool(qualified),
-                    "generated_tokens": tokens, "client_queue_seconds": queue,
+                    "generated_tokens": tokens, "token_count_source": count_source, "client_queue_seconds": queue,
                     "client_elapsed_seconds": latency, "first_token_seconds": ttft,
                     "ttft_source": ttft_source}
 

@@ -71,11 +71,16 @@ def source_from_candidate(candidate: JsonDict) -> JsonDict:
     }
 
 
-def source_from_local(path: str | Path) -> JsonDict:
+def source_from_local(path: str | Path, *, recursive: bool = True) -> JsonDict:
     root = Path(path)
     if not root.exists():
         raise ValueError(f"artifact source does not exist: {root}")
-    paths = [root] if root.is_file() else sorted(item for item in root.rglob("*") if item.is_file())
+    if root.is_file():
+        paths = [root]
+    elif recursive:
+        paths = sorted(item for item in root.rglob("*") if item.is_file())
+    else:
+        paths = sorted(item for item in root.iterdir() if item.is_file())
     files = []
     json_documents: JsonDict = {}
     for item in paths:

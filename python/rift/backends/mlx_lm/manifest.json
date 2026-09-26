@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "backend_id": "mlx-lm",
+  "display_name": "MLX-LM",
+  "adapter_api_version": "1.0",
+  "upstream_project": "ml-explore/mlx-lm",
+  "module": "rift.backends.mlx_lm.backend",
+  "supported_tasks": ["chat", "completion"],
+  "supported_formats": ["mlx"],
+  "quantizations": ["mlx", "2bit", "3bit", "4bit", "6bit", "8bit", "fp16", "bf16"],
+  "operating_systems": ["macos"],
+  "accelerators": ["metal"],
+  "installation_methods": ["isolated-python"],
+  "endpoints": ["openai"],
+  "features": ["unified-memory", "prompt-caching", "speculative-decoding"],
+  "tuning_profiles": [],
+  "topology_modes": ["single_node", "replicated"],
+  "evidence_status": "implemented_unverified_local_only",
+  "multi_gpu": false,
+  "streaming": true,
+  "description": "Apple Silicon MLX-LM backend operated through an OpenAI-compatible local process."
+}

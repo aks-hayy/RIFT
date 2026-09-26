@@ -20,6 +20,8 @@ from urllib.parse import unquote, urlparse, urlsplit
 
 from .adapters.artifacts import source_from_candidate, source_from_local
 from .adapters.contracts import AdapterManifest
+from .discovery import assess_metadata_capabilities, model_family_matches, normalize_workload
+from .execution_policy import content_hash
 from .artifacts import ArtifactManifest
 from .adapters.converters import converter_adapter_host
 from .benchmark_suite import (
@@ -44,10 +46,13 @@ from .release import DiagnosticBundle, migrate_config, migrate_state
 from .recommendations import RecommendationStore
 from .rift import RiftEngine
 from .rift_yaml import read_yaml, write_yaml
+from .gateway_manager import GatewayManager
 from .system_profile import HardwareAnalyzer
 from .state_store import StateStore
 from .runtime_paths import RiftPaths
-from .telemetry import ResourcePolicy, TelemetryStore, TelemetrySupervisor
+from .telemetry import AlertDispatcher, ResourcePolicy, TelemetryStore, TelemetrySupervisor, WebhookAlertAdapter
+from .telemetry.objectives import AGGREGATIONS, OPERATORS, normalize_objectives, required_metrics
+from .telemetry.profiles import metric_catalog, profile_catalog, resolve_selection
 from .tuning_engine import (
     CostMeasurement,
     GpuEnergySampler,
@@ -161,6 +166,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         self.evidence_engine = EvidenceEngine(root=self.root, data_root=self.rift_dir)
         self.artifacts = ArtifactManifest(root=self.root)
         self.recommendation_store = RecommendationStore(self.rift_dir)
+        self.gateway_manager = GatewayManager(self.root, self.rift_dir)
         from .gateway import ApiKeyStore
 
         self.api_keys = ApiKeyStore(self.rift_dir / "gateway" / "api_keys.json")
@@ -187,7 +193,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             if self._telemetry_registry_key and self._telemetry_registry_key in _TELEMETRY_RUNTIMES:
                 store, supervisor = _TELEMETRY_RUNTIMES[self._telemetry_registry_key]
                 self._telemetry_supervisor = supervisor or TelemetrySupervisor(
-                    store, interval_seconds=2.0, node_id="local", policy=ResourcePolicy()
+                    store, interval_seconds=2.0, node_id="local", policy=ResourcePolicy(), alert_dispatcher=self._alert_dispatcher()
                 )
                 _TELEMETRY_RUNTIMES[self._telemetry_registry_key] = (store, self._telemetry_supervisor)
             else:
@@ -196,6 +202,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     interval_seconds=2.0,
                     node_id="local",
                     policy=ResourcePolicy(),
+                    alert_dispatcher=self._alert_dispatcher(),
                 )
         return self._telemetry_supervisor
 
@@ -233,6 +240,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             "observability": {
                 "telemetry": {
                     "enabled": True,
+                    "profile": "default",
                     "sample_interval_seconds": 2.0,
                     "raw_retention_hours": 48,
                     "rollup_retention_days": 90,
@@ -241,6 +249,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "compute_cost_per_node_hour": None,
                     "prometheus": {"enabled": True},
                     "otlp": {"enabled": False, "endpoint": None},
+                    "alerts": {},
                 }
             },
             "nodes": [
@@ -274,8 +283,10 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     },
                     "monitoring": {
                         "enabled": True,
+                        "objectives": [],
                         "resources": {
                             "enabled": True,
+                            "profile": "default",
                             "sample_interval_seconds": 2.0,
                             "electricity_price_per_kwh": None,
                             "compute_cost_per_node_hour": None,
@@ -343,6 +354,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         telemetry = (config.get("observability") or {}).get("telemetry") or {}
         if not isinstance(telemetry, dict):
             raise ValueError("observability.telemetry must be an object")
+        resolve_selection(telemetry)
         for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour"):
             self._validate_accounting_rate(key, telemetry.get(key))
         for name, service in config["services"].items():
@@ -357,6 +369,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             gateway = service.get("gateway") or {}
             if not isinstance(monitoring, dict):
                 raise ValueError(f"service {name} monitoring must be an object")
+            normalize_objectives(monitoring.get("objectives"))
             if not isinstance(recovery, dict):
                 raise ValueError(f"service {name} recovery must be an object")
             if not isinstance(gateway, dict):
@@ -364,6 +377,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             resources = monitoring.get("resources") or {}
             if not isinstance(resources, dict):
                 raise ValueError(f"service {name} monitoring.resources must be an object")
+            resolve_selection({**telemetry, **resources})
             for key in ("electricity_price_per_kwh", "compute_cost_per_node_hour"):
                 self._validate_accounting_rate(key, resources.get(key))
             if float(resources.get("sample_interval_seconds", 2.0)) <= 0.0:
@@ -477,7 +491,11 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 continue
             inspected_roots.add(key)
             try:
-                source = source_from_local(candidate)
+                # A models directory may contain several child model folders.
+                # Inspect only files owned by this candidate folder so the
+                # parent is not misreported as a composite model and each
+                # child artifact keeps its own launch path.
+                source = source_from_local(candidate, recursive=False)
                 variants = self.engine.artifact_adapters.resolve(source)
             except (OSError, ValueError):
                 continue
@@ -513,6 +531,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 hardware=hardware,
                 requested="auto",
                 workload=task,
+                probe_cache=discovery["nodes"][0].get("backends"),
             )
             backend = str(decision.get("backend") or "")
             winner = next(
@@ -540,7 +559,8 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "format": item.get("format"),
                     "quantization": item.get("quantization"),
                     "size_bytes": item.get("size"),
-                    "backend": backend or None,
+                     "capability_score": self._model_capability_score({**model, **item}),
+                     "backend": backend or None,
                     "score": round(score, 6),
                     "fits": fit,
                     "evidence": "LOCAL_INSPECTION",
@@ -552,6 +572,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         ranked.sort(
             key=lambda item: (
                 not bool(item.get("fits")),
+                -float(item.get("capability_score") or 0.0),
                 -float(item.get("score") or 0.0),
                 int(item.get("size_bytes") or 0),
                 str(item.get("path") or ""),
@@ -594,6 +615,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         refresh: bool = False,
         output: str | Path | None = None,
         selector: str | None = None,
+        monitoring_profile: str | None = None,
+        monitoring_metrics: list[str] | None = None,
+        monitoring_objectives: list[dict[str, Any]] | None = None,
         write: bool = True,
     ) -> JsonDict:
         """Inspect one Hub repository and materialize its best deployable artifact."""
@@ -633,6 +657,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 hardware=hardware,
                 requested="auto",
                 workload=task,
+                probe_cache=discovery["nodes"][0].get("backends"),
             )
             backend = str(decision.get("backend") or "")
             winner = next(
@@ -728,6 +753,10 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         config = self.default_config()
         config["project"] = f"rift-{task}-{repo_id.replace('/', '--')}"
         config["nodes"][0]["hardware_summary"] = self._hardware_summary(hardware)
+        service.setdefault("monitoring", {}).setdefault("resources", {}).update(
+            resolve_selection({"profile": monitoring_profile, "metrics": monitoring_metrics})
+        )
+        self._apply_monitoring_objectives(service, monitoring_objectives)
         config["services"] = {"chat": service}
         output_path = self._resolve_path(
             output or self.rift_dir / "generated" / f"hub-{repo_id.replace('/', '--')}.yaml"
@@ -756,10 +785,17 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         top: int = 10,
         candidate_limit: int = 300,
         max_download_gb: float = 12.0,
+        monitoring_profile: str | None = None,
+        monitoring_metrics: list[str] | None = None,
+        monitoring_objectives: list[dict[str, Any]] | None = None,
+        workload_contract: JsonDict | None = None,
+        selected_candidate: JsonDict | None = None,
         write: bool = True,
     ) -> JsonDict:
         discovery = self.discover(local=True, models_dir=models_dir, write=True)
         hardware = discovery["nodes"][0]["hardware"]
+        profile = normalize_workload(task=task, workload_contract=workload_contract)
+        task = profile.task
         service = self.default_config()["services"]["chat"]
         service["task"] = task
         alternatives: list[JsonDict] = []
@@ -770,23 +806,47 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             if not local_models:
                 raise ValueError("local source requires at least one recognized model artifact in --models-dir")
             ranked_local = []
+            if selected_candidate is not None:
+                wanted_path = str(selected_candidate.get("local_path") or selected_candidate.get("selected_file") or "")
+                selected_item = next((item for item in local_models if str(item.get("path") or "") == wanted_path), None)
+                if selected_item is None:
+                    raise ValueError("selected local recommendation is no longer present in the model inventory")
+                selected_backend = str(selected_candidate.get("backend") or "auto")
+                local_decision = self._select_provider_for_model(
+                    model={**selected_item, **dict(selected_item.get("artifact") or {}),
+                           "context_length": profile.context_length, "concurrency": profile.concurrency},
+                    hardware=hardware,
+                    requested=selected_backend,
+                    workload=task,
+                    probe_cache=discovery["nodes"][0].get("backends"),
+                )
+                winner = next((candidate for candidate in local_decision.get("candidates", [])
+                    if candidate.get("backend") == local_decision.get("backend") and candidate.get("fits")), None)
+                if not winner:
+                    raise ValueError("selected local recommendation no longer passes backend preflight")
+                ranked_local.append((0.0, float(winner.get("score") or 0.0), selected_item, local_decision))
             for item in local_models:
+                if selected_candidate is not None:
+                    break
                 decision = self._select_provider_for_model(
-                    model={**item, **dict(item.get("artifact") or {})},
+                    model={**item, **dict(item.get("artifact") or {}),
+                           "context_length": profile.context_length, "concurrency": profile.concurrency},
                     hardware=hardware,
                     requested="auto",
                     workload=task,
+                    probe_cache=discovery["nodes"][0].get("backends"),
                 )
                 winner = next((candidate for candidate in decision.get("candidates", []) if candidate.get("backend") == decision.get("backend")), None)
                 if winner:
                     artifact_score = self._artifact_local_preference(item)
-                    ranked_local.append((float(winner.get("score") or 0.0) + artifact_score, item, decision))
+                    capability_score = self._model_capability_score({**item, **dict(item.get("artifact") or {})})
+                    ranked_local.append((capability_score, float(winner.get("score") or 0.0) + artifact_score, item, decision))
             if not ranked_local:
                 raise ValueError("no installed or installable backend adapter accepted the local artifacts")
-            ranked_local.sort(key=lambda entry: (-entry[0], int(entry[1].get("size") or 0), str(entry[1].get("path"))))
-            _, selected, local_decision = ranked_local[0]
+            ranked_local.sort(key=lambda entry: (-entry[0], -entry[1], int(entry[2].get("size") or 0), str(entry[2].get("path"))))
+            _, _, selected, local_decision = ranked_local[0]
             alternatives = [
-                {"id": item[1]["path"], "format": item[1].get("format"), "reason": "lower adapter compatibility score"}
+                {"id": item[2]["path"], "format": item[2].get("format"), "reason": "lower capability-first ranking score"}
                 for item in ranked_local[1:8]
             ]
             service["model"].update(
@@ -807,6 +867,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 candidate_limit=candidate_limit,
                 max_download_gb=max_download_gb,
                 endpoint=endpoint,
+                workload_contract=workload_contract,
             )
             best = recommendation.get("best_for_hardware", {}).get("absolute_best")
             if not best:
@@ -838,6 +899,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         service["model"]["decision"] = {
             "reason": self._selection_reasons(selected, hardware, backend),
             "alternatives": alternatives,
+            "quality_evidence": selected.get("quality_evidence", {}),
+            "public_evaluation_comparison": selected.get("public_evaluation_comparison", {}),
+            "evaluation_evidence": selected.get("evaluation_evidence", {}),
         }
         service["placement"] = {
             "node": "local",
@@ -852,6 +916,17 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         config = self.default_config()
         config["project"] = f"rift-{task}"
         config["nodes"][0]["hardware_summary"] = self._hardware_summary(hardware)
+        service.setdefault("monitoring", {}).setdefault("resources", {}).update(
+            resolve_selection({"profile": monitoring_profile, "metrics": monitoring_metrics})
+        )
+        self._apply_monitoring_objectives(service, monitoring_objectives)
+        if workload_contract is not None:
+            serving = service.setdefault("serving", {})
+            serving["context_length"] = max(profile.context_length, int(serving.get("context_length") or 0))
+            serving["concurrency"] = max(profile.concurrency, int(serving.get("concurrency") or 1))
+            gateway = service.setdefault("gateway", {})
+            gateway["max_prompt_tokens"] = max(profile.context_length, int(gateway.get("max_prompt_tokens") or 0))
+            gateway["max_total_tokens"] = max(profile.context_length + 1024, int(gateway.get("max_total_tokens") or 0))
         config["services"] = {"chat": service}
         output_path = self._resolve_path(output)
         result = {
@@ -891,6 +966,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         target_node_id: str | None = None,
         service_name: str = "chat",
         exposure: str = "local",
+        monitoring_profile: str | None = None,
+        monitoring_metrics: list[str] | None = None,
+        monitoring_objectives: list[dict[str, Any]] | None = None,
     ) -> JsonDict:
         """Turn one immutable recommendation candidate into deployable YAML intent."""
 
@@ -1025,6 +1103,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "reason": list(selected.get("evidence") or []),
                     "warnings": list(selected.get("warnings") or []),
                     "backend_candidates": list(selected.get("backend_candidates") or []),
+                    "quality_evidence": selected.get("quality_evidence", {}),
+                    "public_evaluation_comparison": selected.get("public_evaluation_comparison", {}),
+                    "evaluation_evidence": selected.get("evaluation_evidence", {}),
                 },
             }
         )
@@ -1042,6 +1123,12 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         service["exposure"] = exposure
         service["serving"]["host"] = "127.0.0.1" if exposure == "local" else "0.0.0.0"
         service["gateway"]["host"] = "127.0.0.1" if exposure == "local" else "0.0.0.0"
+        selection = resolve_selection({
+            "profile": monitoring_profile or (service.get("monitoring") or {}).get("resources", {}).get("profile"),
+            "metrics": monitoring_metrics,
+        })
+        service.setdefault("monitoring", {}).setdefault("resources", {}).update(selection)
+        self._apply_monitoring_objectives(service, monitoring_objectives)
         config["services"] = {service_name: service}
         target = self._resolve_path(
             output or self.plan_dir / f"recommendation-{run_id}.yaml"
@@ -1079,6 +1166,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         target_node_id: str | None = None,
         service_name: str = "chat",
         exposure: str = "local",
+        monitoring_profile: str | None = None,
+        monitoring_metrics: list[str] | None = None,
+        monitoring_objectives: list[dict[str, Any]] | None = None,
     ) -> JsonDict:
         materialized = self.materialize_recommendation_config(
             run_id=run_id,
@@ -1090,6 +1180,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             target_node_id=target_node_id,
             service_name=service_name,
             exposure=exposure,
+            monitoring_profile=monitoring_profile,
+            monitoring_metrics=monitoring_metrics,
+            monitoring_objectives=monitoring_objectives,
         )
         plan = self.plan(config_path=materialized["config_path"], write=True)
         plan["recommendation_run_id"] = run_id
@@ -1632,6 +1725,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 hardware=hardware,
                 requested=str(policy.get("backend") or "auto"),
                 workload=str(service.get("task") or "chat"),
+                probe_cache=discovery["nodes"][0].get("backends"),
             )
             backend = str(backend_decision.get("backend") or "")
             if not backend:
@@ -1720,7 +1814,12 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 hardware=hardware,
                 tuning=tuning,
             )
-            if model.get("source") in ("huggingface", "private") and not model.get("local_path"):
+            model_source = str(model.get("source") or "").strip().lower()
+            model_is_remote = (
+                model_source in {"huggingface", "private"}
+                or model_source.startswith(("http://", "https://"))
+            )
+            if model_is_remote and not model.get("local_path"):
                 artifact = model.get("artifact") or {}
                 disk_fit = model.get("disk_feasibility") or {}
                 if str(disk_fit.get("status") or "").lower() == "insufficient":
@@ -1801,6 +1900,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         hardware: JsonDict,
         requested: str,
         workload: str = "chat",
+        probe_cache: dict[str, JsonDict] | None = None,
     ) -> JsonDict:
         fmt = str(model.get("format") or "unknown").lower()
         quantization = str(model.get("quantization") or "").lower()
@@ -1849,9 +1949,15 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     fit = provider.model_fit(model=model, hardware=hardware)
             except Exception as exc:
                 fit = {"fits": False, "reason": f"provider fit check failed: {exc}"}
-            detection = provider.probe(
-                search_root=str(self.rift_dir / "backends" / name)
-            ) if callable(getattr(provider, "probe", None)) else provider.detect(search_root=str(self.rift_dir / "backends" / name))
+            detection = probe_cache.get(name) if probe_cache is not None else None
+            if detection is None:
+                detection = (
+                    provider.probe(search_root=str(self.rift_dir / "backends" / name))
+                    if callable(getattr(provider, "probe", None))
+                    else provider.detect(search_root=str(self.rift_dir / "backends" / name))
+                )
+                if probe_cache is not None:
+                    probe_cache[name] = detection
             compatible = bool(fit.get("fits")) and format_supported and quantization_supported and architecture_supported and platform_supported
             score = (
                 (0.42 if format_supported else 0.0)
@@ -1914,6 +2020,32 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             "Q2_K": 0.030,
         }
         return order.get(quantization, 0.070 if quantization else 0.0)
+
+    @staticmethod
+    def _model_capability_score(model: JsonDict) -> float:
+        """Return a capability-first ranking signal for compatible local artifacts.
+
+        When the user has not supplied a model-size ceiling, a larger model is the
+        useful default *provided it already passed the hardware-fit gate*.  This is
+        intentionally only a ranking signal: it does not make an artifact fit, and
+        it does not change weights, quantization, or the provider's acceptance
+        decision.  Explicit architecture metadata wins; filenames are a safe
+        fallback for local GGUF inventories that do not carry parameter counts.
+        """
+        explicit = model.get("parameters_b")
+        try:
+            if explicit is not None and float(explicit) > 0:
+                return float(explicit)
+        except (TypeError, ValueError):
+            pass
+        haystack = " ".join(
+            str(model.get(key) or "")
+            for key in ("name", "path", "selected_file", "id", "repo_id", "model_id")
+        )
+        match = re.search(r"(?<![0-9])([0-9]+(?:\.[0-9]+)?)\s*[bB](?![a-zA-Z])", haystack)
+        if match:
+            return float(match.group(1))
+        return 0.0
 
     def apply(
         self,
@@ -2174,6 +2306,33 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             results.append({"service": service_name, "launched": launched})
             report("launching", f"Started {service_name}; waiting for health", 85.0, {"service": service_name})
         self.write_state(state)
+        gateway_results: list[JsonDict] = []
+        gateway_candidate = next(
+            (
+                (name, service)
+                for name, service in plan.get("services", {}).items()
+                if isinstance(service.get("gateway"), dict)
+                and bool((service.get("gateway") or {}).get("enabled", True))
+            ),
+            None,
+        )
+        if permissions.allow_launch and gateway_candidate and not self._telemetry_ephemeral:
+            gateway_name, _gateway_service = gateway_candidate
+            try:
+                gateway_results.append(
+                    self.gateway_start(service_name=str(gateway_name), config_path=config_path)
+                )
+                report("launching", "Shared gateway is running", None, {"service": gateway_name})
+            except Exception as exc:
+                gateway_results.append(
+                    {"started": False, "status": "error", "error": str(exc), "service": gateway_name}
+                )
+                report(
+                    "launching",
+                    "Gateway start failed; service remains available directly",
+                    None,
+                    {"error": str(exc), "service": gateway_name},
+                )
         tuning_results: list[JsonDict] = []
         if permissions.optimize:
             # Optimization is measured only after the reviewed deployment is
@@ -2266,6 +2425,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 "results": results,
                 "tuning": tuning_results,
                 "evaluations": evaluation_results,
+                "gateway": gateway_results,
                 "state_path": str(self.state_path),
             }
         records: list[JsonDict] = []
@@ -2298,6 +2458,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             "results": results,
             "tuning": tuning_results,
             "evaluations": evaluation_results,
+            "gateway": gateway_results,
             "deployment_records": records,
             "state_path": str(self.state_path),
         }
@@ -2314,7 +2475,12 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         completed = 0
         for service_name, service in plan["services"].items():
             model = service.get("model") or {}
-            if model.get("source") not in ("huggingface", "private") or model.get("local_path"):
+            model_source = str(model.get("source") or "").strip().lower()
+            model_is_remote = (
+                model_source in {"huggingface", "private"}
+                or model_source.startswith(("http://", "https://"))
+            )
+            if not model_is_remote or model.get("local_path"):
                 continue
             repo_id = str(model.get("id") or "")
             if not repo_id or repo_id == "auto":
@@ -2355,7 +2521,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             local_dir = str(result.get("local_dir") or output_dir)
             manifest = self.artifacts.build(
                 local_dir,
-                source=str(model.get("source") or "huggingface"),
+                source="private" if model_source == "private" else "huggingface",
                 repo_id=repo_id,
                 revision=revision,
                 license_name=model.get("license"),
@@ -2851,6 +3017,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         """Start/attach the node supervisor without making telemetry a launch dependency."""
         monitoring = dict(service.get("monitoring") or {})
         resources = self._effective_telemetry_resources(service)
+        objectives = normalize_objectives((service.get("monitoring") or {}).get("objectives"))
         if not bool(resources.get("enabled", True)):
             return
         pid_value = (service.get("runtime") or {}).get("pid")
@@ -2865,8 +3032,14 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "scope": (service.get("runtime") or {}).get("resource_scope") or {"kind": "pid", "pid": pid},
                     "electricity_price_per_kwh": resources.get("electricity_price_per_kwh"),
                     "compute_cost_per_node_hour": resources.get("compute_cost_per_node_hour"),
+                    "telemetry_profile": resources.get("profile", "default"),
+                    "telemetry_metrics": list(resources.get("metrics") or []),
+                    "objectives": objectives,
+                    "gateway_metrics_path": str(self.rift_dir / "gateway" / "metrics.json"),
+                    "gateway_route_scope": f"service:{service_name}",
                 },
                 interval_seconds=float(resources.get("sample_interval_seconds", 2.0)),
+                metrics=list(resources.get("metrics") or []),
             )
             service["telemetry"] = {
                 "enabled": True,
@@ -2914,7 +3087,116 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             if key in ("electricity_price_per_kwh", "compute_cost_per_node_hour") and value is None:
                 continue
             effective[key] = value
+        selection = resolve_selection(effective)
+        effective.update(selection)
+        objectives = normalize_objectives(monitoring.get("objectives")) if isinstance(monitoring, dict) else []
+        known_metrics = set(metric_catalog())
+        selected_metrics = list(effective.get("metrics") or [])
+        for metric in required_metrics(objectives):
+            if metric in known_metrics and metric not in selected_metrics:
+                selected_metrics.append(metric)
+        effective["metrics"] = selected_metrics
         return effective
+
+    @staticmethod
+    def _apply_monitoring_objectives(service: JsonDict, raw_objectives: Any) -> list[dict[str, Any]]:
+        """Persist objectives and make their known metrics visible in the plan."""
+        normalized = normalize_objectives(raw_objectives)
+        monitoring = service.setdefault("monitoring", {})
+        monitoring["objectives"] = normalized
+        resources = monitoring.setdefault("resources", {})
+        if not isinstance(resources, dict):
+            resources = {}
+            monitoring["resources"] = resources
+        selected = list(resources.get("metrics") or [])
+        known = set(metric_catalog())
+        for metric in required_metrics(normalized):
+            if metric in known and metric not in selected:
+                selected.append(metric)
+        if selected:
+            resources["metrics"] = selected
+        return normalized
+
+    def _alert_dispatcher(self) -> AlertDispatcher:
+        """Build optional alert adapters from global telemetry configuration."""
+        adapters: dict[str, Any] = {}
+        try:
+            config = read_yaml(self._resolve_path("rift.yaml"))
+            configured = ((config.get("observability") or {}).get("telemetry") or {}).get("alerts") or {}
+            if isinstance(configured, dict):
+                webhook = configured.get("webhook")
+                if isinstance(webhook, dict) and webhook.get("endpoint"):
+                    adapters["webhook"] = WebhookAlertAdapter(
+                        str(webhook["endpoint"]),
+                        timeout_seconds=float(webhook.get("timeout_seconds", 5.0)),
+                    )
+        except (OSError, ValueError, TypeError):
+            pass
+        return AlertDispatcher(adapters)
+
+    def telemetry_catalog(self) -> JsonDict:
+        """Return the selectable monitoring metrics and built-in profiles."""
+
+        return {
+            "api_version": "1",
+            "default_profile": "default",
+            "metrics": list(metric_catalog().values()),
+            "profiles": list(profile_catalog().values()),
+        }
+
+    def telemetry_objective_catalog(self) -> JsonDict:
+        """Return the policy vocabulary used by objective editors and clients."""
+        return {
+            "api_version": "1",
+            "operators": sorted(OPERATORS),
+            "aggregations": sorted(AGGREGATIONS),
+            "metrics": list(metric_catalog().values()),
+        }
+
+    def telemetry_objectives(
+        self,
+        *,
+        service_name: str | None = None,
+        session_id: str | None = None,
+        events: bool = False,
+        limit: int = 100,
+    ) -> JsonDict:
+        """Return configured objectives and their latest observed state."""
+        session = self.telemetry_store.get_session(session_id) if session_id else None
+        if session is None:
+            sessions = self.telemetry_store.list_sessions(service_name=service_name, limit=1)["sessions"]
+            session = sessions[0] if sessions else None
+        if session is None:
+            return {"api_version": "1", "service": service_name, "session": None, "objectives": [], "evaluations": [], "events": []}
+        try:
+            metadata = json.loads(session.get("metadata_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        configured = normalize_objectives((metadata or {}).get("objectives"))
+        stored_events = self.telemetry_store.list_objective_events(
+            service_name=str(session.get("service_name") or service_name or ""),
+            session_id=str(session.get("session_id") or session_id or ""),
+            limit=max(1, int(limit)),
+        )["events"]
+        latest: dict[str, dict[str, Any]] = {}
+        for event in reversed(stored_events):
+            payload = dict(event.get("payload") or {})
+            objective_id = str(event.get("objective_id") or payload.get("objective_id") or "")
+            if objective_id:
+                latest[objective_id] = payload
+        report = session.get("report") if isinstance(session, dict) else None
+        if isinstance(report, dict) and report.get("objectives"):
+            latest.update({str(item.get("objective_id")): item for item in report["objectives"] if isinstance(item, dict) and item.get("objective_id")})
+        evaluations = [latest.get(item["id"], {"objective_id": item["id"], "metric": item["metric"], "status": "unknown", "reason": "not_evaluated"}) for item in configured]
+        return {
+            "api_version": "1",
+            "service": session.get("service_name"),
+            "node_id": session.get("node_id"),
+            "session": {key: session.get(key) for key in ("session_id", "status", "started_at", "stopped_at")},
+            "objectives": configured,
+            "evaluations": evaluations,
+            "events": stored_events if events else [],
+        }
 
     def service_telemetry_accounting(
         self,
@@ -3043,13 +3325,17 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             except (OSError, json.JSONDecodeError):
                 gateway = {}
             if isinstance(gateway, dict):
+                route_scope = str((self.read_state().get("services", {}).get(service_name) or {}).get("telemetry", {}).get("gateway_route_scope") or f"service:{service_name}")
+                scoped = (gateway.get("route_metrics") or {}).get(route_scope) if isinstance(gateway.get("route_metrics"), dict) else None
+                source = scoped if isinstance(scoped, dict) else gateway
                 report["traffic"] = {
-                    "requests_total": int(gateway.get("requests_total") or 0),
-                    "requests_succeeded": int(gateway.get("requests_succeeded") or 0),
-                    "requests_failed": int(gateway.get("requests_failed") or 0),
-                    "input_tokens_observed": int(gateway.get("tokens_input_observed") or 0),
-                    "output_tokens_observed": int(gateway.get("tokens_output_observed") or 0),
+                    "requests_total": int(source.get("requests_total") or 0),
+                    "requests_succeeded": int(source.get("requests_succeeded") or 0),
+                    "requests_failed": int(source.get("requests_failed") or 0),
+                    "input_tokens_observed": int(source.get("tokens_input_observed") or gateway.get("tokens_input_observed") or 0),
+                    "output_tokens_observed": int(source.get("tokens_output_observed") or gateway.get("tokens_output_observed") or 0),
                     "coverage": "measured" if int(gateway.get("requests_with_usage") or 0) else "unknown",
+                    "route_scope": route_scope,
                 }
             self.telemetry_store.update_report(report)
             return report
@@ -3094,7 +3380,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 continue
             if str(session.get("service_name") or "") not in live_services:
                 continue
-            series = self.telemetry_store.series(str(session["session_id"]), limit=1)["samples"]
+            series = self.telemetry_store.series(str(session["session_id"]), limit=1, latest=True)["samples"]
             if series:
                 latest.append({"session": session, "sample": series[-1]})
         latest.sort(key=lambda item: float((item.get("sample") or {}).get("observed_at") or 0), reverse=True)
@@ -3198,6 +3484,39 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             "incident_count": len(state.get("incidents", [])),
             "incidents": entries,
         }
+
+    def record_incident(
+        self,
+        service_name: str,
+        *,
+        reason: str,
+        action: str = "alert",
+        details: JsonDict | None = None,
+    ) -> JsonDict:
+        """Persist a controller incident raised outside the supervisor loop."""
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        if not isinstance(service, dict):
+            return {"recorded": False, "service": service_name, "reason": "service not found"}
+        incident = self._record_incident(
+            state,
+            service_name=service_name,
+            reason=reason,
+            action=action,
+            observation={"source": "runtime_request_guard"},
+            service=service,
+            details=details,
+        )
+        self.write_state(state)
+        # Reuse configured telemetry alert adapters when available. Delivery
+        # failures must not hide the durable incident record.
+        try:
+            delivery = self._alert_dispatcher().dispatch(
+                {"event": "rift.incident", "incident": incident, "details": details or {}},
+            )
+        except Exception:
+            delivery = {"sent": 0, "failed": 1}
+        return {"recorded": True, "alert_delivery": delivery, **incident}
 
     def _service_observation(
         self,
@@ -3879,8 +4198,16 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         raise KeyError(f"evaluation run not found: {value}")
 
     def backend_status(self) -> JsonDict:
+        # Keep the declarative folder catalog visible alongside live runtime
+        # probes.  Static capability claims are useful for discovery, while
+        # the provider detection below remains the authority for what is
+        # actually installed and launchable on this host.
+        from .backends import backend_catalog
+
+        catalog = backend_catalog()
         return {
             "adapter_api_version": self.backend_host.diagnostics().get("adapter_api_version"),
+            "catalog": catalog.diagnostics(),
             "providers": {
                 name: {
                     "detection": self._provider_probe(provider, name),
@@ -4096,18 +4423,32 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         task: str = "chat",
         models_dir: str,
         top: int = 10,
+        workload_contract: JsonDict | None = None,
     ) -> JsonDict:
         if top <= 0:
             raise ValueError("top must be positive")
+        profile = normalize_workload(task=task, workload_contract=workload_contract)
+        task = profile.task
         discovery = self.discover(local=True, models_dir=models_dir, write=False)
         hardware = discovery["nodes"][0]["hardware"]
         ranked: list[JsonDict] = []
         for item in self.scan_local_models(models_dir):
             model = {**item, **dict(item.get("artifact") or {})}
+            model["context_length"] = profile.context_length
+            model["concurrency"] = profile.concurrency
             decision = self._select_provider_for_model(
-                model=model, hardware=hardware, requested="auto"
+                model=model,
+                hardware=hardware,
+                requested="auto",
+                workload=task,
+                probe_cache=discovery["nodes"][0].get("backends"),
             )
             backend = str(decision.get("backend") or "")
+            preferred_backend = str(profile.backend_preference or "").strip().lower()
+            preferred = next((candidate for candidate in decision.get("candidates", [])
+                if str(candidate.get("backend") or "").lower() == preferred_backend and candidate.get("fits")), None)
+            if preferred:
+                backend = preferred_backend
             winner = next(
                 (candidate for candidate in decision.get("candidates", []) if candidate.get("backend") == backend),
                 None,
@@ -4115,6 +4456,24 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             if not winner or not winner.get("fits"):
                 continue
             size = int(item.get("size") or model.get("total_bytes") or model.get("size") or 0)
+            family_preference = str(profile.model_family_preference or "").strip().lower()
+            family_match = model_family_matches(family_preference, str(item.get("path") or "")) if family_preference else False
+            capability_status = assess_metadata_capabilities(
+                repo_id=str(item.get("path") or ""),
+                tags=[str(tag) for tag in model.get("tags", [])] if isinstance(model.get("tags"), list) else [],
+                tool_calling=profile.tool_calling,
+                structured_output=profile.structured_output,
+            )
+            if "unsupported" in capability_status.values():
+                continue
+            if preferred_backend and backend != preferred_backend:
+                warnings = [f"preferred backend {preferred_backend!r} was unavailable; selected {backend}"]
+            else:
+                warnings = []
+            if family_preference and not family_match:
+                warnings.append(f"preferred model family {profile.model_family_preference!r} was not matched")
+            if any(status == "unknown" for status in capability_status.values()):
+                warnings.append("required tool/structured-output support must be verified for this local artifact")
             ranked.append(
                 {
                     "repo_id": str(item["path"]),
@@ -4127,28 +4486,51 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "selected_download_bytes": 0,
                     "estimated_download_bytes": size,
                     "parameters_b": model.get("parameters_b"),
+                    "capability_score": self._model_capability_score({**model, **item}),
                     "model_type": model.get("architecture") or model.get("model_type") or "local artifact",
                     "backend": backend,
                     "license": model.get("license") or "unknown",
                     "gated": False,
-                    "final_score": float(winner.get("score") or 0.0),
+                    "final_score": float((preferred or winner).get("score") or 0.0) + (0.08 if family_match else 0.0),
                     "confidence": 0.5,
                     "scores": {"hardware_fit": float(winner.get("score") or 0.0), "quality_proxy": 0.0},
                     "evidence": [
                         "artifact was inspected from the supplied local path",
                         str(winner.get("reason") or "backend accepted the local artifact"),
                     ],
-                    "warnings": [],
+                    "warnings": warnings,
+                    "workload_match": {"objective": profile.objective,
+                        "preferences": {**({"backend": "matched" if backend == preferred_backend else "fallback"} if preferred_backend else {}),
+                                        **({"model_family": "matched" if family_match else "fallback"} if family_preference else {})}},
+                    "capability_status": capability_status,
                     "artifact_selection": model,
                     "disk_feasibility": {"status": "local_artifact", "required_bytes": 0},
                     "backend_candidates": decision.get("candidates", []),
                 }
             )
-        ranked.sort(key=lambda item: (-float(item["final_score"]), int(item.get("estimated_download_bytes") or 0), str(item["repo_id"])))
+        if workload_contract is None:
+            ranked.sort(key=lambda item: (
+                -float(item.get("capability_score") or 0.0),
+                -float(item.get("final_score") or 0.0),
+                -self._artifact_local_preference(item),
+                int(item.get("estimated_download_bytes") or 0),
+                str(item["repo_id"]),
+            ))
+        else:
+            ranked.sort(key=lambda item: (
+                -float(item.get("final_score") or 0.0),
+                -float(item.get("capability_score") or 0.0),
+                -self._artifact_local_preference(item),
+                int(item.get("estimated_download_bytes") or 0),
+                str(item["repo_id"]),
+            ))
         run_id = f"local-{time.time_ns()}"
         result = {
             "recommendation_run_id": run_id,
             "task": task,
+            "workload_profile": profile.to_dict(),
+            "workload_contract_hash": content_hash(workload_contract) if workload_contract is not None else None,
+            "request_fingerprint": content_hash({"workload": profile.to_dict(), "source": "local", "models_dir": str(Path(models_dir).resolve()), "hardware": hardware.get("fingerprint")}),
             "source": "local",
             "recommendations": ranked[:top],
             "candidate_counts": {"raw": len(ranked), "after_filters": len(ranked), "enriched": len(ranked), "returned": min(top, len(ranked))},
@@ -4423,8 +4805,8 @@ class RiftOrchestrator(TuningCoordinatorMixin):
     ) -> JsonDict:
         if warmups < 0 or repetitions <= 0:
             raise ValueError("warmups cannot be negative and repetitions must be positive")
-        if max_tokens <= 0 or max_tokens > 128:
-            raise ValueError("max_tokens must be between 1 and 128")
+        if max_tokens <= 0 or max_tokens > 1024:
+            raise ValueError("max_tokens must be between 1 and 1024")
         if concurrency <= 0:
             raise ValueError("concurrency must be positive")
         state = self.read_state()
@@ -4436,6 +4818,25 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         api_base = runtime.get("api_base") or (service.get("launch_plan") or {}).get("api_base")
         if not provider or not api_base:
             return {"available": False, "reason": "service has no benchmarkable provider/api_base"}
+        endpoint = self._evaluation_endpoint(
+            service_name=service_name,
+            service=service,
+            backend_api_base=str(api_base),
+        )
+        if not endpoint.get("available"):
+            return {"available": False, "reason": endpoint.get("reason"), "endpoint": endpoint}
+        structured_gateway = endpoint.get("kind") == "gateway"
+        gateway_config = service.get("gateway") if isinstance(service.get("gateway"), dict) else {}
+        schema_value = gateway_config.get("output_schema")
+        if isinstance(schema_value, dict) and isinstance(schema_value.get("schema"), dict):
+            schema_value = schema_value["schema"]
+        if structured_gateway and not str(prompt or "").strip() and isinstance(schema_value, dict):
+            prompt = (
+                "Return exactly one JSON object matching the approved schema. "
+                "Use concise values, use today's ISO date for date fields, and no markdown. Schema: "
+                + json.dumps(schema_value, sort_keys=True, separators=(",", ":"))
+            )
+            max_tokens = max(max_tokens, 128)
         suite = (
             BenchmarkSuite()
             if not str(prompt or "").strip()
@@ -4452,7 +4853,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         )
         report = suite.run(
             provider.benchmark,
-            base_url=str(api_base),
+            base_url=str(endpoint["url"]),
             warmups=warmups,
             repetitions=repetitions,
             concurrency=concurrency,
@@ -4464,6 +4865,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 "hardware_fingerprint": (self.engine.hardware_profile() or {}).get("fingerprint"),
                 "operator_prompt": bool(str(prompt or "").strip()),
                 "max_tokens": int(max_tokens),
+                "acceptance_endpoint": endpoint,
             },
         )
         if write:
@@ -4542,6 +4944,11 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 health = provider.health(base_url=api_base, timeout_seconds=2.0)
             except Exception as exc:
                 health = {"healthy": False, "reason": str(exc)}
+        evaluation_endpoint = self._evaluation_endpoint(
+            service_name=service_name,
+            service=service,
+            backend_api_base=api_base,
+        )
         model = service.get("model") or {}
         model_id = str(
             runtime.get("model")
@@ -4552,12 +4959,13 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         )
         run_id = f"evaluation-{service_name}-{time.time_ns()}"
         configuration = {
-            "max_tokens": min(128, int(max_tokens)),
+            "max_tokens": min(1024, int(max_tokens)),
             "deadline_seconds": float(total_deadline_seconds),
             "retain_responses": bool(retain_responses),
             "required": bool(required),
             "context_length": (service.get("serving") or {}).get("context_length"),
             "concurrency": (service.get("serving") or {}).get("concurrency"),
+            "endpoint": evaluation_endpoint,
         }
         judge_invoke = None
         if judge is not None:
@@ -4600,10 +5008,12 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 "external_data_consent": True,
                 "credential_ref": credential_ref,
             }
-        if not api_base or provider is None or not bool((health or {}).get("healthy")):
+        if not api_base or provider is None or not bool((health or {}).get("healthy")) or not evaluation_endpoint.get("available"):
             reason = (
                 "service is not healthy or has no OpenAI-compatible endpoint"
                 if not health
+                else str(evaluation_endpoint.get("reason") or "")
+                if not evaluation_endpoint.get("available")
                 else str(health.get("reason") or "service health check failed")
             )
             run = EvaluationRun(
@@ -4623,12 +5033,16 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             result = run.to_dict()
             result.update({"available": False, "health": health, "required": bool(required)})
         else:
-            invoke = invoke_openai_compatible(api_base, model=model_id, timeout_seconds=min(30.0, total_deadline_seconds))
+            invoke = invoke_openai_compatible(
+                str(evaluation_endpoint["url"]),
+                model=model_id,
+                timeout_seconds=min(30.0, total_deadline_seconds),
+            )
             run = evaluate_suite(
                 selected_suite,
                 invoke,
                 run_id=run_id,
-                max_tokens=min(128, int(max_tokens)),
+                max_tokens=min(1024, int(max_tokens)),
                 total_deadline_seconds=total_deadline_seconds,
                 retain_responses=retain_responses,
                 service=service_name,
@@ -4660,6 +5074,145 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             },
         )
         return result
+
+    def verify_tool_capability(
+        self,
+        *,
+        service_name: str = "chat",
+        timeout_seconds: float = 60.0,
+        write: bool = True,
+    ) -> JsonDict:
+        """Verify tool-call emission for the exact deployed service.
+
+        This is intentionally narrower than tool execution.  RIFT probes the
+        live model/backend/template/runtime combination with harmless synthetic
+        schemas and records whether it emits valid calls.  The caller remains
+        responsible for a real broker, authorization, and side effects.
+        """
+
+        state = self.read_state()
+        service = state.get("services", {}).get(service_name)
+        if not isinstance(service, dict):
+            return {
+                "available": False,
+                "status": "NOT_RUN",
+                "service": service_name,
+                "reason": f"service not found in state: {service_name}",
+                "tool_execution": "not_evaluated",
+            }
+        backend_name = str(service.get("backend") or "")
+        provider = self.providers.get(backend_name)
+        runtime = service.get("runtime") or {}
+        launch_plan = service.get("launch_plan") or {}
+        api_base = str(runtime.get("api_base") or launch_plan.get("api_base") or "").strip()
+        model = service.get("model") or {}
+        model_id = str(
+            runtime.get("model")
+            or launch_plan.get("model")
+            or model.get("id")
+            or model.get("selected_file")
+            or service_name
+        )
+        identity = {
+            "service_revision": service.get("revision") or service.get("deployment_revision"),
+            "backend": backend_name,
+            "backend_build": runtime.get("backend_build") or launch_plan.get("backend_build"),
+            "artifact": model.get("selected_file") or model.get("local_path") or model.get("id"),
+            "artifact_sha256": model.get("sha256") or model.get("artifact_sha256"),
+            "chat_template": runtime.get("chat_template") or launch_plan.get("chat_template"),
+            "tool_call_parser": runtime.get("tool_call_parser") or launch_plan.get("tool_call_parser"),
+            "launch_flags": launch_plan.get("args") or launch_plan.get("command"),
+        }
+        if provider is None or not api_base:
+            result = {
+                "available": False,
+                "status": "NOT_RUN",
+                "service": service_name,
+                "backend": backend_name,
+                "model": model_id,
+                "identity": identity,
+                "reason": "service has no registered provider or OpenAI-compatible endpoint",
+                "tool_execution": "not_evaluated",
+            }
+        else:
+            try:
+                result = provider.verify_tool_capability(
+                    base_url=api_base,
+                    model=model_id,
+                    identity=identity,
+                    timeout_seconds=timeout_seconds,
+                )
+                result = dict(result)
+                result.update({"service": service_name, "backend": backend_name, "model": model_id, "identity": identity})
+            except Exception as exc:
+                result = {
+                    "available": False,
+                    "status": "NOT_RUN",
+                    "service": service_name,
+                    "backend": backend_name,
+                    "model": model_id,
+                    "identity": identity,
+                    "reason": str(exc)[:500],
+                    "tool_execution": "not_evaluated",
+                }
+        if write:
+            target = self._timestamped("reports", f"{service_name}-tool-capability")
+            self._write_json(target, result)
+            result["report_path"] = str(target)
+        self.observability_store.append(
+            "tool_capability_completed",
+            status="ok" if result.get("status") == "VERIFIED" else "warning",
+            service=service_name,
+            details={
+                "backend": backend_name,
+                "model": model_id,
+                "status": result.get("status"),
+                "tool_execution": result.get("tool_execution", "not_evaluated"),
+            },
+        )
+        return result
+
+    def _evaluation_endpoint(
+        self,
+        *,
+        service_name: str,
+        service: JsonDict,
+        backend_api_base: str,
+    ) -> JsonDict:
+        """Resolve the endpoint used for correctness acceptance.
+
+        A structured-output workload must be tested through RIFT's enforcing
+        gateway. Falling back to the backend would only test model behavior
+        and could falsely claim that the approved schema was enforced.
+        """
+        gateway = service.get("gateway") if isinstance(service.get("gateway"), dict) else {}
+        required = bool(gateway.get("structured_output_enforced"))
+        if not required:
+            return {"url": str(backend_api_base), "kind": "backend", "available": bool(backend_api_base), "reason": None}
+        status = self.gateway_status()
+        state = status.get("state") if isinstance(status.get("state"), dict) else status
+        alive = bool(status.get("process_alive")) and str(status.get("status") or "").lower() == "running"
+        routed_service = str(state.get("service_name") or "")
+        if not alive or routed_service != str(service_name):
+            return {
+                "url": None,
+                "kind": "gateway",
+                "available": False,
+                "reason": "structured-output acceptance requires a live gateway route for this service",
+            }
+        host = str(gateway.get("host") or state.get("host") or "127.0.0.1")
+        if host in {"0.0.0.0", "::", ""}:
+            host = "127.0.0.1"
+        try:
+            port = int(gateway.get("port") or state.get("port") or 11734)
+        except (TypeError, ValueError):
+            port = 11734
+        return {
+            "url": f"http://{host}:{port}",
+            "kind": "gateway",
+            "available": True,
+            "reason": None,
+        }
 
     def logs(self, *, service_name: str = "chat", tail: int = 200) -> JsonDict:
         if tail <= 0:
@@ -4784,42 +5337,37 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         target = output or self.rift_dir / "manifests" / f"{int(time.time())}-deployment.json"
         return {"manifest": manifest, "path": write_deployment_manifest(manifest, target)}
 
-    def gateway_status(self) -> JsonDict:
-        state_path = self.rift_dir / "gateway" / "state.json"
-        metrics_path = self.rift_dir / "gateway" / "metrics.json"
-        gateway_state: JsonDict = {}
-        metrics: JsonDict = {}
-        if state_path.is_file():
-            try:
-                gateway_state = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                gateway_state = {"status": "invalid", "error": str(exc)}
-        if metrics_path.is_file():
-            try:
-                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
-                metrics = {"error": str(exc)}
-        pid_value = gateway_state.get("pid")
-        pid = int(pid_value) if pid_value not in (None, "") else None
-        process_alive = self._process_alive(pid) if pid is not None else False
-        recorded_status = str(gateway_state.get("status") or "not_started")
-        effective_status = (
-            "running"
-            if recorded_status == "running" and process_alive
-            else "stale"
-            if recorded_status == "running"
-            else recorded_status
+    def gateway_start(
+        self,
+        *,
+        service_name: str = "chat",
+        config_path: str | Path | None = None,
+        host: str | None = None,
+        port: int | None = None,
+        group_id: str | None = None,
+    ) -> JsonDict:
+        result = (
+            self.gateway_manager.start_group(group_id, config_path, host=host, port=port)
+            if group_id
+            else self.gateway_manager.start_main(config_path, service_name=service_name, host=host, port=port)
         )
-        return {
-            "configured": bool(gateway_state),
-            "status": effective_status,
-            "process_alive": process_alive,
-            "state": gateway_state,
-            "metrics": metrics,
-            "state_path": str(state_path),
-            "metrics_path": str(metrics_path),
-            "api_keys": self.api_keys.list(),
-        }
+        self.observability_store.append(
+            "gateway_started" if result.get("started") else "gateway_already_running",
+            details={key: value for key, value in result.items() if key not in {"pid"}},
+        )
+        return {**result, "api_keys": self.api_keys.list()}
+
+    def gateway_stop(self, *, group_id: str | None = None) -> JsonDict:
+        result = self.gateway_manager.stop_group(group_id) if group_id else self.gateway_manager.stop_main()
+        self.observability_store.append("gateway_stopped", details={key: value for key, value in result.items() if key not in {"pid"}})
+        return {**result, "api_keys": self.api_keys.list()}
+
+    def gateway_status(self, *, group_id: str | None = None) -> JsonDict:
+        result = self.gateway_manager.group_status(group_id) if group_id else self.gateway_manager.status()
+        if group_id is None:
+            result.setdefault("state", {key: value for key, value in result.items() if key in {"kind", "host", "port", "config_path", "service_name", "pid", "status"}})
+            result.setdefault("metrics", {})
+        return {**result, "api_keys": self.api_keys.list()}
 
     def gateway_key_create(self, *, label: str, quota: JsonDict | None = None) -> JsonDict:
         result = self.api_keys.create(label=label, quota=quota)
@@ -5061,7 +5609,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 **windowed,
                 "median_tokens_per_second": windowed.get("tokens_per_second"),
                 "median_elapsed_seconds": windowed.get("latency_seconds"),
-                "p95_elapsed_seconds": windowed.get("latency_seconds"),
+                "p95_elapsed_seconds": None,
                 "median_first_token_seconds": windowed.get("ttft_seconds"),
                 "generated_tokens_estimate": windowed.get("tokens"),
                 "failure_count": windowed.get("failures", 0),
@@ -5119,7 +5667,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         if not api_base:
             raise ValueError("api_base is required for cost profiling")
         for _ in range(warmup_runs):
-            provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False)
+            provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False, seed=17, temperature=0.0)
         samples: list[JsonDict] = []
         energy_results: list[JsonDict] = []
         for _ in range(repeats):
@@ -5127,7 +5675,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             cpu_before = self._tuning_process_cpu_seconds(service_name)
             sampler.start()
             try:
-                sample = dict(provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False) or {})
+                sample = dict(provider.benchmark(base_url=api_base, prompt=prompt, max_tokens=max_tokens, ignore_eos=False, seed=17, temperature=0.0) or {})
             finally:
                 energy_results.append(sampler.stop())
             cpu_after = self._tuning_process_cpu_seconds(service_name)
@@ -5234,6 +5782,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 "method": "normal_approximation",
                 "sample_count": 0,
             }
+        if profile == "speed" and "objective_samples" in raw:
+            from .tuning_benchmark import bootstrap_interval
+            return {**bootstrap_interval(raw["objective_samples"]), "metric": raw.get("objective_definition")}
         samples = raw.get("samples") if isinstance(raw, dict) else None
         values: list[float] = []
         if profile == "speed":
@@ -5317,6 +5868,9 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         baseline_raw: JsonDict,
         candidate_raw: JsonDict,
     ) -> list[float]:
+        if profile == "speed" and ("objective_samples" in baseline_raw or "objective_samples" in candidate_raw):
+            from .tuning_benchmark import improvement_interval
+            return improvement_interval(baseline_raw.get("objective_samples", []), candidate_raw.get("objective_samples", []))
         if profile == "speed":
             baseline_value = float(baseline.tokens_per_second or 0.0)
             candidate_value = float(candidate.tokens_per_second or 0.0)

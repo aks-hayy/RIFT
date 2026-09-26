@@ -223,6 +223,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run category, repo id, identity id, or artifact id",
     )
     plan.add_argument(
+        "--monitoring-profile",
+        help="Telemetry profile to persist for the generated service (default, minimal, performance, cost, or custom)",
+    )
+    plan.add_argument(
+        "--monitoring-metrics",
+        help="Comma-separated telemetry metric IDs when using a custom profile",
+    )
+    plan.add_argument(
+        "--monitoring-policy",
+        help="YAML/JSON objective policy to attach to the generated service",
+    )
+    plan.add_argument(
         "--materialized-config",
         help="Optional path for YAML generated from --recommendation-run",
     )
@@ -334,12 +346,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_model_group(commands)
     _add_backend_group(commands)
+    _add_gateway_group(commands)
     _add_tuning_command(commands)
     _add_service_group(commands)
     _add_cluster_group(commands)
     _add_node_group(commands)
     _add_mesh_group(commands)
+    _add_workload_group(commands)
     _add_system_group(commands)
+    _parser(commands, "shell", "Open the interactive RIFT shell")
     return parser
 
 
@@ -375,8 +390,13 @@ def _add_model_group(commands) -> None:
         help="Model source to rank; local uses artifacts found under --models-dir",
     )
     recommend.add_argument("--models-dir", help="Local model directory used with --source local")
+    recommend.add_argument("--model-ref", help="Inspect one exact Hugging Face repository")
     recommend.add_argument("--top", type=int, default=10)
     recommend.add_argument("--candidate-limit", type=int, default=250)
+    recommend.add_argument("--search-candidate-limit", type=int, default=250,
+                           help="Maximum Hub candidates to inspect before returning the shortlist")
+    recommend.add_argument("--workload-id", help="Use a saved workload draft as discovery intent")
+    recommend.add_argument("--workload-revision", type=int, help="Exact saved workload revision to inspect")
     recommend.add_argument("--max-download-gb", type=float)
     recommend.add_argument("--formats")
     recommend.add_argument("--include-gated", action="store_true")
@@ -462,6 +482,39 @@ def _add_backend_group(commands) -> None:
     health.add_argument("--base-url", default="http://127.0.0.1:11735")
 
 
+def _add_gateway_group(commands) -> None:
+    gateway = _parser(
+        commands,
+        "gateway",
+        "Start, stop, and inspect the shared OpenAI-compatible gateway",
+        epilog=(
+            "Examples:\n"
+            "  rift gateway start --config rift.yaml\n"
+            "  rift gateway status\n"
+            "  rift gateway group start team-a --port 11736"
+        ),
+    )
+    sub = _subcommands(gateway, title="gateway commands", dest="gateway_command")
+    start = _parser(sub, "start", "Start the shared controller gateway")
+    start.add_argument("--config", default="rift.yaml")
+    start.add_argument("--service", default="chat")
+    start.add_argument("--host")
+    start.add_argument("--port", type=int)
+    stop = _parser(sub, "stop", "Stop the shared controller gateway")
+    status = _parser(sub, "status", "Show gateway process, route, and metric status")
+    group = _parser(sub, "group", "Manage an optional dedicated group listener")
+    group_sub = _subcommands(group, title="group gateway commands", dest="gateway_group_command")
+    group_start = _parser(group_sub, "start", "Start a dedicated listener for a service group")
+    group_start.add_argument("group_id")
+    group_start.add_argument("--config", default="rift.yaml")
+    group_start.add_argument("--host")
+    group_start.add_argument("--port", type=int, required=True)
+    group_stop = _parser(group_sub, "stop", "Stop a dedicated group listener")
+    group_stop.add_argument("group_id")
+    group_status = _parser(group_sub, "status", "Show a dedicated group listener status")
+    group_status.add_argument("group_id")
+
+
 def _add_service_group(commands) -> None:
     service = _parser(
         commands,
@@ -513,9 +566,17 @@ def _add_service_group(commands) -> None:
     telemetry.add_argument("--limit", type=int, default=100)
     telemetry.add_argument("--since", type=float)
     telemetry.add_argument("--until", type=float)
+    objectives = _parser(sub, "objectives", "Show configured service objectives and live status")
+    objectives.add_argument("--service", default="chat")
+    objectives.add_argument("--session-id")
+    objectives.add_argument("--events", action="store_true", help="Include objective state transitions")
+    objectives.add_argument("--report", action="store_true", help="Show the latest completed objective report")
+    objectives.add_argument("--limit", type=int, default=100)
     gateway = _parser(sub, "gateway", "Run the policy-enforcing OpenAI-compatible gateway")
+    gateway.add_argument("gateway_action", nargs="?", choices=["run"], default="run")
     gateway.add_argument("--config", default="rift.yaml")
     gateway.add_argument("--service", default="chat")
+    gateway.add_argument("--group")
     gateway.add_argument("--host")
     gateway.add_argument("--port", type=int)
     gateway.add_argument("--fallback-service", dest="fallback_services", action="append")
@@ -536,7 +597,7 @@ def _add_tune_options(tune) -> None:
     tune.add_argument("--controller-url", help="Controller URL for a persistent profiled run")
     tune.add_argument("--candidate-limit", type=int, default=4)
     tune.add_argument("--warmups", type=int, default=1)
-    tune.add_argument("--repeats", type=int, default=2)
+    tune.add_argument("--repeats", type=int, default=5)
     tune.add_argument("--startup-timeout", type=float, default=180.0)
     tune.add_argument("--prompt", default="Reply briefly: what is one benefit of local inference?")
     tune.add_argument("--max-tokens", type=int, default=32)
@@ -760,6 +821,55 @@ def _add_system_group(commands) -> None:
     migrate.add_argument("--paths", action="store_true", help="Migrate checkout-local .rift/models data")
     migrate.add_argument("--source-root", help="Checkout root to inspect; defaults to the current directory")
     migrate.add_argument("--move", action="store_true", help="Remove legacy source data after verified copy")
+
+
+def _add_workload_group(commands) -> None:
+    workload = _parser(
+        commands,
+        "workload",
+        "Compile, approve, and run a workload within explicit permissions",
+        epilog=(
+            "Examples:\n"
+            "  rift workload compile --text \"coding assistant, 30 tok/s, 8K context, offline\" --confirm-default-quality\n"
+            "  rift workload compile --file workload.json\n"
+            "  rift workload compile --text \"invoice extraction with strict JSON\" --output-schema ehr.schema.json\n"
+            "  rift workload show DRAFT_ID\n"
+            "  rift workload approve DRAFT_ID --allow-launch --yes\n"
+            "  rift workload run --approval-id APPROVAL_ID --models-dir .rift/models"
+        ),
+    )
+    sub = _subcommands(workload, title="workload commands", dest="workload_command")
+    compile_parser = _parser(sub, "compile", "Compile text or JSON/YAML into an editable draft")
+    source = compile_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--text", help="Natural-language workload request")
+    source.add_argument("--file", help="UTF-8 JSON/YAML workload file")
+    compile_parser.add_argument("--no-save", action="store_true", help="Print the draft without persisting it")
+    compile_parser.add_argument("--confirm-default-quality", action="store_true", help="Accept rift-text-core/v1 at 0.90 when the request does not name a suite")
+    compile_parser.add_argument("--output-schema", metavar="FILE", help="Attach a local JSON Schema for strict JSON output requirements")
+    show = _parser(sub, "show", "Show a saved workload draft")
+    show.add_argument("draft_id")
+    approve = _parser(sub, "approve", "Approve a draft with explicit permissions and budgets")
+    approve.add_argument("draft_id")
+    approve.add_argument("--network", choices=("offline", "approved_sources"), default="offline")
+    approve.add_argument("--allow-download", action="store_true")
+    approve.add_argument("--allow-install", action="store_true")
+    approve.add_argument("--allow-launch", action="store_true", help="Authorize temporary model launch")
+    approve.add_argument("--allow-restart", action="store_true")
+    approve.add_argument("--allow-promote", action="store_true")
+    approve.add_argument("--allow-cleanup", action="store_true")
+    approve.add_argument("--allow-remote", action="store_true")
+    approve.add_argument("--allow-quantization-alternatives", action="store_true")
+    approve.add_argument("--exploration-seconds", type=int, default=3600)
+    approve.add_argument("--max-artifacts", type=int, default=3)
+    approve.add_argument("--tuning-candidates", type=int, default=24)
+    approve.add_argument("--total-download-gib", type=float, default=36.0)
+    approve.add_argument("--yes", action="store_true", help="Confirm the displayed permission envelope")
+    run = _parser(sub, "run", "Execute an approved workload within its saved action envelope")
+    run.add_argument("--approval-id", required=True)
+    run.add_argument("--models-dir", help="Local model directory for offline workloads")
+    run.add_argument("--model-ref", help="Exact Hugging Face model repository for online workloads")
+    run.add_argument("--candidate-limit", type=int, default=3)
+    run.add_argument("--no-tune", action="store_true", help="Do not invoke Speed/Cost tuning after deployment")
 
 
 __all__ = ["RiftArgumentParser", "RiftHelpFormatter", "build_parser"]

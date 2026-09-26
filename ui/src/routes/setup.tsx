@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { rift } from "@/lib/rift/client";
+import { useTelemetryCatalog } from "@/lib/rift/hooks";
 import { bytes } from "@/lib/rift/format";
 import type {
   UseCase,
@@ -44,6 +45,7 @@ import type {
   MeshNode,
   MeshSighting,
   ManagedEnrollment,
+  MonitoringObjective,
 } from "@/lib/rift/types";
 import { Unavailable } from "@/components/rift/unavailable";
 import { getNextSetupStep, getPreviousSetupStep } from "@/lib/rift/setup-flow";
@@ -55,7 +57,7 @@ import {
 export const Route = createFileRoute("/setup")({
   head: () => ({
     meta: [
-      { title: "Guided setup — RIFT" },
+      { title: "Best Fit Setup — RIFT" },
       {
         name: "description",
         content: "Discover hardware, choose a model, review the plan, and deploy in one flow.",
@@ -79,6 +81,9 @@ interface SetupState {
   chosenRecommendation: ModelRecommendation | null;
   serviceName: string;
   exposure: "local" | "lan" | "public";
+  monitoringProfile: string;
+  monitoringMetrics: string[];
+  monitoringObjectives: MonitoringObjective[];
   plan: Plan | null;
   applyStarted: boolean;
   applyProgress: ApplyProgress | null;
@@ -113,6 +118,9 @@ function SetupPage() {
     chosenRecommendation: null,
     serviceName: "",
     exposure: "local",
+    monitoringProfile: "default",
+    monitoringMetrics: [],
+    monitoringObjectives: [],
     plan: null,
     applyStarted: false,
     applyProgress: null,
@@ -208,7 +216,20 @@ function SetupPage() {
               <StepService
                 serviceName={s.serviceName}
                 exposure={s.exposure}
-                onChange={(name, exp) => setS((p) => ({ ...p, serviceName: name, exposure: exp }))}
+                monitoringProfile={s.monitoringProfile}
+                monitoringMetrics={s.monitoringMetrics}
+                monitoringObjectives={s.monitoringObjectives}
+                onChange={(name, exp, profile, metrics, objectives) =>
+                  setS((p) => ({
+                    ...p,
+                    serviceName: name,
+                    exposure: exp,
+                    monitoringProfile: profile,
+                    monitoringMetrics: metrics,
+                    monitoringObjectives: objectives,
+                    plan: null,
+                  }))
+                }
                 onNext={next}
               />
             )}
@@ -217,6 +238,9 @@ function SetupPage() {
                 recommendation={s.chosenRecommendation}
                 serviceName={s.serviceName}
                 exposure={s.exposure}
+                monitoringProfile={s.monitoringProfile}
+                monitoringMetrics={s.monitoringMetrics}
+                monitoringObjectives={s.monitoringObjectives}
                 plan={s.plan}
                 onPlan={(p) => set("plan", p)}
                 onNext={next}
@@ -1229,6 +1253,7 @@ function StepRecommendation({
         source,
         localPath: source === "local" ? sourceReference : undefined,
         modelRef: source === "huggingface" && sourceReference ? sourceReference : undefined,
+        refresh: attempt > 0,
       })
       .then((r) => alive && setResult(r))
       .catch((e) => alive && setErr(e));
@@ -1304,6 +1329,16 @@ function StepRecommendation({
                 Retry
               </button>
             </div>
+          )}
+          {result.cacheProvenance?.source === "huggingface" && (
+            <p className="mt-3 text-[11px] text-ink-muted">
+              Hub metadata: {result.cacheProvenance.refreshed
+                ? "refreshed for this search"
+                : result.cacheProvenance.oldestEntryAgeSeconds == null
+                  ? "no cached metadata was available"
+                  : `cached; oldest entry ${Math.floor(result.cacheProvenance.oldestEntryAgeSeconds / 3600)}h old`}
+              {" · "}refresh window {Math.floor(result.cacheProvenance.ttlSeconds / 3600)}h
+            </p>
           )}
           <div className="mt-6 grid gap-3">
             {result.recommendations.map((r) => (
@@ -1444,14 +1479,55 @@ function RCell({ label, value, sub }: { label: string; value: string; sub?: stri
 function StepService({
   serviceName,
   exposure,
+  monitoringProfile,
+  monitoringMetrics,
+  monitoringObjectives,
   onChange,
   onNext,
 }: {
   serviceName: string;
   exposure: "local" | "lan" | "public";
-  onChange: (name: string, exp: "local" | "lan" | "public") => void;
+  monitoringProfile: string;
+  monitoringMetrics: string[];
+  monitoringObjectives: MonitoringObjective[];
+  onChange: (
+    name: string,
+    exp: "local" | "lan" | "public",
+    profile: string,
+    metrics: string[],
+    objectives: MonitoringObjective[],
+  ) => void;
   onNext: () => void;
 }) {
+  const catalog = useTelemetryCatalog();
+  const fallbackProfiles = [
+    { id: "minimal", name: "Minimal", description: "Low-overhead service and accelerator health.", metrics: ["process_cpu_percent", "process_rss_bytes", "gpu_utilization_percent", "gpu_vram_pressure_percent"] },
+    { id: "default", name: "Default", description: "Core utilization, memory pressure, VRAM pressure, and power telemetry.", metrics: ["cpu_percent", "process_cpu_percent", "process_rss_bytes", "host_ram_pressure_percent", "gpu_utilization_percent", "gpu_vram_pressure_percent", "gpu_power_watts"] },
+    { id: "performance", name: "Performance", description: "Adds host pressure signals for diagnosing contention.", metrics: ["cpu_percent", "process_cpu_percent", "process_rss_bytes", "host_ram_pressure_percent", "cpu_temperature_c", "gpu_utilization_percent", "gpu_temperature_c", "gpu_vram_used_bytes", "gpu_vram_pressure_percent", "gpu_power_watts"] },
+    { id: "cost", name: "Cost", description: "Power and memory signals for energy and capacity accounting.", metrics: ["process_cpu_percent", "process_rss_bytes", "host_ram_pressure_percent", "gpu_vram_used_bytes", "gpu_vram_pressure_percent", "gpu_power_watts"] },
+  ];
+  const profiles = catalog.data?.profiles?.length ? catalog.data.profiles : fallbackProfiles;
+  const metrics = catalog.data?.metrics ?? fallbackProfiles.find((item) => item.id === "default")!.metrics.map((id) => ({ id, label: id.replaceAll("_", " "), description: "", unit: "", kind: "gauge" as const, scope: "service", source: "local", default: true }));
+  const selectedProfile = profiles.find((profile) => profile.id === monitoringProfile) ?? profiles[0];
+  const selectedMetrics = monitoringProfile === "custom" || monitoringMetrics.length
+    ? monitoringMetrics
+    : selectedProfile?.metrics ?? [];
+  const update = (profile: string, selected: string[], objectives = monitoringObjectives) => onChange(serviceName, exposure, profile, selected, objectives);
+  const toggleMetric = (metric: string) => {
+    const next = selectedMetrics.includes(metric)
+      ? selectedMetrics.filter((item) => item !== metric)
+      : [...selectedMetrics, metric];
+    update("custom", next);
+  };
+  const updateObjective = (index: number, patch: Partial<MonitoringObjective>) => {
+    const next = monitoringObjectives.map((objective, itemIndex) => itemIndex === index ? { ...objective, ...patch } : objective);
+    onChange(serviceName, exposure, monitoringProfile, monitoringMetrics, next);
+  };
+  const addObjective = () => onChange(serviceName, exposure, monitoringProfile, monitoringMetrics, [
+    ...monitoringObjectives,
+    { id: `objective-${monitoringObjectives.length + 1}`, metric: metrics[0]?.id ?? "cpu_percent", operator: "<=", threshold: 90, aggregation: "latest", windowSeconds: 300, consecutiveBreaches: 3 },
+  ]);
+  const removeObjective = (index: number) => onChange(serviceName, exposure, monitoringProfile, monitoringMetrics, monitoringObjectives.filter((_, itemIndex) => itemIndex !== index));
   return (
     <div>
       <StepTitle
@@ -1465,7 +1541,7 @@ function StepService({
           <input
             type="text"
             value={serviceName}
-            onChange={(e) => onChange(e.target.value, exposure)}
+            onChange={(e) => onChange(e.target.value, exposure, monitoringProfile, monitoringMetrics, monitoringObjectives)}
             placeholder="chat-8b"
             className="h-10 px-3 rounded-[4px] border border-border bg-raised text-[13px] rift-mono focus:outline-none focus:border-primary"
           />
@@ -1497,7 +1573,7 @@ function StepService({
                 name="exposure"
                 className="mt-1"
                 checked={exposure === o.id}
-                onChange={() => onChange(serviceName, o.id as "local" | "lan" | "public")}
+                onChange={() => onChange(serviceName, o.id as "local" | "lan" | "public", monitoringProfile, monitoringMetrics, monitoringObjectives)}
               />
               <span>
                 <span className="block text-[13px] font-medium text-ink">{o.label}</span>
@@ -1506,8 +1582,64 @@ function StepService({
             </label>
           ))}
         </fieldset>
+        <fieldset className="grid gap-3">
+          <legend className="rift-label mb-1">Monitoring profile</legend>
+          <select
+            aria-label="Monitoring profile"
+            value={monitoringProfile}
+            onChange={(event) => {
+              const profile = event.target.value;
+              const nextProfile = profiles.find((item) => item.id === profile);
+              update(profile, profile === "custom" ? selectedMetrics : nextProfile?.metrics ?? []);
+            }}
+            className="h-10 rounded-[4px] border border-border bg-raised px-3 text-[13px]"
+          >
+            {profiles.map((profile) => (
+              <option key={profile.id} value={profile.id}>{profile.name}</option>
+            ))}
+            <option value="custom">Custom</option>
+          </select>
+          <p className="text-[12px] text-ink-secondary">
+            Choose the collection budget for this service. Metrics are stored only when selected;
+            alert rules are configured separately.
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {metrics.map((metric) => (
+              <label key={metric.id} className="flex items-start gap-2 p-2.5 rounded-[4px] border border-border bg-raised text-[12px]">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-[var(--oxide)]"
+                  checked={selectedMetrics.includes(metric.id)}
+                  onChange={() => toggleMetric(metric.id)}
+                />
+                <span>
+                  <span className="block text-ink font-medium">{metric.label}</span>
+                  <span className="block text-ink-secondary mt-0.5">{metric.description || `${metric.scope} · ${metric.unit}`}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <fieldset className="grid gap-3" aria-label="Service objectives">
+          <div className="flex items-center justify-between">
+            <legend className="rift-label">Service objectives</legend>
+            <button type="button" onClick={addObjective} className="h-7 rounded border border-border px-2.5 text-[11px]">Add objective</button>
+          </div>
+          <p className="text-[12px] text-ink-secondary">Set thresholds for any collected or derived metric. Leave empty if you only want live telemetry.</p>
+          {monitoringObjectives.length === 0 ? <p className="rounded border border-dashed border-border px-3 py-3 text-[12px] text-ink-secondary">No objectives configured.</p> : monitoringObjectives.map((objective, index) => (
+            <div key={`${objective.id}-${index}`} className="grid gap-2 rounded border border-border bg-raised p-3 sm:grid-cols-2">
+              <label className="grid gap-1"><span className="rift-label">Objective id</span><input value={objective.id} onChange={(event) => updateObjective(index, { id: event.target.value })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]" /></label>
+              <label className="grid gap-1"><span className="rift-label">Metric</span><select value={objective.metric} onChange={(event) => updateObjective(index, { metric: event.target.value })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]">{metrics.map((metric) => <option key={metric.id} value={metric.id}>{metric.label}</option>)}</select></label>
+              <label className="grid gap-1"><span className="rift-label">Condition</span><select value={objective.operator} onChange={(event) => updateObjective(index, { operator: event.target.value })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]"><option value="<=">≤</option><option value=">=">≥</option><option value="<">&lt;</option><option value=">">&gt;</option><option value="==">=</option></select></label>
+              <label className="grid gap-1"><span className="rift-label">Threshold</span><input type="number" value={objective.threshold} onChange={(event) => updateObjective(index, { threshold: Number(event.target.value) })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]" /></label>
+              <label className="grid gap-1"><span className="rift-label">Aggregation</span><select value={objective.aggregation ?? "latest"} onChange={(event) => updateObjective(index, { aggregation: event.target.value })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]"><option value="latest">Latest</option><option value="average">Average</option><option value="max">Maximum</option><option value="p95">p95</option><option value="p99">p99</option></select></label>
+              <label className="grid gap-1"><span className="rift-label">Window (seconds)</span><input type="number" min="0" value={objective.windowSeconds ?? 0} onChange={(event) => updateObjective(index, { windowSeconds: Number(event.target.value) })} className="h-8 rounded border border-border bg-canvas px-2 text-[12px]" /></label>
+              <button type="button" onClick={() => removeObjective(index)} className="justify-self-start text-[11px] text-error">Remove objective</button>
+            </div>
+          ))}
+        </fieldset>
       </div>
-      <PrimaryNext disabled={!serviceName.trim()} onClick={onNext} label="Review plan" />
+      <PrimaryNext disabled={!serviceName.trim() || selectedMetrics.length === 0} onClick={onNext} label="Review plan" />
     </div>
   );
 }
@@ -1516,6 +1648,9 @@ function StepPlan({
   recommendation,
   serviceName,
   exposure,
+  monitoringProfile,
+  monitoringMetrics,
+  monitoringObjectives,
   plan,
   onPlan,
   onNext,
@@ -1523,6 +1658,9 @@ function StepPlan({
   recommendation: ModelRecommendation | null;
   serviceName: string;
   exposure: "local" | "lan" | "public";
+  monitoringProfile: string;
+  monitoringMetrics: string[];
+  monitoringObjectives: MonitoringObjective[];
   plan: Plan | null;
   onPlan: (p: Plan) => void;
   onNext: () => void;
@@ -1546,13 +1684,16 @@ function StepPlan({
         targetNodeId: recommendation.targetNode,
         serviceName,
         exposure,
+        monitoringProfile,
+        monitoringMetrics: monitoringMetrics.length ? monitoringMetrics : undefined,
+        monitoringObjectives: monitoringObjectives.length ? monitoringObjectives : undefined,
       })
       .then((p) => alive && onPlan(p))
       .catch((e) => alive && setErr(e));
     return () => {
       alive = false;
     };
-  }, [recommendation, serviceName, exposure, plan, onPlan]);
+  }, [recommendation, serviceName, exposure, monitoringProfile, monitoringMetrics, monitoringObjectives, plan, onPlan]);
 
   return (
     <div>

@@ -1,12 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
+import { Link } from "@tanstack/react-router";
 import { useState } from "react";
-import { Search, Sparkles } from "lucide-react";
+import { RefreshCw, Search, Sparkles } from "lucide-react";
 import { AppShell } from "@/components/rift/app-shell";
-import { PageHeader, Panel, SourceBadge, StatDot } from "@/components/rift/primitives";
+import { PageHeader, Panel, SourceBadge } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
-import { useRecommendations, useServices } from "@/lib/rift/hooks";
+import { useRecommendations } from "@/lib/rift/hooks";
 import { bytes } from "@/lib/rift/format";
-import type { ModelArtifact, ModelRecommendation, UseCase } from "@/lib/rift/types";
+import type { ModelRecommendation, UseCase } from "@/lib/rift/types";
 
 export const Route = createFileRoute("/models")({
   head: () => ({
@@ -22,35 +23,26 @@ export const Route = createFileRoute("/models")({
 });
 
 function ModelsPage() {
-  const services = useServices();
   const [task, setTask] = useState<UseCase>("chat");
   const [search, setSearch] = useState<UseCase | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const recommendations = useRecommendations(
-    search ? { useCase: search, source: "huggingface" } : null,
+    search ? { useCase: search, source: "huggingface", refresh: attempt > 0 } : null,
   );
-  const active = (services.data ?? []).map((service): ModelArtifact => ({
-    id: service.artifactId,
-    displayName:
-      service.details?.modelPath?.replace(/\\/g, "/").split("/").pop() || service.artifactId,
-    family: "controller-managed",
-    parameters: "from artifact metadata",
-    source: "local",
-    format: service.artifactId.toLowerCase().endsWith(".gguf") ? "gguf" : "hf",
-    quantization: service.artifactId.toLowerCase().includes("q8") ? "q8_0" : "none",
-    sizeBytes: 0,
-    license: "see model card",
-    trust: "community",
-    provenance: "derived-live",
-  }));
-
   return (
     <AppShell>
       <PageHeader
-        eyebrow="Catalog"
-        title="Models"
-        description="See what is deployed now, then let RIFT discover and rank Hugging Face models for this machine. No repository ID is required."
+        eyebrow="Model discovery"
+        title="Find a model for this machine"
+        description="Run RIFT’s live hardware-aware discovery. Results come from the controller and retain their measured, estimated, and repository provenance."
         actions={
           <div className="flex items-center gap-2">
+            <Link
+              to="/models/catalog"
+              className="inline-flex h-9 items-center rounded-xl border border-border bg-white/70 px-3 text-[12px] font-medium text-ink hover:border-primary/35 hover:text-primary"
+            >
+              Local artifact catalog
+            </Link>
             <select
               value={task}
               onChange={(event) => setTask(event.target.value as UseCase)}
@@ -64,7 +56,10 @@ function ModelsPage() {
             </select>
             <button
               type="button"
-              onClick={() => setSearch(task)}
+              onClick={() => {
+                setAttempt(0);
+                setSearch(task);
+              }}
               className="inline-flex h-9 items-center gap-2 rounded-[4px] bg-primary px-3.5 text-[13px] font-medium text-primary-foreground hover:bg-[color:var(--oxide-deep)]"
             >
               <Search className="size-4" aria-hidden />
@@ -74,32 +69,21 @@ function ModelsPage() {
         }
       />
       <div className="max-w-[1400px] mx-auto px-4 py-6 grid gap-4">
-        <Panel
-          title="Active artifacts"
-          aside={<SourceBadge source="derived-live" />}
-          bodyClassName="p-0"
-        >
-          {services.unavailable ? (
-            <div className="p-4">
-              <Unavailable endpoint="/services" resource="Controller-managed services" />
-            </div>
-          ) : services.isLoading || !services.data ? (
-            <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
-              Loading managed artifacts...
-            </div>
-          ) : active.length === 0 ? (
-            <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
-              No model artifacts are attached to a managed service.
-            </div>
-          ) : (
-            <ArtifactTable artifacts={active} />
-          )}
-        </Panel>
-
         {search && (
           <Panel
             title={`Hardware-aware recommendations / ${search}`}
-            aside={<SourceBadge source="live" />}
+            aside={
+              <div className="flex items-center gap-3">
+                <SourceBadge source="live" />
+                <button
+                  type="button"
+                  onClick={() => setAttempt((value) => value + 1)}
+                  className="inline-flex items-center gap-1 text-[11px] text-primary hover:text-ink"
+                >
+                  <RefreshCw className="size-3" aria-hidden /> Refresh search
+                </button>
+              </div>
+            }
             bodyClassName="p-0"
           >
             {recommendations.isLoading ? (
@@ -127,60 +111,14 @@ function ModelsPage() {
         )}
 
         {!search && (
-          <Panel title="Model discovery" aside={<SourceBadge source="live" />}>
+          <Panel title="Ready to discover" aside={<SourceBadge source="live" />}>
             <div className="px-4 py-10 text-center text-[13px] text-ink-secondary">
-              Choose a task and start discovery. RIFT will show only live controller results; no
-              catalog records are fabricated when the controller has no data.
+              Select a workload category and start a fresh controller-backed discovery run.
             </div>
           </Panel>
         )}
       </div>
     </AppShell>
-  );
-}
-
-function ArtifactTable({ artifacts }: { artifacts: ModelArtifact[] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="w-full min-w-[720px] text-[13px]">
-        <thead className="rift-label">
-          <tr className="border-b border-border">
-            <th className="h-9 px-4 text-left font-normal">Artifact</th>
-            <th className="px-4 text-left font-normal">Format</th>
-            <th className="px-4 text-left font-normal">Parameters</th>
-            <th className="px-4 text-left font-normal">Size</th>
-            <th className="px-4 text-left font-normal">Trust</th>
-            <th className="px-4 text-left font-normal">Source</th>
-          </tr>
-        </thead>
-        <tbody>
-          {artifacts.map((artifact) => (
-            <tr key={artifact.id} className="border-b border-border last:border-0">
-              <td className="px-4 py-3">
-                <div className="font-medium text-ink">{artifact.displayName}</div>
-                <div className="rift-mono text-[10.5px] text-ink-secondary">{artifact.id}</div>
-              </td>
-              <td className="px-4 rift-mono text-[12px]">
-                {artifact.format} / {artifact.quantization}
-              </td>
-              <td className="px-4 rift-mono text-[12px]">{artifact.parameters}</td>
-              <td className="px-4 rift-mono text-[12px]">
-                {artifact.sizeBytes ? bytes(artifact.sizeBytes) : "controller metadata pending"}
-              </td>
-              <td className="px-4">
-                <span className="inline-flex items-center gap-2">
-                  <StatDot tone={artifact.trust === "verified" ? "ok" : "attention"} />
-                  {artifact.trust}
-                </span>
-              </td>
-              <td className="px-4">
-                <SourceBadge source={artifact.provenance} />
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   );
 }
 

@@ -3,6 +3,7 @@ import importlib
 import io
 import json
 import os
+import pytest
 import sys
 import tempfile
 import threading
@@ -78,6 +79,7 @@ cli = importlib.import_module("rift.cli")
 rift_parser = importlib.import_module("rift.cli.parser")
 benchmark_catalog = importlib.import_module("rift.benchmark_catalog")
 calibration = importlib.import_module("rift.recommender_calibration")
+workload_compiler = importlib.import_module("rift.workload_compiler")
 
 
 GB = 1024**3
@@ -315,6 +317,14 @@ def test_verify_cli_defaults_to_one_and_exposes_budget_controls():
     explicit = parser.parse_args(["model", "recommend", "--verify", "--verify-top", "3", "--verify-budget", "5"])
     assert explicit.verify_top == 3
     assert explicit.verify_budget == 5.0
+    discovery = parser.parse_args([
+        "model", "recommend", "--workload-id", "draft-1", "--workload-revision", "2",
+        "--search-candidate-limit", "400", "--model-ref", "org/model",
+    ])
+    assert discovery.workload_id == "draft-1"
+    assert discovery.workload_revision == 2
+    assert discovery.search_candidate_limit == 400
+    assert discovery.model_ref == "org/model"
 
 
 def test_simulated_hardware_profile_accepts_compact_input():
@@ -384,6 +394,214 @@ def test_recommendation_exposes_benchmark_sites_and_diversified_search():
     assert {"format_gguf", "format_awq", "format_gptq", "format_safetensors"}.issubset(arm_names)
     assert {"small_parameter_band", "medium_parameter_band", "large_parameter_band"}.issubset(arm_names)
     assert result["discovery"]["query_strategy_version"] == "R20_DIVERSIFIED_EVIDENCE_FUNNEL"
+
+
+def test_hugging_face_eval_results_preserve_benchmark_task_and_provenance():
+    evidence = rift.RiftEngine()._candidate_eval_evidence(
+        {
+            "id": "org/coder-7b-gguf",
+            "evalResults": [
+                {
+                    "dataset_id": "open-code-eval/benchmark",
+                    "dataset_name": "Open Code Eval",
+                    "task_id": "code_generation",
+                    "task_type": "text-generation",
+                    "metric_type": "pass@1",
+                    "value": 0.64,
+                    "source": {"name": "Verified leaderboard", "url": "https://example.test/results"},
+                    "verifyToken": "verified-token",
+                }
+            ],
+        }
+    )
+
+    assert evidence["present"] is True
+    assert evidence["metrics"] == [
+        {
+            "benchmark_id": "open-code-eval/benchmark",
+            "benchmark_name": "Open Code Eval",
+            "task_id": "code_generation",
+            "task_type": "text-generation",
+            "name": "pass@1",
+            "value": 0.64,
+            "source": "Verified leaderboard",
+            "source_url": "https://example.test/results",
+            "verification": "verified",
+        }
+    ]
+
+
+def test_public_eval_scores_only_change_ranking_for_shared_task_relevant_metrics():
+    engine = rift.RiftEngine()
+    unrelated = {
+        "benchmark_id": "general/chat",
+        "task_id": "chat",
+        "task_type": "text-generation",
+        "name": "accuracy",
+        "value": 0.99,
+        "source": "publisher",
+        "verification": "community",
+    }
+    shared = {
+        "benchmark_id": "public/code-eval",
+        "task_id": "code_generation",
+        "task_type": "text-generation",
+        "name": "pass@1",
+        "source": "public leaderboard",
+        "verification": "verified",
+    }
+    candidates = [
+        {
+            "repo_id": "org/model-a",
+            "final_score": 0.80,
+            "scores": {"quality_proxy": 0.70},
+            "evaluation_evidence": {"metrics": [{**shared, "value": 0.42}, unrelated]},
+        },
+        {
+            "repo_id": "org/model-b",
+            "final_score": 0.79,
+            "scores": {"quality_proxy": 0.69},
+            "evaluation_evidence": {"metrics": [{**shared, "value": 0.81}]},
+        },
+    ]
+
+    ranked = engine._rank_with_public_evaluations(candidates, task="coding")
+
+    assert ranked[0]["repo_id"] == "org/model-b"
+    assert ranked[0]["public_evaluation_comparison"]["benchmark_count"] == 1
+    assert ranked[0]["public_evaluation_comparison"]["score"] == 1.0
+    assert ranked[1]["public_evaluation_comparison"]["score"] == 0.0
+    assert ranked[1]["public_evaluation_comparison"]["ignored_metric_count"] == 1
+
+
+def test_live_hub_evaluations_flow_into_best_fit_recommendation():
+    repo_values = {
+        "org/llama-7b-gptq": 0.20,
+        "org/coder-7b-gguf": 0.95,
+    }
+    previous = {
+        repo_id: MODEL_DETAILS[repo_id].get("evalResults")
+        for repo_id in repo_values
+    }
+    for repo_id, value in repo_values.items():
+        MODEL_DETAILS[repo_id]["evalResults"] = [
+            {
+                "dataset": {"id": "public/code-eval", "name": "Public Code Eval"},
+                "task_id": "code_generation",
+                "task_type": "code-generation",
+                "metric_type": "pass@1",
+                "value": value,
+                "source": {"name": "Verified public leaderboard", "url": "https://example.test/code"},
+                "verifyToken": "verified-token",
+            }
+        ]
+    try:
+        with FakeRecommendHubServer() as endpoint, tempfile.TemporaryDirectory() as tmp:
+            result = rift.RiftEngine().recommend_models(
+                task="coding",
+                top=10,
+                candidate_limit=20,
+                max_download_gb=12,
+                endpoint=endpoint,
+                cache_dir=str(Path(tmp) / "cache"),
+                enrichment_cap=5,
+                artifact_enrichment_cap=5,
+                persist_run=False,
+            )
+    finally:
+        for repo_id, old in previous.items():
+            if old is None:
+                MODEL_DETAILS[repo_id].pop("evalResults", None)
+            else:
+                MODEL_DETAILS[repo_id]["evalResults"] = old
+
+    published = [
+        item for item in result["recommendations"]
+        if item.get("public_evaluation_comparison", {}).get("score") is not None
+    ]
+    assert len(published) == 2
+    assert result["best_for_hardware"]["best_accuracy_proxy"]["repo_id"] == "org/coder-7b-gguf"
+    assert result["best_for_hardware"]["best_accuracy_proxy"]["public_evaluation_comparison"]["score"] == 1.0
+    assert result["categories"]["best_published_quality"]["repo_id"] == "org/coder-7b-gguf"
+
+
+def test_public_metric_percent_and_fraction_scales_are_compared_consistently():
+    engine = rift.RiftEngine()
+    candidates = [
+        {
+            "repo_id": "org/fraction-score",
+            "final_score": 0.8,
+            "scores": {"quality_proxy": 0.7},
+            "evaluation_evidence": {"metrics": [{
+                "benchmark_id": "public/chat-eval", "task_id": "chat", "task_type": "chat",
+                "name": "accuracy", "value": 0.72, "verification": "verified",
+            }]},
+        },
+        {
+            "repo_id": "org/percent-score",
+            "final_score": 0.79,
+            "scores": {"quality_proxy": 0.69},
+            "evaluation_evidence": {"metrics": [{
+                "benchmark_id": "public/chat-eval", "task_id": "chat", "task_type": "chat",
+                "name": "accuracy", "value": 72.0, "verification": "verified",
+            }]},
+        },
+    ]
+
+    ranked = engine._rank_with_public_evaluations(candidates, task="chat")
+
+    assert ranked[0]["repo_id"] == "org/fraction-score"
+    assert ranked[0]["public_evaluation_comparison"]["score"] == 0.5
+    assert ranked[1]["public_evaluation_comparison"]["score"] == 0.5
+
+
+def test_compiled_workload_controls_hub_discovery_and_search_breadth():
+    contract = workload_compiler.compile_workload(
+        {
+            "task": "rag",
+            "objective": "speed",
+            "performance": {"context_tokens": 16384, "concurrency": 2, "min_decode_tps": 20},
+            "quality": {"suite_id": "rift-text-core", "suite_version": "v1", "minimum_score": 0.8, "required_cases": ["response_nonempty"]},
+            "capabilities": {"tool_calling": False, "structured_output": False},
+            "policies": {"network": "approved_sources", "backend": "llama.cpp", "model_family": "Mamba-2"},
+            "service": {"name": "rag"},
+        },
+        confirm_default_quality=True,
+    )["contract"]
+    with FakeRecommendHubServer() as endpoint, tempfile.TemporaryDirectory() as tmp:
+        result = rift.RiftEngine().recommend_models(
+            task="chat",
+            workload_contract=contract,
+            top=1,
+            candidate_limit=1,
+            search_candidate_limit=8,
+            endpoint=endpoint,
+            cache_dir=str(Path(tmp) / "cache"),
+            enrichment_cap=3,
+            persist_run=False,
+        )
+    assert result["task"] == "rag"
+    assert result["workload_profile"]["context_length"] == 16384
+    assert result["workload_profile"]["concurrency"] == 2
+    assert result["search_candidate_limit"] == 8
+    assert result["candidate_counts"]["raw"] <= 8
+    assert result["workload_contract_hash"]
+    assert result["recommendations"][0]["workload_match"]["objective"] == "speed"
+
+
+def test_offline_workload_contract_never_queries_hugging_face():
+    contract = workload_compiler.compile_workload(
+        "Offline RAG assistant, 8K context", confirm_default_quality=True
+    )["contract"]
+    with FakeRecommendHubServer() as endpoint, tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ValueError, match="offline workload requires local"):
+            rift.RiftEngine().recommend_models(
+                workload_contract=contract,
+                endpoint=endpoint,
+                cache_dir=str(Path(tmp) / "cache"),
+                persist_run=False,
+            )
+        assert FakeRecommendHubHandler.search_calls == 0
 
 
 def test_calibration_matrix_contains_real_and_fifty_simulated_profiles():
@@ -486,6 +704,58 @@ def test_low_host_memory_rejects_artifact_without_runtime_headroom():
     )
     assert scored["excluded"] is True
     assert "host RAM headroom" in scored["exclusion_reason"]
+
+
+def test_unrelated_public_eval_metadata_does_not_inflate_quality_or_confidence():
+    engine = rift.RiftEngine()
+    hardware = system_profile.simulate_hardware_profile(
+        "gpu=RTX 4060,vram_gb=8,ram_gb=16,disk_free_gb=100,os=windows"
+    )
+    disk = system_profile.simulated_disk_capacity(hardware, reserve_bytes=2 * GB)
+    candidate = {
+        "id": "org/general-chat-7b",
+        "pipeline_tag": "text-generation",
+        "tags": ["llama", "gguf", "instruct", "chat", "license:apache-2.0"],
+        "num_parameters": 7_000_000_000,
+        "config": {"model_type": "llama"},
+        "cardData": {"license": "apache-2.0"},
+        "siblings": [
+            {"rfilename": "config.json", "size": 512},
+            {"rfilename": "model-q4_k_m.gguf", "size": 4 * GB},
+        ],
+    }
+    baseline = engine._score_hub_candidate(
+        candidate,
+        hardware=hardware,
+        task="chat",
+        mode="balanced",
+        allowed_formats={"gguf"},
+        max_download_bytes=12 * GB,
+        include_gated=False,
+        disk_profile=disk,
+    )
+    with_unrelated_eval = engine._score_hub_candidate(
+        {
+            **candidate,
+            "model-index": [{
+                "results": [{
+                    "task": {"type": "text-generation", "name": "code generation"},
+                    "dataset": {"type": "public/code-benchmark", "name": "code benchmark"},
+                    "metrics": [{"type": "pass@1", "value": 0.99}],
+                }]
+            }],
+        },
+        hardware=hardware,
+        task="chat",
+        mode="balanced",
+        allowed_formats={"gguf"},
+        max_download_bytes=12 * GB,
+        include_gated=False,
+        disk_profile=disk,
+    )
+
+    assert with_unrelated_eval["scores"]["quality_proxy"] == baseline["scores"]["quality_proxy"]
+    assert with_unrelated_eval["confidence"] == baseline["confidence"]
 
 
 def test_recommendation_scoring_filters_and_enrichment_cap():

@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "backend_id": "vllm",
+  "display_name": "vLLM",
+  "adapter_api_version": "1.0",
+  "upstream_project": "vllm-project/vllm",
+  "module": "rift.backends.vllm.backend",
+  "tuning_module": "rift.backends.vllm.tuning",
+  "supported_tasks": ["chat", "completion", "embeddings", "reranking", "vision-language"],
+  "supported_formats": ["safetensors", "awq", "gptq", "fp8"],
+  "quantizations": ["awq", "gptq", "fp8", "fp16", "bf16"],
+  "operating_systems": ["linux", "wsl2", "container"],
+  "accelerators": ["cuda", "rocm", "xpu", "cpu"],
+  "installation_methods": ["isolated-python", "container", "wsl2"],
+  "endpoints": ["openai"],
+  "features": ["continuous-batching", "prefix-caching", "structured-output", "speculative-decoding", "tensor-parallelism", "multi-backend-accelerators", "tool-calling-probe"],
+  "tuning_profiles": ["speed", "cost"],
+  "tuning_parameters": [
+    {"name": "max_num_batched_tokens", "type": "integer", "group": "scheduler", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "max_num_seqs", "type": "integer", "group": "scheduler", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "enable_chunked_prefill", "type": "boolean", "group": "scheduler", "profiles": ["speed"], "restart_required": true},
+    {"name": "gpu_memory_utilization", "type": "number", "group": "memory", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "enable_prefix_caching", "type": "boolean", "group": "prefix_cache", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "kv_cache_dtype", "type": "string", "group": "kv_precision", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "enforce_eager", "type": "boolean", "group": "execution", "profiles": ["speed", "cost"], "restart_required": true},
+    {"name": "cpu_offload_gb", "type": "number", "group": "offload", "profiles": ["speed", "cost"], "restart_required": true}
+  ],
+  "topology_modes": ["single_node", "replicated", "tensor_parallel"],
+  "evidence_status": "implemented_unverified",
+  "multi_gpu": true,
+  "streaming": true,
+  "description": "High-throughput OpenAI-compatible serving backend with runtime-specific accelerator paths."
+}

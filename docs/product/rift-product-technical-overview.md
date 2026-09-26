@@ -1,8 +1,8 @@
 # RIFT — Product and Technical Architecture
 
-**Document status:** implementation-grounded product reference  
-**Scope:** the RIFT control plane currently present in this repository  
-**Audience:** product, platform, inference, SRE, security, and developer-tooling teams  
+**Document status:** implementation-grounded product reference
+**Scope:** the RIFT control plane currently present in this repository
+**Audience:** product, platform, inference, SRE, security, and developer-tooling teams
 **Last reviewed:** 2026-09-07
 
 This document describes what RIFT currently does, how the pieces fit together, and where the implementation is intentionally qualified, experimental, or only a foundation. It is a product document, not a promise that every advertised backend or hardware combination has passed physical qualification.

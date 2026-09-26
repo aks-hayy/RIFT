@@ -25,6 +25,10 @@ from .operations import OperationStore
 from .runtime_paths import RiftPaths
 from .rift import RiftEngine
 from .tuning_engine import TuningStore
+from .workload_compiler import compile_workload
+from .workload_store import WorkloadStore
+from .workload_controller import WorkloadController
+from .execution_policy import default_execution_policy
 
 
 JsonDict = dict[str, Any]
@@ -95,6 +99,13 @@ class RiftServerRuntime:
                     # from coming up; the affected service remains subject to
                     # the normal degraded-state reconciliation path.
                     pass
+            if runtime_root is not None:
+                try:
+                    TuningStore(Path(runtime_root) / "tuning.db").reclaim_orphaned_leases()
+                except Exception:
+                    # Stale tuning cleanup is best effort and must not prevent
+                    # the controller from serving the rest of the API.
+                    pass
 
     @staticmethod
     def is_background_operation(path: str) -> bool:
@@ -109,6 +120,7 @@ class RiftServerRuntime:
             "/api/rift/v2/tuning/runs",
             "/api/rift/v2/evaluations",
             "/api/rift/v2/benchmarks",
+            "/api/rift/v2/workload-runs",
         } or (
             path.startswith("/api/rift/v2/deployments/")
             and path.endswith("/actions")
@@ -132,6 +144,24 @@ class RiftServerRuntime:
         operation_id = str(operation["operation_id"])
         cancel_event = threading.Event()
         self._operation_cancel_events[operation_id] = cancel_event
+        # Allocate the workload journal row before returning 202.  This gives
+        # the easy-path UI a stable run id immediately, while the operation
+        # worker continues through search/deploy/acceptance asynchronously.
+        worker_payload = dict(payload)
+        workload_run_id: str | None = None
+        if path == "/api/rift/v2/workload-runs":
+            approval_id = str(payload.get("approval_id") or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id is required")
+            approval = self.workload_store().get_approval(approval_id)
+            workload_run = self.workload_store().create_run(
+                draft_id=str(approval["draft_id"]),
+                approval_id=approval_id,
+                run_id=str(payload.get("run_id") or "") or None,
+                payload={"operation_id": operation_id},
+            )
+            workload_run_id = str(workload_run["run_id"])
+            worker_payload["run_id"] = workload_run_id
         resource_key = self.background_resource_key(path, payload)
         resource_lock = self.background_resource_lock(resource_key)
 
@@ -202,7 +232,7 @@ class RiftServerRuntime:
                         control_kwargs["cancel_check"] = cancel_event.is_set
                     result = self.control_post(
                         path,
-                        {**payload, "operation_id": operation_id},
+                        {**worker_payload, "operation_id": operation_id},
                         **control_kwargs,
                     )
                 finally:
@@ -236,6 +266,7 @@ class RiftServerRuntime:
         return {
             "request_id": request_id,
             "operation_id": operation_id,
+            **({"run_id": workload_run_id} if workload_run_id else {}),
             "status": "RUNNING",
             "stage": operation.get("stage", "queued"),
             "message": operation.get("message", "Operation accepted"),
@@ -291,6 +322,11 @@ class RiftServerRuntime:
             else:
                 self._mesh_controller = self.mesh_controller_factory()
         return self._mesh_controller
+
+    def workload_store(self) -> WorkloadStore:
+        """Resolve the durable workload journal beside the operation store."""
+        root = getattr(self.operation_store, "root", None)
+        return WorkloadStore((Path(root).parent if root is not None else RiftPaths.from_environment().home) / "workloads.db")
 
     def start_bootstrap_listener(self) -> JsonDict:
         if self._bootstrap_server is not None:
@@ -474,6 +510,37 @@ class RiftServerRuntime:
             service_id = ((query or {}).get("service") or [None])[0]
             return self.mesh_controller().group_detail(group_id, service_id)
         orchestrator = self.orchestrator_factory()
+        if path == "/api/rift/v2/workloads":
+            store = self.workload_store()
+            limit = int(((query or {}).get("limit") or [50])[0] or 50)
+            return {"api_version": "2", "drafts": store.list_drafts(limit=limit)}
+        if path == "/api/rift/v2/workload-policies":
+            return {"api_version": "2", "policies": self.workload_store().list_policies(limit=int(((query or {}).get("limit") or [50])[0] or 50))}
+        if path.startswith("/api/rift/v2/workload-policies/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[3] == "workload-policies":
+                return {"api_version": "2", **self.workload_store().get_policy(parts[4])}
+        if path.startswith("/api/rift/v2/workloads/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 5 and parts[3] == "workloads":
+                requested_revision = ((query or {}).get("revision") or [None])[0]
+                revision = int(requested_revision) if requested_revision not in (None, "") else None
+                return {"api_version": "2", **self.workload_store().get_draft(parts[4], revision=revision)}
+        if path == "/api/rift/v2/workload-runs":
+            limit = int(((query or {}).get("limit") or [50])[0] or 50)
+            return {"api_version": "2", "runs": self.workload_store().list_runs(limit=limit)}
+        if path.startswith("/api/rift/v2/workload-runs/"):
+            parts = path.strip("/").split("/")
+            if len(parts) not in {5, 6} or parts[3] != "workload-runs":
+                raise KeyError(path)
+            run = self.workload_store().get_run(parts[4])
+            if len(parts) == 6 and parts[5] not in {"events", "report"}:
+                raise KeyError(path)
+            if path.endswith("/events") or path.endswith("/report"):
+                # The report is the same validated journal result in v1; the
+                # dedicated route keeps future renderers additive.
+                return {"events": run["events"]} if path.endswith("/events") else run
+            return run
         if path == "/api/rift/v2/plans":
             return {"api_version": "2", **orchestrator.list_plans()}
         if path.startswith("/api/rift/v2/plans/"):
@@ -510,16 +577,31 @@ class RiftServerRuntime:
             return orchestrator.load_evaluation(run_id)
         if path == "/api/rift/v2/tuning/capabilities":
             from .tuning_adapters import tuning_adapter
+            from .backends import backend_catalog
             name = str(((query or {}).get("service") or ["chat"])[0])
             service = (orchestrator.read_state().get("services") or {}).get(name)
             if not isinstance(service, dict):
                 raise KeyError(name)
             backend = service.get("backend")
+            static_manifest = backend_catalog().get(str(backend or ""))
             provider = orchestrator.providers.get(backend)
             adapter = tuning_adapter(backend, provider) if provider else None
             if adapter is None:
-                return {"service": name, "backend": backend, "profiles": [], "parameters": [], "available": False}
-            return {**adapter.probe(service), "service": name, "available": True}
+                return {
+                    "service": name,
+                    "backend": backend,
+                    "profiles": list(static_manifest.tuning_profiles) if static_manifest else [],
+                    "parameters": list(static_manifest.tuning_parameters) if static_manifest else [],
+                    "manifest": static_manifest.to_dict() if static_manifest else None,
+                    "available": False,
+                    "reason": "no tuning adapter is registered for this backend",
+                }
+            return {
+                **adapter.probe(service),
+                "service": name,
+                "manifest": static_manifest.to_dict() if static_manifest else None,
+                "available": True,
+            }
         if path == "/api/rift/v2/tuning/profiles":
             return {
                 "api_version": "1",
@@ -528,7 +610,7 @@ class RiftServerRuntime:
                         "id": "speed",
                         "label": "Speed",
                         "objective": "Maximize measured generated tokens per second while preserving the locked deployment contract and rejecting latency regressions.",
-                        "metric": "median generated tokens/second",
+                        "metric": "per-request decode rate (interactive) or aggregate output throughput (shared)",
                         "usage_modes": ["interactive", "shared"],
                     },
                     {
@@ -568,9 +650,13 @@ class RiftServerRuntime:
         if path in ("/api/rift/settings", "/api/rift/v2/settings"):
             return orchestrator.settings_snapshot()
         if path == "/api/rift/v2/adapters":
+            from .backends import backend_catalog
+
+            catalog = backend_catalog()
             return {
                 "api_version": "2",
                 "registry": orchestrator.backend_host.diagnostics(),
+                "backend_catalog": catalog.diagnostics(),
                 "adapters": [
                     {
                         "adapter_id": adapter_id,
@@ -686,8 +772,12 @@ class RiftServerRuntime:
                 raise KeyError(path)
             return value
         if path == "/api/rift/v2/capabilities":
+            from .backends import backend_catalog
+
+            catalog = backend_catalog()
             return {
                 "api_version": "2",
+                "backend_catalog": catalog.diagnostics(),
                 "backend_adapters": {
                     name: adapter.manifest.capability.to_dict()
                     for name, adapter in sorted(orchestrator.providers.items())
@@ -734,6 +824,28 @@ class RiftServerRuntime:
                 service_name=((query or {}).get("service") or [None])[0],
                 node_id=((query or {}).get("node") or [None])[0],
             )
+        if path == "/api/rift/telemetry/catalog":
+            return orchestrator.telemetry_catalog()
+        if path == "/api/rift/telemetry/objectives/catalog":
+            return orchestrator.telemetry_objective_catalog()
+        if path == "/api/rift/telemetry/objectives":
+            return orchestrator.telemetry_objectives(
+                service_name=((query or {}).get("service") or [None])[0],
+                session_id=((query or {}).get("session_id") or [None])[0],
+                events=str(((query or {}).get("events") or [""])[0]).lower() in {"1", "true", "yes"},
+                limit=int(((query or {}).get("limit") or [100])[0] or 100),
+            )
+        if path == "/api/rift/v2/telemetry/history":
+            values = query or {}
+            session_id = str((values.get("session_id") or [""])[0])
+            if not session_id:
+                raise ValueError("session_id is required for resource history")
+            until = float((values.get("until") or [time.time()])[0])
+            since = float((values.get("since") or [until - 900])[0])
+            return orchestrator.telemetry_store.history(
+                session_id, metric=str((values.get("metric") or ["cpu_percent"])[0]),
+                since=since, until=until, buckets=int((values.get("buckets") or [180])[0]),
+            )
         if path == "/api/rift/telemetry/series":
             def query_float(name: str) -> float | None:
                 value = ((query or {}).get(name) or [None])[0]
@@ -778,6 +890,12 @@ class RiftServerRuntime:
             return orchestrator.incidents()
         if path == "/api/rift/gateway":
             return orchestrator.gateway_status()
+        if path == "/api/rift/gateway/groups":
+            status = orchestrator.gateway_status()
+            return {"groups": status.get("groups", []), "routes": (status.get("metrics") or {}).get("routes", [])}
+        if path.startswith("/api/rift/gateway/groups/"):
+            group_id = path.rstrip("/").rsplit("/", 1)[-1]
+            return orchestrator.gateway_status(group_id=group_id)
         if path == "/api/rift/observability":
             return orchestrator.observability()
         if path == "/api/rift/timeline":
@@ -814,6 +932,56 @@ class RiftServerRuntime:
         cancel_check: Callable[[], bool] | None = None,
     ) -> JsonDict:
         path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
+        if path in {"/api/rift/v2/workloads/compile", "/api/rift/v2/workloads"}:
+            request = payload.get("workload", payload.get("input", payload.get("request")))
+            if request is None:
+                raise ValueError("workload, input, or request is required")
+            schema_payload = payload.get("output_schema")
+            compiled = compile_workload(
+                request,
+                output_schema=schema_payload if isinstance(schema_payload, dict) else None,
+                output_schema_filename=str(payload.get("output_schema_filename") or "") or None,
+            )
+            if bool(payload.get("persist", True)):
+                return self.workload_store().save_draft(
+                    compiled["contract"],
+                    provenance=compiled["provenance"],
+                    questions=compiled["questions"],
+                ) | {k: compiled[k] for k in ("input", "warnings", "unsupported_requirements", "limitations")}
+            return compiled
+        if path == "/api/rift/v2/workload-policies":
+            policy = payload.get("policy") if isinstance(payload.get("policy"), dict) else default_execution_policy(target=str(payload.get("target") or "local"))
+            policy_id = str(payload.get("policy_id") or "easy-local").strip()
+            return self.workload_store().save_policy(policy_id, policy, expected_revision=int(payload.get("expected_revision") or 0))
+        if path.startswith("/api/rift/v2/workloads/") and path.endswith("/approve"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 6 or parts[3] != "workloads":
+                raise KeyError(path)
+            draft_id = parts[4]
+            expected_revision = int(payload.get("revision") or payload.get("expected_revision") or 0)
+            return self.workload_store().approve(
+                draft_id,
+                expected_revision=expected_revision,
+                contract_hash=str(payload.get("contract_hash") or ""),
+                policy_id=str(payload.get("policy_id") or ""),
+                policy_revision=int(payload.get("policy_revision") or 0),
+                envelope=payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {},
+                envelope_hash=str(payload.get("envelope_hash") or ""),
+            )
+        if path == "/api/rift/v2/workload-runs":
+            approval_id = str(payload.get("approval_id") or "").strip()
+            if not approval_id:
+                raise ValueError("approval_id is required")
+            return WorkloadController(self.orchestrator_factory(), self.workload_store()).run(
+                approval_id,
+                run_id=str(payload.get("run_id") or "") or None,
+                models_dir=str(payload.get("models_dir") or "") or None,
+                model_ref=str(payload.get("model_ref") or "") or None,
+                candidate_limit=int(payload.get("candidate_limit") or 3),
+                search_candidate_limit=int(payload.get("search_candidate_limit") or 250),
+                tune=bool(payload.get("tune", True)),
+                progress=progress,
+            )
         if path == "/api/rift/v2/benchmark-plans":
             profiles = payload.get("profiles") or ["smoke"]
             if isinstance(profiles, str):
@@ -1048,6 +1216,9 @@ class RiftServerRuntime:
                 token=payload.get("token"),
                 run_store_root=str(orchestrator.rift_dir),
                 model_ref=str(payload.get("model_ref") or "") or None,
+                workload_contract=payload.get("workload_contract"),
+                search_candidate_limit=(int(payload["search_candidate_limit"]) if payload.get("search_candidate_limit") is not None else None),
+                allowed_licenses=payload.get("allowed_licenses"),
             )
         if path == "/api/rift/v2/compatibility":
             artifact = payload.get("artifact")
@@ -1149,15 +1320,37 @@ class RiftServerRuntime:
             run_id = str(payload.get("recommendation_run_id") or "")
             if not run_id:
                 raise ValueError("recommendation_run_id is required")
+            monitoring_metrics = payload.get("monitoring_metrics")
+            if isinstance(monitoring_metrics, str):
+                monitoring_metrics = [item.strip() for item in monitoring_metrics.split(",") if item.strip()]
+            if monitoring_metrics is not None and not isinstance(monitoring_metrics, list):
+                raise ValueError("monitoring_metrics must be an array or comma-separated string")
+            monitoring_objectives = payload.get("monitoring_objectives")
+            if isinstance(monitoring_objectives, str):
+                try:
+                    monitoring_objectives = json.loads(monitoring_objectives)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("monitoring_objectives must be valid JSON") from exc
+            if monitoring_objectives is not None and not isinstance(monitoring_objectives, (list, dict)):
+                raise ValueError("monitoring_objectives must be an array or object")
+            plan_kwargs = {
+                "run_id": run_id,
+                "selector": str(payload.get("selector") or "best_estimated"),
+                "output": payload.get("output"),
+                "artifact_id": payload.get("artifact_id"),
+                "backend_kind": payload.get("backend_kind"),
+                "target_node_id": payload.get("target_node_id"),
+                "service_name": str(payload.get("service_name") or "chat"),
+                "exposure": str(payload.get("exposure") or "local"),
+            }
+            if payload.get("monitoring_profile") not in (None, ""):
+                plan_kwargs["monitoring_profile"] = str(payload["monitoring_profile"])
+            if monitoring_metrics is not None:
+                plan_kwargs["monitoring_metrics"] = [str(item) for item in monitoring_metrics]
+            if monitoring_objectives is not None:
+                plan_kwargs["monitoring_objectives"] = monitoring_objectives
             return orchestrator.plan_recommendation_run(
-                run_id=run_id,
-                selector=str(payload.get("selector") or "best_estimated"),
-                output=payload.get("output"),
-                artifact_id=payload.get("artifact_id"),
-                backend_kind=payload.get("backend_kind"),
-                target_node_id=payload.get("target_node_id"),
-                service_name=str(payload.get("service_name") or "chat"),
-                exposure=str(payload.get("exposure") or "local"),
+                **plan_kwargs,
             )
         if path.startswith("/api/rift/v2/plans/") and path.endswith("/apply"):
             parts = path.strip("/").split("/")
@@ -1207,11 +1400,14 @@ class RiftServerRuntime:
                     task=str(payload.get("task") or "chat"),
                     models_dir=models_dir,
                     top=int(payload.get("top") or 10),
+                    workload_contract=payload.get("workload_contract"),
                 )
             return orchestrator.engine.recommend_models(
                 task=str(payload.get("task") or "chat"),
                 top=int(payload.get("top") or 10),
                 candidate_limit=int(payload.get("candidate_limit") or 200),
+                endpoint=str(payload.get("endpoint") or "https://huggingface.co"),
+                token=payload.get("token"),
                 max_download_gb=(
                     float(payload["max_download_gb"])
                     if payload.get("max_download_gb") is not None
@@ -1224,6 +1420,9 @@ class RiftServerRuntime:
                 disk_reserve_gb=float(payload.get("disk_reserve_gb") or 2.0),
                 run_store_root=str(orchestrator.rift_dir),
                 model_ref=str(payload.get("model_ref") or "") or None,
+                workload_contract=payload.get("workload_contract"),
+                search_candidate_limit=(int(payload["search_candidate_limit"]) if payload.get("search_candidate_limit") is not None else None),
+                allowed_licenses=payload.get("allowed_licenses"),
             )
         if path == "/api/rift/calibrate":
             return orchestrator.calibrate_hardware(
@@ -1305,8 +1504,8 @@ class RiftServerRuntime:
                 no_apply=bool(payload.get("no_apply", False)),
                 dry_run=bool(payload.get("dry_run", False)),
                 candidate_limit=int(payload.get("candidate_limit") or 24),
-                warmup_runs=int(payload.get("warmup_runs") or 1),
-                repeats=int(payload.get("repeats") or 3),
+                warmup_runs=int(payload.get("warmup_runs", 1)),
+                repeats=int(payload.get("repeats", 5)),
                 startup_timeout_seconds=float(payload.get("startup_timeout_seconds") or 180.0),
                 prompt=str(payload.get("prompt") or "Reply briefly: what is one benefit of local inference?"),
                 max_tokens=int(payload.get("max_tokens") or 32),
@@ -1371,6 +1570,31 @@ class RiftServerRuntime:
             return orchestrator.gateway_key_revoke(key_id=str(payload.get("key_id") or ""))
         if path == "/api/rift/gateway/keys/rotate":
             return orchestrator.gateway_key_rotate(key_id=str(payload.get("key_id") or ""))
+        if path == "/api/rift/gateway/actions":
+            action = str(payload.get("action") or "").lower()
+            if action == "start":
+                return orchestrator.gateway_start(
+                    service_name=str(payload.get("service") or "chat"),
+                    config_path=payload.get("config"),
+                    host=payload.get("host"),
+                    port=int(payload["port"]) if payload.get("port") not in (None, "") else None,
+                )
+            if action == "stop":
+                return orchestrator.gateway_stop()
+            raise ValueError("gateway action must be start or stop")
+        if path.startswith("/api/rift/gateway/groups/") and path.endswith("/actions"):
+            group_id = path.split("/api/rift/gateway/groups/", 1)[1].rsplit("/", 1)[0]
+            action = str(payload.get("action") or "").lower()
+            if action == "start":
+                return orchestrator.gateway_start(
+                    group_id=group_id,
+                    config_path=payload.get("config"),
+                    host=payload.get("host"),
+                    port=int(payload["port"]) if payload.get("port") not in (None, "") else None,
+                )
+            if action == "stop":
+                return orchestrator.gateway_stop(group_id=group_id)
+            raise ValueError("gateway action must be start or stop")
         if path == "/api/rift/observability/prune":
             return orchestrator.prune_observability()
         if path == "/api/rift/migrate":
@@ -1432,6 +1656,45 @@ class RiftServerRuntime:
             )
         raise KeyError(path)
 
+    def control_put(self, path: str, payload: JsonDict) -> JsonDict:
+        """Edit a workload draft by creating its next immutable revision."""
+        if not path.startswith("/api/rift/v2/workloads/") or path.endswith("/approve"):
+            raise KeyError(path)
+        parts = path.strip("/").split("/")
+        if len(parts) != 5 or parts[3] != "workloads":
+            raise KeyError(path)
+        request = payload.get("workload", payload.get("input", payload.get("request")))
+        if request is None:
+            raise ValueError("workload, input, or request is required")
+        draft_id = parts[4]
+        expected_revision = int(payload.get("revision") or payload.get("expected_revision") or 0)
+        schema_payload = payload.get("output_schema")
+        # Editing a draft should not silently detach an already-approved
+        # schema.  Callers can explicitly send ``output_schema: null`` when
+        # they intend to remove it (which will make strict JSON approval block
+        # again); omission preserves the prior artifact across revisions.
+        if "output_schema" not in payload:
+            try:
+                previous = self.workload_store().get_draft(draft_id, revision=expected_revision)
+                schema_payload = (previous.get("contract") or {}).get("output_schema")
+            except KeyError:
+                schema_payload = None
+        compiled = compile_workload(
+            request,
+            draft_id=draft_id,
+            revision=expected_revision + 1,
+            output_schema=schema_payload if isinstance(schema_payload, dict) else None,
+            output_schema_filename=str(payload.get("output_schema_filename") or "") or None,
+        )
+        saved = self.workload_store().save_draft(
+            compiled["contract"],
+            provenance=compiled["provenance"],
+            questions=compiled["questions"],
+            draft_id=draft_id,
+            expected_revision=expected_revision,
+        )
+        return saved | {k: compiled[k] for k in ("input", "warnings", "unsupported_requirements", "limitations")}
+
     def control_delete(self, path: str) -> JsonDict:
         if path == "/api/rift/v2/mesh/enrollment-window":
             result = self.mesh_controller().close_enrollment_window()
@@ -1450,7 +1713,7 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             return
         self.send_response(HTTPStatus.NO_CONTENT)
         self._send_cors_headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Request-ID")
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -1662,6 +1925,40 @@ class RiftRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        """Handle immutable workload-draft edits with normal idempotency."""
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/rift/"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown endpoint"})
+            return
+        payload = self._read_json_body()
+        request_id = self.runtime.request_id(self.headers.get("X-Request-ID") or payload.get("request_id"))
+        assert self.runtime.operation_store is not None
+        try:
+            operation, claimed = self.runtime.operation_store.begin_claim(
+                request_id,
+                action=parsed.path,
+                actor=self.runtime.identity(self.headers.get("Authorization"), self.client_address[0]),
+                payload=payload,
+            )
+            if not claimed:
+                status = HTTPStatus.OK if operation.get("status") == "SUCCEEDED" else HTTPStatus.CONFLICT
+                self._send_json(status, {**(operation.get("result") or {}), "request_id": request_id, "replayed": True})
+                return
+            result = self.runtime.control_put(parsed.path, payload)
+            result = {**result, "request_id": request_id, "operation_id": operation["operation_id"]}
+            self.runtime.operation_store.complete(request_id, result=result)
+            self._send_json(HTTPStatus.OK, result)
+        except PermissionError as exc:
+            self.runtime.operation_store.fail(request_id, error=str(exc))
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": str(exc)})
+        except (ValueError, KeyError) as exc:
+            self.runtime.operation_store.fail(request_id, error=str(exc))
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except Exception as exc:  # pragma: no cover - HTTP boundary
+            self.runtime.operation_store.fail(request_id, error=str(exc))
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

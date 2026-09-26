@@ -232,7 +232,36 @@ def test_proxy_request_ids_streaming_metrics_and_limits():
             assert not any("Authorization" in json.dumps(record) for record in records)
         finally:
             stop_server(server, thread)
-    stop_server(backend, backend_thread)
+            stop_server(backend, backend_thread)
+
+
+def test_structured_output_schema_is_forwarded_and_violation_alerted(tmp_path):
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"], "additionalProperties": False}
+    route = {"backend": "vllm", "structured_output_enforced": True, "output_schema": schema, "output_schema_sha256": "abc"}
+    payload = json.dumps({"messages": [{"role": "user", "content": "status"}]}).encode()
+    forwarded = gateway_mod.RiftGatewayRuntime._apply_output_schema(payload, route)
+    forwarded_payload = json.loads(forwarded)
+    assert forwarded_payload["structured_outputs"] == {"json": schema}
+    assert forwarded_payload["response_format"] == {"type": "json_object"}
+
+    class RecordingOrchestrator(FakeOrchestrator):
+        def __init__(self, state):
+            super().__init__(state)
+            self.incidents = []
+
+        def record_incident(self, service_name, **kwargs):
+            self.incidents.append((service_name, kwargs))
+            return {"recorded": True}
+
+    state = managed_state("http://127.0.0.1:1")
+    recorder = RecordingOrchestrator(state)
+    runtime = gateway_mod.RiftGatewayRuntime(root=tmp_path, policy=gateway_mod.GatewayPolicy(), orchestrator_factory=lambda: recorder)
+    valid = b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+    invalid = b'{"choices":[{"message":{"content":"{\\"ok\\":1}"}}]}'
+    assert runtime._validate_schema_response(valid, "application/json", route)[0] is True
+    assert runtime._validate_schema_response(invalid, "application/json", route)[0] is False
+    runtime._record_schema_violation({**route, "service": "chat"}, "request-1", "wrong type")
+    assert recorder.incidents and recorder.incidents[0][0] == "chat"
 
 
 def test_rate_auth_concurrency_and_fallback():

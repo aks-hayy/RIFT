@@ -3,8 +3,9 @@ import { Activity, Network, ShieldCheck, UserPlus } from "lucide-react";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, StatDot } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
+import { NodeMap } from "@/components/rift/node-map";
 import { relativeTime } from "@/lib/rift/format";
-import { useMeshNodes, useMeshTopology } from "@/lib/rift/hooks";
+import { useMeshNodes, useMeshTopology, useServices } from "@/lib/rift/hooks";
 import type { MeshNode } from "@/lib/rift/types";
 
 export const Route = createFileRoute("/nodes/")({
@@ -32,6 +33,7 @@ function certificateStatus(node: MeshNode): string {
 function NodesListPage() {
   const nodesQuery = useMeshNodes();
   const topologyQuery = useMeshTopology();
+  const servicesQuery = useServices();
   const nodes = nodesQuery.data ?? [];
   const topology = topologyQuery.data;
   const routable = nodes.filter((node) => node.routable && node.trustState === "ACTIVE").length;
@@ -162,6 +164,14 @@ function NodesListPage() {
             </Panel>
           )}
         </section>
+
+        {!nodesQuery.unavailable && !nodesQuery.isLoading && !nodesQuery.error && (
+          <NodeMap
+            nodes={nodes}
+            links={topologyQuery.data?.links ?? []}
+            services={servicesQuery.data ?? []}
+          />
+        )}
 
         <section aria-labelledby="mesh-link-table">
           {topologyQuery.unavailable ? (

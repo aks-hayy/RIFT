@@ -25,7 +25,7 @@ class TuningCoordinatorMixin:
         dry_run: bool = False,
         candidate_limit: int = 24,
         warmup_runs: int = 1,
-        repeats: int = 3,
+        repeats: int = 5,
         requests_per_window: int = 1,
         startup_timeout_seconds: float = 180.0,
         prompt: str = "Reply briefly: what is one benefit of local inference?",
@@ -195,6 +195,10 @@ class TuningCoordinatorMixin:
         usage = usage or service.get("usage") or ("interactive" if concurrency == 1 else "shared")
         if usage not in {"interactive", "shared"}:
             raise ValueError("usage must be interactive or shared")
+        if profile == "cost" and concurrency > 1 and measurement_runner is None:
+            return {"available": False, "applied": False, "outcome": "unavailable",
+                    "service": service_name, "backend": backend, "profile": profile,
+                    "reason": "Cost requires concurrent load-window energy accounting for this service; the current sampler is single-request only. Configured concurrency will not be silently reduced."}
         baseline_plan["tuning_usage"] = usage
         locked = {
             "model_path": model_path,
@@ -488,8 +492,18 @@ class TuningCoordinatorMixin:
                 tuning=unique[0],
             )
             baseline_plan_normalized["tuning_usage"] = usage
-            if ngram_speculation is not None:
-                baseline_plan = baseline_plan_normalized
+            # Candidate plans are rebuilt from the materialized artifact, so
+            # keep that same normalized plan as the rollback baseline. Older
+            # deployments may store only a repository-relative filename in
+            # their launch summary; restoring that stale summary makes the
+            # backend look in its working directory after a no-improvement
+            # tuning run and leaves the service failed.
+            baseline_plan = baseline_plan_normalized
+            baseline_tuning = {
+                key: value
+                for key, value in dict(baseline_plan.get("tuning") or {}).items()
+                if value is not None
+            }
             # A CLI/config speculation override changes the baseline itself,
             # not just the candidate list. Ensure the live process is replaced
             # before measuring it; otherwise an inherited optimized server
@@ -615,8 +629,8 @@ class TuningCoordinatorMixin:
                         prompt=prompt,
                         max_tokens=max_tokens,
                         warmup_runs=warmup_runs,
-                    repeats=repeats,
-                    requests_per_window=requests_per_window,
+                        repeats=repeats,
+                        requests_per_window=requests_per_window,
                         measurement_runner=measurement_runner,
                         usage=usage,
                     )

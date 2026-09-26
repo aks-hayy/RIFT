@@ -43,6 +43,27 @@ def test_recipe_rejects_underfilled_window_and_bootstrap_is_inconclusive():
     assert bootstrap_interval([1.0, 2.0])["verdict"] == "inconclusive"
 
 
+def test_explicit_zero_token_usage_is_not_replaced_by_text_estimate():
+    from rift.tuning_benchmark import BenchmarkRecipe, run_windows
+    result = run_windows(lambda **_: {"generated_tokens": 0, "generated_tokens_estimate": 20},
+                         base_url="http://test", recipe=BenchmarkRecipe(prompt="x"), warmups=0, repetitions=1)
+    assert result["failures"] == 1
+    assert result["tokens"] == 0
+    assert result["samples"][0]["token_count_source"] == "server_usage"
+
+
+def test_window_objectives_not_latency_surrogates_determine_speed_confidence():
+    from rift.orchestrator import RiftOrchestrator
+    from rift.tuning_engine import SpeedMeasurement
+    baseline = SpeedMeasurement.from_mapping({"tokens": 100, "tokens_per_second": 20, "latency_seconds": 5})
+    candidate = SpeedMeasurement.from_mapping({"tokens": 100, "tokens_per_second": 30, "latency_seconds": 5})
+    interval = RiftOrchestrator._profile_improvement_interval("speed", baseline, candidate,
+        baseline_raw={"objective_samples": [20] * 5, "replicates": [5] * 5},
+        candidate_raw={"objective_samples": [30] * 5, "replicates": [5] * 5})
+    assert interval == [.5, .5]
+    assert not RiftOrchestrator._profile_confidence_interval("speed", candidate, {"objective_samples": [30] * 4})["available"]
+
+
 def test_vllm_adapter_uses_pinned_runtime_probe_and_locks_identity():
     from rift.tuning_adapters import VllmTuningAdapter
 

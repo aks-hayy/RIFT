@@ -393,6 +393,21 @@ def test_tuning_store_round_trips_run_events_without_clobbering_existing_state()
         assert loaded["events"][0]["stage"] == "baseline"
 
 
+def test_tuning_store_reclaims_dead_controller_leases() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = TuningStore(Path(directory) / "tuning.db")
+        run = store.create_run({"service": "deleted-service", "profile": "speed"})
+        store.acquire(run["run_id"], ["devices:local", "service:deleted-service"])
+        store.owner_alive = lambda _run_id: False
+
+        reclaimed = store.reclaim_orphaned_leases()
+
+        assert reclaimed == [run["run_id"]]
+        assert store.get_run(run["run_id"])["status"] == "INTERRUPTED"
+        with store._connection() as connection:
+            assert connection.execute("SELECT COUNT(*) FROM tuning_leases").fetchone()[0] == 0
+
+
 def test_gpu_energy_sampler_integrates_power_without_touching_monitoring_store() -> None:
     from rift.tuning_engine import GpuEnergySampler
 

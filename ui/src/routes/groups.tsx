@@ -4,6 +4,9 @@ import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, StatDot } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
 import { useMeshServiceGroups, useMeshServices } from "@/lib/rift/hooks";
+import { useGatewayStatus } from "@/lib/rift/hooks";
+import { rift } from "@/lib/rift/client";
+import { useState } from "react";
 
 export const Route = createFileRoute("/groups")({
   head: () => ({ meta: [{ title: "Groups — RIFT" }] }),
@@ -13,6 +16,9 @@ export const Route = createFileRoute("/groups")({
 function GroupsPage() {
   const groups = useMeshServiceGroups();
   const services = useMeshServices();
+  const gateway = useGatewayStatus();
+  const [ports, setPorts] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
   const servicesById = new Map((services.data ?? []).map((service) => [service.serviceId, service]));
   return (
     <AppShell>
@@ -40,6 +46,43 @@ function GroupsPage() {
                   })}
                 </div>
                 <div className="mt-4 flex items-center gap-2 text-[11px] uppercase tracking-[0.12em] text-ink-secondary"><Layers3 className="size-3.5" aria-hidden /> default: {group.defaultService ?? group.serviceIds[0]}</div>
+                <div className="mt-4 border-t border-border pt-3 grid gap-2">
+                  <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.1em] text-ink-secondary">
+                    <span>Main gateway route</span>
+                    <span className="rift-mono">{gateway.data?.status ?? "unknown"}</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      aria-label={`Dedicated port for ${group.groupId}`}
+                      value={ports[group.groupId] ?? "11736"}
+                      onChange={(event) => setPorts((current) => ({ ...current, [group.groupId]: event.target.value }))}
+                      className="h-8 w-24 rounded-[4px] border border-border bg-transparent px-2 rift-mono text-[12px]"
+                      inputMode="numeric"
+                    />
+                    {(() => {
+                      const listener = gateway.data?.groups?.find((item) => item.groupId === group.groupId);
+                      const running = listener?.status === "running" && listener.processAlive;
+                      return (
+                        <button
+                          type="button"
+                          disabled={busy === group.groupId}
+                          onClick={async () => {
+                            setBusy(group.groupId);
+                            try {
+                              await rift.gatewayGroupAction(group.groupId, running ? "stop" : "start", running ? {} : { port: Number(ports[group.groupId] ?? 11736) });
+                              gateway.refetch();
+                            } finally {
+                              setBusy(null);
+                            }
+                          }}
+                          className="h-8 px-3 rounded-[4px] border border-border text-[12px] disabled:opacity-50"
+                        >
+                          {busy === group.groupId ? "Working…" : running ? "Stop dedicated listener" : "Start dedicated listener"}
+                        </button>
+                      );
+                    })()}
+                  </div>
+                </div>
               </Panel>
             ))}
           </div>

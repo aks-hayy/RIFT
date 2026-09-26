@@ -24,6 +24,8 @@ import uuid
 from .orchestrator import RiftOrchestrator
 from .rift_yaml import read_yaml
 from .runtime_paths import RiftPaths
+from .mesh.services import ServiceCatalog
+from .evaluation import validate_json_response
 
 
 JsonDict = dict[str, Any]
@@ -256,10 +258,12 @@ class RiftGatewayRuntime:
         data_root: str | Path | None = None,
         policy: GatewayPolicy | None = None,
         orchestrator_factory: OrchestratorFactory | None = None,
+        group_id: str | None = None,
     ) -> None:
         self.root = Path(root) if root else Path.cwd()
         self.rift_dir = Path(data_root) if data_root is not None else self.root / ".rift"
         self.policy = policy or GatewayPolicy()
+        self.group_id = str(group_id).strip() if group_id else None
         self.orchestrator_factory = orchestrator_factory or (
             lambda: RiftOrchestrator(root=self.root, runtime_root=self.rift_dir)
         )
@@ -269,6 +273,11 @@ class RiftGatewayRuntime:
             self.policy.burst_requests_per_second,
         )
         self.key_store = ApiKeyStore(self.rift_dir / "gateway" / "api_keys.json")
+        self.metrics_path = (
+            self.rift_dir / "gateway" / "groups" / self.group_id / "metrics.json"
+            if self.group_id
+            else self.rift_dir / "gateway" / "metrics.json"
+        )
         self._metrics_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._metrics: JsonDict = {
@@ -294,6 +303,7 @@ class RiftGatewayRuntime:
             "status_codes": {},
             "backends": {},
             "last_request": None,
+            "route_metrics": {},
         }
 
     def request_id(self, supplied: str | None) -> str:
@@ -360,10 +370,10 @@ class RiftGatewayRuntime:
             "estimation": "conservative character heuristic; backend tokenizer remains authoritative",
         }
 
-    def routes(self) -> list[JsonDict]:
+    def _service_routes(self, names: list[str] | None = None) -> list[JsonDict]:
         state = self.orchestrator_factory().read_state()
         services = state.get("services", {})
-        ordered = [self.policy.service_name, *self.policy.fallback_services]
+        ordered = names or [self.policy.service_name, *self.policy.fallback_services]
         routes = []
         seen = set()
         for name in ordered:
@@ -377,19 +387,92 @@ class RiftGatewayRuntime:
                 continue
             runtime = service.get("runtime") or {}
             launch_plan = service.get("launch_plan") or {}
+            gateway = service.get("gateway") if isinstance(service.get("gateway"), dict) else {}
+            artifact = gateway.get("output_schema")
+            schema = artifact.get("schema") if isinstance(artifact, dict) and "schema" in artifact else artifact
+            enforce_schema = bool(gateway.get("structured_output_enforced")) and isinstance(schema, dict)
             base_url = runtime.get("api_base") or launch_plan.get("api_base")
             if not base_url:
                 continue
             routes.append(
                 {
+                    "kind": "service",
                     "service": name,
+                    "scope": f"service:{name}",
                     "backend": service.get("backend"),
                     "base_url": str(base_url).rstrip("/"),
                     "status": service.get("status"),
                     "model": (service.get("model") or {}).get("id"),
+                    "output_schema": schema if enforce_schema else None,
+                    "output_schema_sha256": gateway.get("output_schema_sha256") if enforce_schema else None,
+                    "structured_output_enforced": enforce_schema,
                 }
             )
         return routes
+
+    def _group_routes(self) -> list[JsonDict]:
+        """Return path-mounted mesh groups backed by the local service catalog."""
+        catalog_path = self.rift_dir / "mesh" / "services.json"
+        if not catalog_path.is_file():
+            return []
+        try:
+            catalog = ServiceCatalog(catalog_path)
+            groups = catalog.list_groups()
+        except (OSError, ValueError, RuntimeError):
+            return []
+        routes: list[JsonDict] = []
+        for group in groups:
+            if not group.gateway_path:
+                continue
+            routes.append(
+                {
+                    "kind": "group",
+                    "group_id": group.group_id,
+                    "scope": f"group:{group.group_id}",
+                    "gateway_path": group.gateway_path.rstrip("/") or "/",
+                    "service_ids": list(group.service_ids),
+                    "default_service": group.default_service or group.service_ids[0],
+                }
+            )
+        return routes
+
+    def routes(self) -> list[JsonDict]:
+        return self._service_routes() + self._group_routes()
+
+    def resolve_request_path(self, path: str) -> tuple[str | None, str, list[str] | None]:
+        """Resolve a public path into a metric scope, upstream path, and member order."""
+        raw = str(path or "/")
+        clean, separator, query = raw.partition("?")
+        if self.group_id:
+            group = next((item for item in self._group_routes() if item.get("group_id") == self.group_id), None)
+            if group:
+                members = [str(group.get("default_service") or ""), *[str(item) for item in group.get("service_ids") or []]]
+                members = list(dict.fromkeys(item for item in members if item))
+                if clean in _OPENAI_PATHS:
+                    return str(group["scope"]), raw, members
+        for group in sorted(self._group_routes(), key=lambda item: len(str(item.get("gateway_path") or "")), reverse=True):
+            prefix = str(group.get("gateway_path") or "/").rstrip("/") or "/"
+            if prefix == "/":
+                continue
+            if clean == prefix:
+                continue
+            if clean.startswith(prefix + "/"):
+                upstream = clean[len(prefix):] or "/"
+                normalized_upstream = upstream
+                if normalized_upstream not in _OPENAI_PATHS and normalized_upstream in {
+                    "/chat/completions",
+                    "/completions",
+                    "/embeddings",
+                    "/models",
+                }:
+                    normalized_upstream = "/v1" + normalized_upstream
+                if normalized_upstream in _OPENAI_PATHS:
+                    normalized = normalized_upstream + ((separator + query) if separator else "")
+                    members = [str(group.get("default_service") or ""), *[str(item) for item in group.get("service_ids") or []]]
+                    return str(group["scope"]), normalized, list(dict.fromkeys(item for item in members if item))
+        if clean in _OPENAI_PATHS:
+            return f"service:{self.policy.service_name}", raw, None
+        return None, raw, None
 
     def proxy(
         self,
@@ -399,8 +482,22 @@ class RiftGatewayRuntime:
         body: bytes | None,
         request_id: str,
         stream_requested: bool,
+        route_scope: str | None = None,
+        member_names: list[str] | None = None,
     ) -> GatewayResponse:
-        routes = self.routes()
+        resolved_scope, upstream_path, resolved_members = self.resolve_request_path(path)
+        route_scope = route_scope or resolved_scope
+        member_names = member_names if member_names is not None else resolved_members
+        if route_scope is None:
+            return GatewayResponse(
+                status=HTTPStatus.NOT_FOUND.value,
+                content_type="application/json",
+                backend_service=None,
+                backend_url=None,
+                body=json.dumps({"error": "unknown gateway endpoint"}).encode("utf-8"),
+                error="unknown gateway endpoint",
+            )
+        routes = self._service_routes(member_names)
         if not routes:
             return GatewayResponse(
                 status=HTTPStatus.SERVICE_UNAVAILABLE.value,
@@ -412,14 +509,17 @@ class RiftGatewayRuntime:
             )
         failures = []
         for index, route in enumerate(routes):
-            target = f"{route['base_url']}{path}"
+            target = f"{route['base_url']}{upstream_path}"
+            forwarded_body = self._apply_output_schema(body, route)
             headers = {
                 "Accept": "text/event-stream" if stream_requested else "application/json",
                 "Content-Type": "application/json",
                 "User-Agent": "RIFT-Gateway/1.0",
                 "X-Request-ID": request_id,
             }
-            request = Request(target, data=body, headers=headers, method=method)
+            if route.get("structured_output_enforced") and route.get("output_schema_sha256"):
+                headers["X-RIFT-Output-Schema-SHA256"] = str(route["output_schema_sha256"])
+            request = Request(target, data=forwarded_body, headers=headers, method=method)
             try:
                 response = urlopen(request, timeout=self.policy.request_timeout_seconds)
             except HTTPError as exc:
@@ -431,6 +531,12 @@ class RiftGatewayRuntime:
                 error_body = exc.read(self.policy.max_body_bytes)
                 content_type = exc.headers.get("Content-Type", "application/json")
                 exc.close()
+                if route.get("structured_output_enforced") and status in {400, 422}:
+                    self._record_schema_violation(
+                        route,
+                        request_id,
+                        f"backend rejected the structured-output request (HTTP {status})",
+                    )
                 return GatewayResponse(
                     status=status,
                     content_type=content_type,
@@ -467,6 +573,29 @@ class RiftGatewayRuntime:
             content_type = response.headers.get("Content-Type", "application/json")
             is_stream = stream_requested or content_type.lower().startswith("text/event-stream")
             if is_stream:
+                if route.get("structured_output_enforced"):
+                    streamed = response.read(self.policy.max_body_bytes + 1)
+                    response.close()
+                    valid, detail = self._validate_schema_response(streamed, content_type, route)
+                    if not valid:
+                        self._record_schema_violation(route, request_id, detail)
+                        return GatewayResponse(
+                            status=HTTPStatus.BAD_GATEWAY.value,
+                            content_type="application/json",
+                            backend_service=str(route["service"]),
+                            backend_url=target,
+                            body=json.dumps({"error": "backend response violates the configured output schema", "detail": detail, "request_id": request_id}).encode("utf-8"),
+                            fallback_count=index,
+                            error="output schema violation",
+                        )
+                    return GatewayResponse(
+                        status=status,
+                        content_type=content_type,
+                        backend_service=str(route["service"]),
+                        backend_url=target,
+                        body=streamed,
+                        fallback_count=index,
+                    )
                 return GatewayResponse(
                     status=status,
                     content_type=content_type,
@@ -487,6 +616,19 @@ class RiftGatewayRuntime:
                     fallback_count=index,
                     error="upstream response body too large",
                 )
+            if route.get("structured_output_enforced"):
+                valid, detail = self._validate_schema_response(response_body, content_type, route)
+                if not valid:
+                    self._record_schema_violation(route, request_id, detail)
+                    return GatewayResponse(
+                        status=HTTPStatus.BAD_GATEWAY.value,
+                        content_type="application/json",
+                        backend_service=str(route["service"]),
+                        backend_url=target,
+                        body=json.dumps({"error": "backend response violates the configured output schema", "detail": detail, "request_id": request_id}).encode("utf-8"),
+                        fallback_count=index,
+                        error="output schema violation",
+                    )
             return GatewayResponse(
                 status=status,
                 content_type=content_type,
@@ -504,11 +646,121 @@ class RiftGatewayRuntime:
             error="routing exhausted",
         )
 
-    def begin_request(self, body_bytes: int) -> None:
+    @staticmethod
+    def _apply_output_schema(body: bytes | None, route: JsonDict) -> bytes | None:
+        if not body or not route.get("structured_output_enforced"):
+            return body
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body
+        if not isinstance(payload, dict):
+            return body
+        schema = route.get("output_schema")
+        backend = str(route.get("backend") or "").casefold()
+        if backend == "vllm":
+            # vLLM's structured_outputs API is preferred; response_format is
+            # retained for older OpenAI-compatible builds.
+            payload["structured_outputs"] = {"json": schema}
+            payload["response_format"] = {"type": "json_object"}
+        else:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "rift_output", "schema": schema, "strict": True},
+            }
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+    @staticmethod
+    def _response_text(body: bytes, content_type: str) -> str:
+        try:
+            if content_type.lower().startswith("text/event-stream"):
+                pieces: list[str] = []
+                for line in body.decode("utf-8", errors="replace").splitlines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    choice = (chunk.get("choices") or [{}])[0] if isinstance(chunk, dict) else {}
+                    delta = choice.get("delta") if isinstance(choice, dict) else {}
+                    pieces.append(str((delta or {}).get("content") or choice.get("text") or ""))
+                return "".join(pieces)
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        choice = choices[0]
+        message = choice.get("message")
+        if isinstance(message, dict):
+            return str(message.get("content") or "")
+        return str(choice.get("text") or "")
+
+    def _validate_schema_response(self, body: bytes, content_type: str, route: JsonDict) -> tuple[bool, str]:
+        return validate_json_response(self._response_text(body, content_type), route.get("output_schema") or {})
+
+    def _record_schema_violation(self, route: JsonDict, request_id: str, detail: str) -> None:
+        try:
+            orchestrator = self.orchestrator_factory()
+            orchestrator.record_incident(
+                str(route.get("service") or "unknown"),
+                reason="structured output schema violation",
+                action="alert",
+                details={
+                    "request_id": request_id,
+                    "detail": detail,
+                    "schema_sha256": route.get("output_schema_sha256"),
+                    "source": "gateway_runtime_guard",
+                },
+            )
+        except Exception:
+            # Validation remains fail-closed even if persistence/alerting is
+            # temporarily unavailable.
+            return
+
+    def _route_bucket_locked(self, route_scope: str | None) -> JsonDict | None:
+        if not route_scope:
+            return None
+        routes = self._metrics.setdefault("route_metrics", {})
+        bucket = routes.setdefault(
+            route_scope,
+            {
+                "requests_total": 0,
+                "requests_active": 0,
+                "requests_succeeded": 0,
+                "requests_failed": 0,
+                "bytes_received": 0,
+                "bytes_sent": 0,
+                "latency_seconds_total": 0.0,
+                "fallbacks_used": 0,
+                "status_codes": {},
+                "last_request": None,
+            },
+        )
+        return bucket
+
+    @staticmethod
+    def _route_status(bucket: JsonDict, status: int) -> None:
+        codes = bucket.setdefault("status_codes", {})
+        codes[str(status)] = int(codes.get(str(status)) or 0) + 1
+
+    def begin_request(self, body_bytes: int, *, route_scope: str | None = None) -> None:
         with self._metrics_lock:
             self._metrics["requests_total"] += 1
             self._metrics["requests_active"] += 1
             self._metrics["bytes_received"] += int(body_bytes)
+            bucket = self._route_bucket_locked(route_scope)
+            if bucket is not None:
+                bucket["requests_total"] += 1
+                bucket["requests_active"] += 1
+                bucket["bytes_received"] += int(body_bytes)
 
     def reject(
         self,
@@ -520,6 +772,7 @@ class RiftGatewayRuntime:
         path: str,
         identity: str,
         error: str,
+        route_scope: str | None = None,
     ) -> None:
         record = {
             "created_unix_seconds": time.time(),
@@ -542,6 +795,12 @@ class RiftGatewayRuntime:
             status_codes = self._metrics["status_codes"]
             status_codes[str(status)] = int(status_codes.get(str(status)) or 0) + 1
             self._metrics["last_request"] = record
+            bucket = self._route_bucket_locked(route_scope)
+            if bucket is not None:
+                bucket["requests_total"] += 1
+                bucket["requests_failed"] += 1
+                self._route_status(bucket, status)
+                bucket["last_request"] = record
             self._persist_metrics_locked()
         self._append_request_log(record)
 
@@ -559,6 +818,7 @@ class RiftGatewayRuntime:
         fallback_count: int,
         token_estimate: JsonDict | None,
         error: str | None,
+        route_scope: str | None = None,
     ) -> None:
         record = {
             "created_unix_seconds": time.time(),
@@ -601,6 +861,16 @@ class RiftGatewayRuntime:
                 if not success:
                     backend["failures"] += 1
             self._metrics["last_request"] = record
+            bucket = self._route_bucket_locked(route_scope)
+            if bucket is not None:
+                bucket["requests_active"] = max(0, int(bucket.get("requests_active") or 0) - 1)
+                bucket["requests_total"] = max(1, int(bucket.get("requests_total") or 0))
+                bucket["requests_succeeded" if success else "requests_failed"] += 1
+                bucket["bytes_sent"] += int(bytes_sent)
+                bucket["latency_seconds_total"] += latency_seconds
+                bucket["fallbacks_used"] += int(fallback_count)
+                self._route_status(bucket, status)
+                bucket["last_request"] = record
             self._persist_metrics_locked()
         self._append_request_log(record)
 
@@ -613,6 +883,11 @@ class RiftGatewayRuntime:
         )
         metrics["policy"] = asdict(self.policy)
         metrics["routes"] = self.routes()
+        for bucket in metrics.get("route_metrics", {}).values():
+            completed = int(bucket.get("requests_succeeded") or 0) + int(bucket.get("requests_failed") or 0)
+            bucket["average_latency_seconds"] = (
+                float(bucket.get("latency_seconds_total") or 0.0) / completed if completed else None
+            )
         return metrics
 
     def health(self) -> JsonDict:
@@ -639,7 +914,7 @@ class RiftGatewayRuntime:
         }
 
     def _persist_metrics_locked(self) -> None:
-        path = self.rift_dir / "gateway" / "metrics.json"
+        path = self.metrics_path
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(".json.tmp")
         temp.write_text(json.dumps(self._metrics, indent=2, sort_keys=True), encoding="utf-8")
@@ -719,20 +994,21 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
         if request_path in ("/metrics", "/api/rift/gateway/metrics"):
             self._send_json(HTTPStatus.OK.value, self.runtime.metrics(), self.runtime.request_id(None))
             return
-        if request_path == "/v1/models":
+        if self.runtime.resolve_request_path(self.path)[0] is not None:
             self._handle_proxy("GET")
             return
         self._send_json(HTTPStatus.NOT_FOUND.value, {"error": "unknown gateway endpoint"}, self.runtime.request_id(None))
 
     def do_POST(self) -> None:  # noqa: N802
         request_path = self.path.split("?", 1)[0]
-        if request_path not in _OPENAI_PATHS or request_path == "/v1/models":
+        if self.runtime.resolve_request_path(self.path)[0] is None or request_path == "/v1/models":
             self._send_json(HTTPStatus.NOT_FOUND.value, {"error": "unknown gateway endpoint"}, self.runtime.request_id(None))
             return
         self._handle_proxy("POST")
 
     def _handle_proxy(self, method: str) -> None:
         started = time.perf_counter()
+        route_scope, upstream_path, member_names = self.runtime.resolve_request_path(self.path)
         request_id = self.runtime.request_id(self.headers.get("X-Request-ID"))
         authorization = self.headers.get("Authorization")
         identity = self.runtime.identity(authorization, self.client_address[0])
@@ -745,6 +1021,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 path=self.path,
                 identity=identity,
                 error="invalid gateway API key",
+                route_scope=route_scope,
             )
             self._send_json(HTTPStatus.UNAUTHORIZED.value, {"error": "invalid gateway API key"}, request_id)
             return
@@ -758,6 +1035,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 path=self.path,
                 identity=identity,
                 error="gateway request rate exceeded",
+                route_scope=route_scope,
             )
             self._send_json(
                 HTTPStatus.TOO_MANY_REQUESTS.value,
@@ -776,6 +1054,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 path=self.path,
                 identity=identity,
                 error="request body exceeds gateway limit",
+                route_scope=route_scope,
             )
             self._send_json(
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
@@ -793,7 +1072,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                     raise ValueError("request JSON must be an object")
                 token_estimate = self.runtime.validate_payload(
                     payload,
-                    path=self.path.split("?", 1)[0],
+                    path=upstream_path.split("?", 1)[0],
                 )
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                 self.runtime.reject(
@@ -804,6 +1083,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                     path=self.path,
                     identity=identity,
                     error=str(exc),
+                    route_scope=route_scope,
                 )
                 self._send_json(HTTPStatus.BAD_REQUEST.value, {"error": str(exc)}, request_id)
                 return
@@ -816,6 +1096,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 path=self.path,
                 identity=identity,
                 error="gateway concurrency limit reached",
+                route_scope=route_scope,
             )
             self._send_json(
                 HTTPStatus.TOO_MANY_REQUESTS.value,
@@ -824,7 +1105,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                 extra_headers={"Retry-After": "1"},
             )
             return
-        self.runtime.begin_request(length)
+        self.runtime.begin_request(length, route_scope=route_scope)
         result: GatewayResponse | None = None
         bytes_sent = 0
         observed_usage: JsonDict | None = None
@@ -832,10 +1113,12 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
             try:
                 result = self.runtime.proxy(
                     method=method,
-                    path=self.path,
+                    path=upstream_path,
                     body=body,
                     request_id=request_id,
                     stream_requested=bool(payload.get("stream", False)),
+                    route_scope=route_scope,
+                    member_names=member_names,
                 )
             except Exception as exc:
                 result = GatewayResponse(
@@ -878,6 +1161,7 @@ class RiftGatewayHandler(BaseHTTPRequestHandler):
                         else token_estimate
                     ),
                     error=result.error,
+                    route_scope=route_scope,
                 )
 
     def _send_stream(self, result: GatewayResponse, request_id: str) -> tuple[int, JsonDict | None]:
@@ -1019,8 +1303,18 @@ def serve_gateway(
     host: str | None = None,
     port: int | None = None,
     fallback_services: list[str] | None = None,
+    group_id: str | None = None,
 ) -> None:
     config = Path(config_path).resolve()
+    selected_group = str(group_id or "").strip() or None
+    if selected_group:
+        catalog_path = RiftPaths.from_environment(cwd=config.parent).home / "mesh" / "services.json"
+        try:
+            catalog = ServiceCatalog(catalog_path)
+            group = next(item for item in catalog.list_groups() if item.group_id == selected_group)
+            service_name = group.default_service or group.service_ids[0]
+        except (OSError, RuntimeError, StopIteration, ValueError) as exc:
+            raise ValueError(f"gateway group not found: {selected_group}") from exc
     overrides: JsonDict = {"host": host, "port": port}
     if fallback_services is not None:
         overrides["fallback_services"] = fallback_services
@@ -1031,16 +1325,26 @@ def serve_gateway(
         root=config.parent,
         data_root=RiftPaths.from_environment(cwd=config.parent).home,
         policy=policy,
+        group_id=selected_group,
     )
     server = create_gateway_server(runtime=runtime)
-    state_path = runtime.rift_dir / "gateway" / "state.json"
+    state_path = (
+        runtime.rift_dir / "gateway" / "groups" / selected_group / "state.json"
+        if selected_group
+        else runtime.rift_dir / "gateway" / "state.json"
+    )
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state = {
+        "kind": "group" if selected_group else "main",
         "status": "running",
         "pid": os.getpid(),
         "host": server.server_address[0],
         "port": server.server_port,
         "service": service_name,
+        "service_name": service_name,
+        "group_id": selected_group,
+        "route_scope": f"group:{selected_group}" if selected_group else f"service:{service_name}",
+        "config_path": str(config),
         "fallback_services": list(policy.fallback_services),
         "started_unix_seconds": time.time(),
     }

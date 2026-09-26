@@ -135,6 +135,18 @@ class WorkloadProfile:
     minimum_quality: float | None = None
     maximum_ttft_seconds: float | None = None
     minimum_decode_tokens_per_second: float | None = None
+    objective: str = "balanced"
+    request_rate: float | None = None
+    decode_scope: str = "per_request"
+    ttft_percentile: int = 95
+    tool_calling: bool = False
+    structured_output: bool = False
+    network_policy: str = "approved_sources"
+    backend_preference: str | None = None
+    model_family_preference: str | None = None
+    quality_suite_id: str | None = None
+    quality_suite_version: str | None = None
+    quality_required_cases: tuple[str, ...] = ()
 
     def to_dict(self) -> JsonDict:
         return asdict(self)

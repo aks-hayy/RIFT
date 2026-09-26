@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..backends.catalog import BackendCatalogError, backend_catalog
 from ..adapters.registry import BackendAdapterHost
 from .base import BackendProvider, ProviderLifecycleMixin, provider_lifecycle_gate
 from .lmcache_aware import LMCacheAwareProvider
@@ -12,8 +13,21 @@ from .vllm import VllmProvider
 
 
 def backend_adapter_host(*, load_entry_points: bool = True) -> BackendAdapterHost:
+    catalog = backend_catalog()
+    builtins = []
+    failures: list[str] = []
+    for backend_id in sorted(catalog.manifests()):
+        try:
+            builtins.append(catalog.load(backend_id))
+        except BackendCatalogError as exc:
+            failures.append(str(exc))
+    if failures:
+        # A malformed first-party backend must not make unrelated backends
+        # disappear; the registry will still expose its diagnostics through
+        # the manifest catalog.  This is intentionally not a legacy fallback.
+        pass
     return BackendAdapterHost(
-        builtins=(LlamaCppProvider(), VllmProvider(), SglangProvider(), MlxLmProvider()),
+        builtins=tuple(builtins),
         entry_point_group="rift.backend_adapters",
         load_entry_points=load_entry_points,
     )

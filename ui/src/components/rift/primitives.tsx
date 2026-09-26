@@ -14,11 +14,13 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <div className="border-b border-border bg-surface">
-      <div className="max-w-[1400px] mx-auto px-4 py-6 flex flex-wrap items-end justify-between gap-4">
+    <div className="rift-seismic-rule border-b border-border/70 bg-white/45 backdrop-blur-lg">
+      <div className="max-w-[1560px] mx-auto px-5 py-7 flex flex-wrap items-end justify-between gap-4 sm:px-7">
         <div className="min-w-0">
           {eyebrow && <div className="rift-label mb-2">{eyebrow}</div>}
-          <h1 className="text-[22px] leading-tight font-medium text-ink">{title}</h1>
+          <h1 className="text-[25px] leading-tight font-semibold tracking-[-0.035em] text-ink">
+            {title}
+          </h1>
           {description && (
             <p className="mt-1.5 text-[13px] text-ink-secondary max-w-2xl">{description}</p>
           )}
@@ -43,9 +45,9 @@ export function Panel({
   children: ReactNode;
 }) {
   return (
-    <section className={cn("rift-panel min-w-0 max-w-full", className)}>
+    <section className={cn("rift-panel rift-glass-hover min-w-0 max-w-full", className)}>
       {title && (
-        <header className="flex items-center justify-between px-4 h-10 border-b border-border">
+        <header className="flex h-11 items-center justify-between rounded-t-[inherit] border-b border-border/70 bg-white/30 px-4">
           <h2 className="rift-label">{title}</h2>
           {aside}
         </header>

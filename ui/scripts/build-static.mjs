@@ -2,6 +2,7 @@ import { cp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pathToFileURL } from "node:url";
+import { rootRedirectHtml } from "./static-routes.mjs";
 
 const scriptDir = resolve(fileURLToPath(new URL(".", import.meta.url)));
 const uiRoot = resolve(scriptDir, "..");
@@ -11,11 +12,13 @@ const staticRoot = resolve(uiRoot, "..", "python", "rift", "web", "static");
 const richDistRoot = resolve(staticRoot, "_rich", "dist");
 
 const routes = [
-    { url: "/", filename: "index.html" },
+    { url: "/workloads", filename: "workloads.html" },
+    { url: "/overview", filename: "overview.html" },
     { url: "/setup", filename: "setup.html" },
     { url: "/deployments", filename: "deployments.html" },
     { url: "/nodes", filename: "nodes.html" },
     { url: "/models", filename: "models.html" },
+    { url: "/models/catalog", filename: "models-catalog.html" },
     { url: "/groups", filename: "groups.html" },
     { url: "/operations?tab=operations", filename: "operations.html" },
     { url: "/tuning", filename: "tuning.html" },
@@ -32,8 +35,7 @@ async function sanitizeServerArtifacts() {
                 await visit(entryPath);
                 continue;
             }
-            if (!entry.name.endsWith(".js"))
-                continue;
+            if (!entry.name.endsWith(".js")) continue;
 
             const source = await readFile(entryPath, "utf8");
             let sanitized = source.replace(/[ \t]+(?=\r?\n)/g, "");
@@ -47,8 +49,7 @@ async function sanitizeServerArtifacts() {
                     'filePath: "$1"',
                 );
             }
-            if (sanitized !== source)
-                await writeFile(entryPath, sanitized, "utf8");
+            if (sanitized !== source) await writeFile(entryPath, sanitized, "utf8");
         }
     }
 
@@ -59,12 +60,20 @@ async function main() {
     const { default: app } = await import(pathToFileURL(serverBundle).href);
     await mkdir(staticRoot, { recursive: true });
     for (const entry of await readdir(staticRoot)) {
-        if (entry === "assets" || entry.endsWith(".html") || entry === "rift-mark.svg") {
+        if (
+            entry === "assets" ||
+            entry.endsWith(".html") ||
+            entry === "rift-mark.svg" ||
+            entry === "rift-logo-concept-v9.png"
+        ) {
             await rm(join(staticRoot, entry), { recursive: true, force: true });
         }
     }
     await cp(join(clientRoot, "assets"), join(staticRoot, "assets"), { recursive: true });
-    await cp(join(clientRoot, "rift-mark.svg"), join(staticRoot, "rift-mark.svg"));
+    await cp(
+        join(clientRoot, "rift-logo-concept-v9.png"),
+        join(staticRoot, "rift-logo-concept-v9.png"),
+    );
 
     // The dashboard launcher prefers the server-rendered bundle when Node.js is
     // available. Keep that packaged path in lockstep with the canonical build so
@@ -89,6 +98,7 @@ async function main() {
         );
         await writeFile(join(staticRoot, route.filename), page, "utf8");
     }
+    await writeFile(join(staticRoot, "index.html"), rootRedirectHtml(), "utf8");
     console.log(`Exported ${routes.length} RIFT dashboard routes to ${staticRoot}`);
 }
 

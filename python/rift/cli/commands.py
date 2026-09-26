@@ -10,6 +10,7 @@ import urllib.request
 import uuid
 import zipfile
 from collections.abc import Mapping
+import math
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,12 @@ from rift.rift import RiftEngine
 from rift.rift_yaml import read_yaml, write_yaml
 from rift.runtime_paths import RiftPaths
 from rift.tuning_engine import TuningStore
+from rift.workload_compiler import compile_workload
+from rift.workload_store import WorkloadStore
+from rift.workload_controller import WorkloadController
+from rift.execution_policy import content_hash, default_execution_policy
 from rift.mesh.controller import MeshController
+from rift.telemetry.objectives import normalize_objectives
 
 from .console import RiftConsole
 
@@ -35,6 +41,9 @@ def execute(args: Any, console: RiftConsole) -> int:
 
     if args.command == "mesh":
         return _mesh(args, console)
+
+    if args.command == "workload":
+        return _workload(args, console, orchestrator)
 
     if args.command == "init":
         result = orchestrator.init_config(path=args.config, overwrite=args.force)
@@ -82,31 +91,36 @@ def execute(args: Any, console: RiftConsole) -> int:
         automatic_pull = args.command == "pull"
         dry_run = bool(getattr(args, "dry_run", False))
         source = str(getattr(args, "source", "huggingface") or "huggingface")
-        if source == "local" and not automatic_pull:
-            result = orchestrator.generate_config(
-                task=args.task,
-                source="local",
-                models_dir=getattr(args, "models_dir", None),
-                output=args.output or ".rift/generated/rift.generated.yaml",
-                top=args.top,
-                candidate_limit=args.candidate_limit,
-                max_download_gb=args.max_download_gb or 12.0,
-                write=True,
+        workload_contract = None
+        workload_revision = None
+        if getattr(args, "workload_id", None):
+            draft = WorkloadStore(orchestrator.rift_dir / "workloads.db").get_draft(
+                str(args.workload_id), revision=getattr(args, "workload_revision", None)
             )
-            selected = dict(result.get("selected") or {})
-            service = dict((result.get("config") or {}).get("services", {}).get("chat", {}))
-            result["source"] = "local"
-            result["recommendations"] = [
-                {
-                    "rank": 1,
-                    "id": selected.get("path"),
-                    "format": selected.get("format"),
-                    "backend": dict(service.get("policy") or {}).get("backend"),
-                    "decision": dict(service.get("model") or {}).get("decision"),
-                }
-            ]
+            workload_contract = draft["contract"]
+            workload_revision = draft["revision"]
+        if source == "local" and not automatic_pull:
+            result = orchestrator.recommend_local_models(
+                task=args.task,
+                models_dir=getattr(args, "models_dir", None),
+                top=args.top,
+                workload_contract=workload_contract,
+            )
+            result["workload_revision"] = workload_revision
+            shortlist = result.get("recommendations") or []
+            if shortlist:
+                generated = orchestrator.generate_config(
+                    task=str(result.get("task") or args.task),
+                    source="local",
+                    models_dir=getattr(args, "models_dir", None),
+                    output=args.output or ".rift/generated/rift.generated.yaml",
+                    selected_candidate=shortlist[0],
+                    workload_contract=workload_contract,
+                    write=True,
+                )
+                result.update({key: generated[key] for key in ("path", "config", "discovery", "selected")})
             console.render(result, view="result", title="Local model recommendation")
-            return 0
+            return 0 if shortlist else 1
         simulated_hardware = getattr(args, "simulate_hardware", None)
         if simulated_hardware and (automatic_pull or bool(getattr(args, "verify", False))):
             console.error(
@@ -132,7 +146,12 @@ def execute(args: Any, console: RiftConsole) -> int:
             token=args.token,
             simulated_hardware=simulated_hardware,
             benchmark_snapshots=getattr(args, "benchmark_snapshot", None),
+            model_ref=getattr(args, "model_ref", None),
+            workload_contract=workload_contract,
+            search_candidate_limit=getattr(args, "search_candidate_limit", args.candidate_limit),
         )
+        if workload_revision is not None:
+            result["workload_revision"] = workload_revision
         if args.command == "recommend" and args.verify:
             verify_top = args.verify_top if args.verify_top is not None else args.verify_finalists
             result["verification"] = orchestrator.verify_recommendation_run(
@@ -187,11 +206,16 @@ def execute(args: Any, console: RiftConsole) -> int:
             return 0
         if args.recommendation_run and (args.huggingface or args.local_model or args.models_dir):
             raise ValueError("choose --recommendation-run or a direct model source, not both")
+        monitoring_objectives = _monitoring_policy(args.monitoring_policy) if getattr(args, "monitoring_policy", None) else None
         if args.recommendation_run:
+            monitoring_profile, monitoring_metrics = _monitoring_selection(args)
             result = orchestrator.plan_recommendation_run(
                 run_id=args.recommendation_run,
                 selector=args.selector,
                 output=args.materialized_config,
+                monitoring_profile=monitoring_profile,
+                monitoring_metrics=monitoring_metrics,
+                monitoring_objectives=monitoring_objectives,
             )
         elif args.huggingface or args.local_model or args.models_dir:
             result = _plan_from_model_source(args, console, orchestrator)
@@ -212,10 +236,14 @@ def execute(args: Any, console: RiftConsole) -> int:
                 run_id = str(selected.get("recommendation_run_id") or "")
                 if not run_id:
                     raise ValueError("selected pulled model has no recommendation run ID")
+                monitoring_profile, monitoring_metrics = _monitoring_selection(args)
                 result = orchestrator.plan_recommendation_run(
                     run_id=run_id,
                     selector=str(selected.get("repo_id") or args.selector or "best_estimated"),
                     output=args.materialized_config,
+                    monitoring_profile=monitoring_profile,
+                    monitoring_metrics=monitoring_metrics,
+                    monitoring_objectives=monitoring_objectives,
                 )
             else:
                 if not config_path.is_file():
@@ -231,7 +259,15 @@ def execute(args: Any, console: RiftConsole) -> int:
                         f"RIFT config not found: {config_path}. "
                         "Run `rift init` to create a starter rift.yaml."
                     )
-                result = orchestrator.plan(config_path=args.config)
+                config_path = args.config
+                if monitoring_objectives is not None:
+                    config = read_yaml(orchestrator._resolve_path(config_path))
+                    for service in (config.get("services") or {}).values():
+                        if isinstance(service, dict):
+                            orchestrator._apply_monitoring_objectives(service, monitoring_objectives)
+                    config_path = str(orchestrator.plan_dir / f"{Path(config_path).stem}-objectives.yaml")
+                    write_yaml(orchestrator._resolve_path(config_path), config)
+                result = orchestrator.plan(config_path=config_path)
         console.render(result, view="plan")
         return 1 if any(item.get("kind") == "error" for item in result.get("actions", [])) else 0
 
@@ -468,6 +504,9 @@ def execute(args: Any, console: RiftConsole) -> int:
         console.render(result, title="Services stopped")
         return 0
 
+    if args.command == "gateway":
+        return _gateway(args, console, orchestrator)
+
     if args.command == "dashboard":
         if args.detach:
             result = launch_dashboard_detached(
@@ -500,6 +539,116 @@ def execute(args: Any, console: RiftConsole) -> int:
     if args.command == "system":
         return _system(args, console, orchestrator)
     raise ValueError(f"unsupported command: {args.command}")
+
+
+def _workload(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
+    """Compile, approve, and execute bounded easy-path workload runs."""
+    store = WorkloadStore(orchestrator.rift_dir / "workloads.db")
+    if args.workload_command == "compile":
+        if args.file:
+            path = Path(args.file)
+            if not path.is_file():
+                raise ValueError(f"workload file was not found: {path}")
+            request = read_yaml(path)
+        else:
+            request = args.text
+        output_schema = None
+        output_schema_filename = None
+        schema_arg = getattr(args, "output_schema", None)
+        if schema_arg:
+            schema_path = Path(schema_arg)
+            if not schema_path.is_file():
+                raise ValueError(f"output schema file was not found: {schema_path}")
+            try:
+                output_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"output schema is not valid JSON: {exc}") from exc
+            output_schema_filename = schema_path.name
+        compiled = compile_workload(
+            request,
+            confirm_default_quality=bool(args.confirm_default_quality),
+            output_schema=output_schema,
+            output_schema_filename=output_schema_filename,
+        )
+        if args.no_save:
+            console.render(compiled, title="Compiled workload (not saved)")
+            return 0
+        saved = store.save_draft(
+            compiled["contract"],
+            provenance=compiled["provenance"],
+            questions=compiled["questions"],
+        )
+        result = saved | {k: compiled[k] for k in ("input", "warnings", "unsupported_requirements", "limitations")}
+        console.render(result, title="Compiled workload draft")
+        return 0
+    if args.workload_command == "show":
+        result = store.get_draft(args.draft_id)
+        console.render(result, title="Workload draft")
+        return 0
+    if args.workload_command == "approve":
+        draft = store.get_draft(args.draft_id)
+        if draft.get("questions"):
+            console.render(
+                {
+                    "status": "BLOCKED",
+                    "draft_id": draft.get("draft_id"),
+                    "revision": draft.get("revision"),
+                    "contract_hash": draft.get("contract_hash"),
+                    "reason": "resolve review questions before approval",
+                    "questions": draft.get("questions"),
+                },
+                title="Workload approval blocked",
+            )
+            return 2
+        envelope = default_execution_policy()
+        envelope["network"] = args.network
+        actions = envelope["actions"]
+        actions.update({
+            "download": bool(args.allow_download),
+            "install": bool(args.allow_install),
+            "temporary_launch": bool(args.allow_launch),
+            "restart": bool(args.allow_restart),
+            "promote": bool(args.allow_promote),
+            "cleanup": bool(args.allow_cleanup),
+            "remote_execution": bool(args.allow_remote),
+        })
+        envelope["allow_quantization_alternatives"] = bool(args.allow_quantization_alternatives)
+        total_bytes = int(max(0.0, float(args.total_download_gib)) * 1024**3)
+        if args.network == "offline":
+            total_bytes = 0
+        envelope["limits"] = {
+            "exploration_seconds": args.exploration_seconds,
+            "max_artifacts": args.max_artifacts,
+            "tuning_candidates": args.tuning_candidates,
+            "per_artifact_bytes": total_bytes,
+            "total_download_bytes": total_bytes,
+        }
+        if not args.yes:
+            console.render({"draft_id": draft["draft_id"], "revision": draft["revision"], "contract_hash": draft["contract_hash"], "envelope": envelope}, title="Approval preview")
+            print("Rerun with `--yes` after reviewing the explicit permissions and budgets.")
+            return 2
+        if not math.isfinite(float(args.total_download_gib)) or args.total_download_gib < 0:
+            raise ValueError("--total-download-gib must be finite and nonnegative")
+        policy_id = f"easy-{draft['draft_id'][:12]}"
+        saved = store.save_policy(policy_id, envelope, expected_revision=0)
+        approval = store.approve(
+            draft["draft_id"], expected_revision=draft["revision"], contract_hash=draft["contract_hash"],
+            policy_id=policy_id, policy_revision=saved["revision"], envelope=envelope,
+            envelope_hash=content_hash(envelope),
+        )
+        console.render({"draft": draft, "policy": saved, "approval": approval}, title="Workload approved")
+        return 0
+    if args.workload_command == "run":
+        result = WorkloadController(orchestrator, store).run(
+            args.approval_id,
+            models_dir=args.models_dir,
+            model_ref=args.model_ref,
+            candidate_limit=args.candidate_limit,
+            tune=not args.no_tune,
+        )
+        console.render(result, title="Workload deployment run")
+        return 0 if result.get("status") == "VERIFIED" else 3 if result.get("status") == "INFEASIBLE" else 2 if result.get("status") == "BLOCKED" else 1
+    raise ValueError("rift workload requires a subcommand")
 
 
 def _parse_budget_seconds(value: str | None) -> float:
@@ -737,6 +886,8 @@ def _plan_from_model_source(
     console: RiftConsole,
     orchestrator: RiftOrchestrator,
 ) -> dict[str, Any]:
+    monitoring_profile, monitoring_metrics = _monitoring_selection(args)
+    monitoring_objectives = _monitoring_policy(args.monitoring_policy) if getattr(args, "monitoring_policy", None) else None
     provided = [bool(args.huggingface), bool(args.local_model), bool(args.models_dir)]
     if sum(provided) != 1:
         raise ValueError("choose exactly one of --huggingface, --local-model, or --models-dir")
@@ -770,6 +921,9 @@ def _plan_from_model_source(
             refresh=args.refresh,
             output=output,
             selector=artifact_selector,
+            monitoring_profile=monitoring_profile,
+            monitoring_metrics=monitoring_metrics,
+            monitoring_objectives=monitoring_objectives,
             write=True,
         )
     else:
@@ -788,8 +942,31 @@ def _plan_from_model_source(
             source="local",
             models_dir=selected["path"],
             output=output,
+            monitoring_profile=monitoring_profile,
+            monitoring_metrics=monitoring_metrics,
+            monitoring_objectives=monitoring_objectives,
         )
     return orchestrator.plan(config_path=materialized["path"])
+
+
+def _monitoring_policy(path: str) -> list[dict[str, Any]]:
+    """Load a normalized objective list from a YAML/JSON policy file."""
+    raw = read_yaml(Path(path))
+    if isinstance(raw, Mapping):
+        if isinstance(raw.get("monitoring"), Mapping):
+            raw = raw["monitoring"].get("objectives", raw["monitoring"])
+        elif "objectives" in raw:
+            raw = raw["objectives"]
+    return normalize_objectives(raw)
+
+
+def _monitoring_selection(args: Any) -> tuple[str | None, list[str] | None]:
+    profile = str(getattr(args, "monitoring_profile", "") or "").strip() or None
+    raw_metrics = getattr(args, "monitoring_metrics", None)
+    if raw_metrics is None:
+        return profile, None
+    metrics = [item.strip() for item in str(raw_metrics).split(",") if item.strip()]
+    return profile, metrics
 
 
 def _model(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
@@ -924,6 +1101,45 @@ def _backend(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) ->
     raise ValueError("rift backend requires a subcommand")
 
 
+def _gateway(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
+    if args.gateway_command == "start":
+        result = orchestrator.gateway_start(
+            service_name=args.service,
+            config_path=args.config,
+            host=args.host,
+            port=args.port,
+        )
+        console.render(result, title="RIFT gateway started")
+        return 0
+    if args.gateway_command == "stop":
+        result = orchestrator.gateway_stop()
+        console.render(result, title="RIFT gateway stopped")
+        return 0
+    if args.gateway_command == "status":
+        result = orchestrator.gateway_status()
+        console.render(result, title="RIFT gateway status")
+        return 0
+    if args.gateway_command == "group":
+        if args.gateway_group_command == "start":
+            result = orchestrator.gateway_start(
+                config_path=args.config,
+                host=args.host,
+                port=args.port,
+                group_id=args.group_id,
+            )
+            console.render(result, title=f"Gateway group {args.group_id} started")
+            return 0
+        if args.gateway_group_command == "stop":
+            result = orchestrator.gateway_stop(group_id=args.group_id)
+            console.render(result, title=f"Gateway group {args.group_id} stopped")
+            return 0
+        if args.gateway_group_command == "status":
+            result = orchestrator.gateway_status(group_id=args.group_id)
+            console.render(result, title=f"Gateway group {args.group_id} status")
+            return 0
+    raise ValueError("rift gateway requires a subcommand")
+
+
 def _service(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) -> int:
     if args.service_command in {"benchmark", "tune"}:
         original_command = args.command
@@ -989,7 +1205,34 @@ def _service(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) ->
             result = orchestrator.telemetry_latest(service_name=args.service, node_id=args.node)
         console.render(result, title="Resource telemetry")
         return 0
+    if args.service_command == "objectives":
+        if args.report:
+            reports = orchestrator.telemetry_reports(service_name=args.service, limit=args.limit)
+            result = {
+                "service": args.service,
+                "reports": [
+                    {
+                        "report_id": report.get("report_id"),
+                        "service_name": report.get("service_name"),
+                        "node_id": report.get("node_id"),
+                        "objectives": report.get("objectives", []),
+                        "objective_events": report.get("objective_events", []),
+                    }
+                    for report in reports.get("reports", [])
+                ],
+            }
+        else:
+            result = orchestrator.telemetry_objectives(
+                service_name=args.service,
+                session_id=args.session_id,
+                events=args.events,
+                limit=args.limit,
+            )
+        console.render(result, title="Service objectives")
+        return 0
     if args.service_command == "gateway":
+        if getattr(args, "gateway_action", "run") != "run":
+            raise ValueError("unsupported service gateway action")
         serve_gateway(
             config_path=args.config,
             service_name=args.service,

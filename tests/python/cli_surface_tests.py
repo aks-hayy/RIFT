@@ -19,6 +19,7 @@ sys.modules.setdefault("rift._core", core)
 
 from rift.cli.parser import build_parser
 from rift.cli.console import RiftConsole
+from rift.cli.commands import _monitoring_policy
 
 
 def test_apply_accepts_explicit_permissions_and_config() -> None:
@@ -85,6 +86,19 @@ def test_plan_accepts_model_source_options() -> None:
     assert args.task == "coding"
     assert args.select == "1"
     assert args.no_prompt is True
+
+
+def test_plan_accepts_monitoring_policy_path() -> None:
+    args = build_parser().parse_args(["plan", "--monitoring-policy", "policies/chat.yaml"])
+    assert args.monitoring_policy == "policies/chat.yaml"
+
+
+def test_monitoring_policy_loader_normalizes_objective_file(tmp_path) -> None:
+    path = tmp_path / "policy.yaml"
+    path.write_text("objectives:\n  - id: ttft\n    metric: inference.ttft_ms\n    operator: <=\n    threshold: 500\n", encoding="utf-8")
+    loaded = _monitoring_policy(str(path))
+    assert loaded[0]["id"] == "ttft"
+    assert loaded[0]["threshold"] == 500.0
 
 
 def test_state_backup_and_restore_require_explicit_restore_confirmation() -> None:
