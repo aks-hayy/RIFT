@@ -224,7 +224,8 @@ class SglangProvider(ProviderLifecycleMixin):
                 unsupported["install_plan"] = self.install_plan()
                 return unsupported
             result = install_python_packages_isolated(
-                ["sglang"], target_dir=target_dir, pre=selected_variant in ("pre", "nightly"), force=force
+                ["sglang"], target_dir=target_dir, backend_id=self.name,
+                pre=selected_variant in ("pre", "nightly"), force=force
             )
         detection = self.detect(search_root=target_dir)
         return {
@@ -405,4 +406,3 @@ def create_backend() -> SglangProvider:
     return SglangProvider()
 
 __all__ = ["SglangProvider", "create_backend"]
-

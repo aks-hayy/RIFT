@@ -14,6 +14,7 @@
     "verify:live-actions": "node --experimental-strip-types scripts/verify-live-actions.mjs",
     "verify:tuning-flow": "node --experimental-strip-types scripts/verify-tuning-flow.mjs",
     "verify:operation-state": "node --experimental-strip-types scripts/verify-operation-state.mjs",
+    "verify:backend-uninstall": "node scripts/verify-backend-uninstall.mjs",
     "verify:controller": "node scripts/verify-controller.mjs",
     "lint": "eslint .",
     "format": "prettier --write ."

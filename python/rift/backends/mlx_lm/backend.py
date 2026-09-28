@@ -151,7 +151,9 @@ class MlxLmProvider(ProviderLifecycleMixin):
                 "reason": host["reason"],
                 "install_plan": self.install_plan(),
             }
-        result = install_python_packages_isolated(["mlx-lm"], target_dir=target_dir, force=force)
+        result = install_python_packages_isolated(
+            ["mlx-lm"], target_dir=target_dir, backend_id=self.name, force=force
+        )
         detection = self.detect(search_root=target_dir)
         return {
             "backend": self.name,
@@ -280,4 +282,3 @@ def create_backend() -> MlxLmProvider:
     return MlxLmProvider()
 
 __all__ = ["MlxLmProvider", "create_backend"]
-

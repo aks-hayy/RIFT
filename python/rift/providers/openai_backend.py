@@ -17,6 +17,8 @@ import venv
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from ..runtime_paths import path_redirection_reason
+
 
 JsonDict = dict[str, Any]
 
@@ -148,6 +150,70 @@ def isolated_environment_paths(target_dir: str | Path) -> JsonDict:
     }
 
 
+def _verified_managed_environment(
+    target_dir: str | Path,
+    backend_id: str,
+    install_type: str,
+) -> bool:
+    """Validate the exact RIFT marker before touching an existing venv."""
+    if path_redirection_reason(target_dir):
+        return False
+    target = Path(target_dir).expanduser().resolve()
+    environment = target / "venv"
+    marker_path = target / "rift-managed-install.json"
+    if (
+        path_redirection_reason(environment)
+        or path_redirection_reason(marker_path)
+        or not marker_path.is_file()
+    ):
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(marker, dict):
+        return False
+    try:
+        recorded_target = Path(str(marker.get("target") or "")).expanduser().resolve()
+    except (OSError, ValueError):
+        return False
+    if (
+        marker.get("managed_by") != "RIFT"
+        or marker.get("backend_id") != backend_id
+        or marker.get("install_type") != install_type
+        or recorded_target != target
+    ):
+        return False
+    metadata = marker.get("metadata")
+    if not isinstance(metadata, dict):
+        return False
+    if install_type == "native-venv":
+        return metadata.get("managed_paths") == ["venv"]
+    if install_type != "wsl-venv" or metadata.get("managed_paths") != []:
+        return False
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", backend_id).strip("-") or "adapter"
+    wsl_path = target / "wsl-install.json"
+    if not wsl_path.is_file() or wsl_path.is_symlink():
+        return False
+    try:
+        wsl_metadata = json.loads(wsl_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(wsl_metadata, dict):
+        return False
+    python_path = str(wsl_metadata.get("python") or "")
+    managed_marker = str(wsl_metadata.get("managed_marker") or "")
+    expected_suffix = f"/.local/share/rift/backends/{safe_id}/venv/bin/python"
+    return bool(
+        python_path.endswith(expected_suffix)
+        and wsl_metadata.get("adapter_id") == backend_id
+        and managed_marker.startswith("RIFT_MANAGED_VENV=")
+        and managed_marker.endswith(f"/.local/share/rift/backends/{safe_id}/venv")
+        and metadata.get("wsl_python") == python_path
+        and metadata.get("managed_marker") == managed_marker
+    )
+
+
 def isolated_executable_detection(
     target_dir: str | Path | None,
     names: tuple[str, ...],
@@ -186,25 +252,44 @@ def install_python_packages_isolated(
     packages: list[str],
     *,
     target_dir: str | Path,
+    backend_id: str,
     pre: bool = False,
     force: bool = False,
 ) -> JsonDict:
+    target_input = Path(target_dir).expanduser()
+    if reason := path_redirection_reason(target_input):
+        raise ValueError(f"backend target is unsafe: {reason}")
     paths = isolated_environment_paths(target_dir)
     environment = Path(paths["environment"])
     python = Path(paths["python"])
+    if reason := path_redirection_reason(environment):
+        raise ValueError(f"backend venv path is unsafe: {reason}")
+    if environment.exists() and not _verified_managed_environment(
+        paths["root"], backend_id, "native-venv"
+    ):
+        raise ValueError("existing backend venv is not verified as RIFT-managed; it was left untouched")
     if force and environment.exists():
         import shutil as _shutil
 
         _shutil.rmtree(environment)
+    created_environment = False
     if not python.is_file():
         Path(paths["root"]).mkdir(parents=True, exist_ok=True)
         venv.EnvBuilder(with_pip=True, clear=False, symlinks=os.name != "nt").create(environment)
+        created_environment = True
     args = [str(python), "-m", "pip", "install", "--disable-pip-version-check"]
     if pre:
         args.append("--pre")
     args.extend(packages)
     started = time.perf_counter()
-    completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=1800)
+    try:
+        completed = subprocess.run(args, check=False, capture_output=True, text=True, timeout=1800)
+    except Exception:
+        if created_environment:
+            shutil.rmtree(environment, ignore_errors=True)
+        raise
+    if completed.returncode != 0 and created_environment:
+        shutil.rmtree(environment, ignore_errors=True)
     return {
         "command": args,
         "display": quote_command(args),
@@ -214,6 +299,7 @@ def install_python_packages_isolated(
         "stderr_tail": completed.stderr[-4000:],
         "environment": paths,
         "isolated": True,
+        "install_type": "native-venv",
     }
 
 
@@ -385,15 +471,41 @@ def install_python_packages_wsl(
         }
     safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", adapter_id).strip("-") or "adapter"
     environment = f"$HOME/.local/share/rift/backends/{safe_id}/venv"
+    if reason := path_redirection_reason(target_dir):
+        return {"installed": False, "changed": False, "reason": f"backend target is unsafe: {reason}"}
+    target = Path(target_dir).expanduser().resolve()
+    host_owned = _verified_managed_environment(target, adapter_id, "wsl-venv")
+    host_marker_path = target / "wsl-install.json"
+    if host_marker_path.exists() and not host_owned:
+        return {
+            "installed": False,
+            "changed": False,
+            "reason": "existing WSL installation metadata is not verified as RIFT-managed; it was left untouched",
+        }
     quoted_packages = " ".join(_shell_quote(item) for item in packages)
     pre_flag = " --pre" if pre else ""
-    reset = f"rm -rf {environment} && " if force else ""
+    force_flag = "1" if force else "0"
+    host_owned_flag = "1" if host_owned else "0"
     script = (
         "set -eu; "
-        f"{reset}"
-        f"python3 -m venv {environment}; "
-        f"{environment}/bin/python -m pip install --disable-pip-version-check{pre_flag} {quoted_packages}; "
-        f"printf '\nRIFT_WSL_PYTHON=%s\n' \"$HOME/.local/share/rift/backends/{safe_id}/venv/bin/python\""
+        f"environment=\"{environment}\"; marker=\"$environment/.rift-managed-install\"; "
+        "command -v realpath >/dev/null 2>&1 || { echo 'realpath is required to validate WSL backend paths' >&2; exit 74; }; "
+        "home_real=$(realpath -m -- \"$HOME\"); actual_environment=$(realpath -m -- \"$environment\"); "
+        f"expected_environment=\"$home_real/.local/share/rift/backends/{safe_id}/venv\"; "
+        "[ \"$actual_environment\" = \"$expected_environment\" ] "
+        "|| { echo 'WSL runtime path is redirected' >&2; exit 74; }; "
+        f"expected=\"RIFT_MANAGED_VENV=$HOME/.local/share/rift/backends/{safe_id}/venv\"; "
+        f"if [ -e \"$environment\" ]; then "
+        f"[ '{host_owned_flag}' = '1' ] && [ -f \"$marker\" ] && [ \"$(cat \"$marker\")\" = \"$expected\" ] "
+        "|| { echo 'unowned WSL environment or ownership marker mismatch' >&2; exit 73; }; fi; "
+        f"if [ '{force_flag}' = '1' ]; then rm -rf -- \"$environment\"; fi; "
+        "created=0; "
+        "if [ ! -x \"$environment/bin/python\" ]; then "
+        "mkdir -p \"$(dirname \"$environment\")\"; python3 -m venv \"$environment\"; created=1; fi; "
+        "printf '%s\\n' \"$expected\" > \"$marker\"; "
+        f"if \"$environment/bin/python\" -m pip install --disable-pip-version-check{pre_flag} {quoted_packages}; then :; "
+        "else status=$?; if [ \"$created\" = '1' ]; then rm -rf -- \"$environment\"; fi; exit \"$status\"; fi; "
+        "printf '\\nRIFT_WSL_PYTHON=%s\\nRIFT_WSL_MARKER=%s\\n' \"$environment/bin/python\" \"$(cat \"$marker\")\""
     )
     args = [str(wsl["executable"]), "--", "bash", "-lc", script]
     started = time.perf_counter()
@@ -411,19 +523,22 @@ def install_python_packages_wsl(
         return {"installed": False, "changed": False, "command": args, "error": str(exc)}
     match = re.search(r"RIFT_WSL_PYTHON=(.+)", completed.stdout)
     python_path = match.group(1).strip() if match else None
+    marker_match = re.search(r"RIFT_WSL_MARKER=(.+)", completed.stdout)
+    managed_marker = marker_match.group(1).strip() if marker_match else None
     metadata = {
         "adapter_id": adapter_id,
         "python": python_path,
+        "managed_marker": managed_marker,
         "packages": packages,
         "installed_unix_seconds": time.time(),
     }
-    target = Path(target_dir)
-    if completed.returncode == 0 and python_path:
+    if completed.returncode == 0 and python_path and managed_marker:
         target.mkdir(parents=True, exist_ok=True)
         (target / "wsl-install.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return {
-        "installed": completed.returncode == 0 and bool(python_path),
-        "changed": completed.returncode == 0,
+        "installed": completed.returncode == 0 and bool(python_path and managed_marker),
+        "changed": completed.returncode == 0 and bool(python_path and managed_marker),
+        "install_type": "wsl-venv",
         "command": args,
         "display": quote_command(args[:4]) + " <isolated-install-script>",
         "returncode": completed.returncode,
@@ -431,6 +546,7 @@ def install_python_packages_wsl(
         "stdout_tail": completed.stdout[-4000:],
         "stderr_tail": completed.stderr[-4000:],
         "wsl_python": python_path,
+        "managed_marker": managed_marker,
         "metadata": metadata,
     }
 

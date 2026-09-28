@@ -458,7 +458,8 @@ def _add_backend_group(commands) -> None:
             "Examples:\n"
             "  rift backend list\n"
             "  rift backend install-plan llama.cpp\n"
-            "  rift backend install llama.cpp --allow-install"
+            "  rift backend install llama.cpp --allow-install\n"
+            "  rift backend uninstall llama.cpp --confirm"
         ),
     )
     sub = _subcommands(backend, title="backend commands", dest="backend_command")
@@ -477,6 +478,9 @@ def _add_backend_group(commands) -> None:
     install.add_argument("--target")
     install.add_argument("--variant", default="auto")
     install.add_argument("--force", action="store_true")
+    uninstall = _parser(sub, "uninstall", "Preview or remove a RIFT-managed provider runtime")
+    uninstall.add_argument("name")
+    uninstall.add_argument("--confirm", action="store_true")
     health = _parser(sub, "health", "Probe a provider's serving endpoint")
     health.add_argument("name", default="llama.cpp", nargs="?")
     health.add_argument("--base-url", default="http://127.0.0.1:11735")

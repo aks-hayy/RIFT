@@ -7,6 +7,7 @@ import copy
 import os
 import platform
 from pathlib import Path
+from pathlib import PurePosixPath
 import re
 import shutil
 import subprocess
@@ -17,8 +18,10 @@ from urllib.request import Request, urlopen
 import zipfile
 
 from ...adapters.contracts import ADAPTER_API_VERSION, AdapterManifest, BackendCapability
+from ...cuda_probe import probe_cuda_driver, probe_nvidia_gpu
 from ...tuning_engine import TuningContract, generate_llama_candidates
 from ...providers.base import ProviderLifecycleMixin
+from ...runtime_paths import path_redirection_reason
 
 JsonDict = dict[str, Any]
 
@@ -155,7 +158,10 @@ class LlamaCppProvider(ProviderLifecycleMixin):
         variant: str = "auto",
         force: bool = False,
     ) -> JsonDict:
-        target = Path(target_dir)
+        target_input = Path(target_dir).expanduser()
+        if reason := path_redirection_reason(target_input):
+            return {"installed": False, "changed": False, "reason": f"backend target is unsafe: {reason}"}
+        target = target_input.resolve(strict=False)
         existing = self.detect(search_root=str(target))
         if existing.get("available") and not force:
             return {
@@ -175,7 +181,50 @@ class LlamaCppProvider(ProviderLifecycleMixin):
                 "install_plan": self.install_plan(),
             }
 
+        previous_managed_paths: set[str] = set()
+        initial_files: set[str] = set()
+        if target.exists():
+            if not target.is_dir():
+                return {"installed": False, "changed": False, "reason": "backend target is not a directory"}
+            redirected = next((path for path in target.rglob("*") if path_redirection_reason(path)), None)
+            if redirected is not None:
+                return {
+                    "installed": False,
+                    "changed": False,
+                    "reason": f"backend target contains a symlink or reparse point: {redirected}",
+                }
+            existing_marker = target / "rift-install.json"
+            if reason := path_redirection_reason(existing_marker):
+                return {"installed": False, "changed": False, "reason": f"install marker path is unsafe: {reason}"}
+            if existing_marker.is_file():
+                try:
+                    previous_record = json.loads(existing_marker.read_text(encoding="utf-8"))
+                    previous_ownership = previous_record.get("managed_installation") or {}
+                    previous_managed_paths = set(previous_ownership.get("managed_paths") or [])
+                except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+                    return {"installed": False, "changed": False, "reason": "existing RIFT install marker is invalid"}
+                if (
+                    previous_record.get("backend") != self.name
+                    or str(previous_record.get("target_dir") or "") != str(target)
+                    or not previous_managed_paths
+                ):
+                    return {
+                        "installed": False,
+                        "changed": False,
+                        "reason": "existing install target is not a verifiable RIFT-managed archive",
+                    }
+            initial_files = self._archive_target_files(target)
+            unowned_files = initial_files - previous_managed_paths - {"rift-install.json"}
+            if unowned_files:
+                return {
+                    "installed": False,
+                    "changed": False,
+                    "reason": "backend target contains files not owned by RIFT; choose a dedicated target",
+                    "unowned_files": sorted(unowned_files)[:20],
+                }
         target.mkdir(parents=True, exist_ok=True)
+        if reason := path_redirection_reason(target):
+            return {"installed": False, "changed": False, "reason": f"backend target is unsafe: {reason}"}
         selected_release = self._select_install_release(variant=variant)
         release = selected_release["release"]
         assets = selected_release["assets"]
@@ -193,27 +242,79 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             }
 
         downloads_dir = target / "_downloads"
+        if reason := path_redirection_reason(downloads_dir):
+            return {"installed": False, "changed": False, "reason": f"download directory is unsafe: {reason}"}
         downloads_dir.mkdir(parents=True, exist_ok=True)
         extracted = []
+        files_created_during_install: set[str] = set()
         for asset in selected_assets:
             name = str(asset["name"])
             url = str(asset["browser_download_url"])
             archive = downloads_dir / name
+            if reason := path_redirection_reason(archive):
+                return {"installed": False, "changed": False, "reason": f"download target is unsafe: {reason}"}
+            archive_relative = archive.relative_to(target).as_posix()
+            if archive.exists() and archive_relative not in previous_managed_paths:
+                return {
+                    "installed": False,
+                    "changed": False,
+                    "reason": "download target contains an unowned file",
+                    "path": archive_relative,
+                }
             self._download_asset(url, archive)
             if archive.suffix.lower() == ".zip":
                 with zipfile.ZipFile(archive) as package:
+                    for member in package.infolist():
+                        relative = self._safe_archive_member(target, member.filename)
+                        if relative is None:
+                            continue
+                        destination = target / Path(*PurePosixPath(relative).parts)
+                        if (
+                            destination.exists()
+                            and relative not in previous_managed_paths
+                            and relative not in files_created_during_install
+                            and not destination.is_dir()
+                        ):
+                            return {
+                                "installed": False,
+                                "changed": False,
+                                "reason": "archive would overwrite an unowned target file",
+                                "path": relative,
+                            }
+                        if not member.is_dir():
+                            files_created_during_install.add(relative)
                     package.extractall(target)
             else:
+                asset_target = target / name
+                asset_relative = asset_target.relative_to(target).as_posix()
+                if asset_target.exists() and asset_relative not in previous_managed_paths:
+                    return {
+                        "installed": False,
+                        "changed": False,
+                        "reason": "archive asset would overwrite an unowned target file",
+                        "path": asset_relative,
+                    }
                 shutil.copy2(archive, target / name)
             extracted.append({"name": name, "url": url, "bytes": archive.stat().st_size})
 
-        detection = self.detect(search_root=str(target))
+        detection = self._detect_target_server(target)
         install_record = {
             "backend": self.name,
             "installed": bool(detection.get("available")),
             "changed": True,
             "target_dir": str(target),
             "variant": variant,
+            "managed_installation": {
+                "managed_by": "RIFT",
+                "backend_id": self.name,
+                "install_type": "archive",
+                "target": str(target),
+                "managed_paths": sorted(
+                    previous_managed_paths
+                    | (self._archive_target_files(target) - initial_files)
+                    | {"rift-install.json"}
+                ),
+            },
             "release": {
                 "tag_name": release.get("tag_name"),
                 "html_url": release.get("html_url"),
@@ -223,13 +324,80 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             "license": "MIT",
             "official_source": "https://github.com/ggml-org/llama.cpp/releases",
         }
-        (target / "rift-install.json").write_text(
-            json.dumps(install_record, indent=2, sort_keys=True),
-            encoding="utf-8",
+        for probe_name in ("gpu_probe", "cuda_probe"):
+            if probe_name in selected_release:
+                install_record[probe_name] = selected_release[probe_name]
+        install_record.setdefault(
+            "gpu_probe",
+            {
+                "available": None,
+                "status": "not_run",
+                "reason": "hardware inventory is not used to override an explicit variant",
+            },
+        )
+        install_record.setdefault(
+            "cuda_probe",
+            {
+                "available": None,
+                "device_count": None,
+                "status": "not_run",
+                "reason": "CUDA driver probing is only used for automatic variant selection",
+            },
+        )
+        selected_cuda_asset = any(
+            self._is_cuda_build_asset(str(asset.get("name") or ""))
+            for asset in selected_assets
+            if isinstance(asset, dict)
+        )
+        install_record["cuda_executable_probe"] = (
+            self._probe_cuda_executable(detection.get("executable"))
+            if selected_cuda_asset
+            else {
+                "available": False,
+                "status": "not_applicable",
+                "reason": "the selected llama.cpp archive is not a CUDA build",
+            }
         )
         if not detection.get("available"):
             install_record["reason"] = "archives extracted but llama-server executable was not found"
+        install_marker = target / "rift-install.json"
+        if reason := path_redirection_reason(install_marker):
+            return {"installed": False, "changed": False, "reason": f"install marker path is unsafe: {reason}"}
+        install_marker.write_text(
+            json.dumps(install_record, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         return install_record
+
+    @staticmethod
+    def _archive_target_files(target: Path) -> set[str]:
+        return {
+            path.relative_to(target).as_posix()
+            for path in target.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+
+    @staticmethod
+    def _safe_archive_member(target: Path, member: str) -> str | None:
+        normalized = str(member or "").replace("\\", "/")
+        path = PurePosixPath(normalized)
+        if not normalized or path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+            raise ValueError(f"unsafe path in llama.cpp archive: {member}")
+        if path.parts and ":" in path.parts[0]:
+            raise ValueError(f"unsafe path in llama.cpp archive: {member}")
+        if normalized.endswith("/"):
+            return None
+        destination = target.joinpath(*path.parts)
+        resolved_target = target.resolve(strict=False)
+        if reason := path_redirection_reason(destination):
+            raise ValueError(f"unsafe path in llama.cpp archive: {member}: {reason}")
+        try:
+            destination.resolve(strict=False).relative_to(resolved_target)
+        except ValueError as exc:
+            raise ValueError(f"unsafe path in llama.cpp archive: {member}") from exc
+        if any(parent.is_symlink() for parent in (destination, *destination.parents) if parent != target.parent):
+            raise ValueError(f"archive path crosses a symlink or reparse point: {member}")
+        return path.as_posix()
 
     def _latest_release_info(self) -> JsonDict:
         request = Request(self.release_api_url, headers={"User-Agent": "RIFT/1.0"})
@@ -251,7 +419,13 @@ class LlamaCppProvider(ProviderLifecycleMixin):
         latest = self._latest_release_info()
         candidates = [latest]
         latest_assets = latest.get("assets", [])
-        if not self._select_windows_assets(latest_assets, variant=variant):
+        probes = self._probe_auto_cuda() if variant.lower() == "auto" else None
+        latest_selected = self._select_windows_assets(
+            latest_assets,
+            variant=variant,
+            _probe_results=probes,
+        )
+        if not latest_selected:
             candidates.extend(self._release_history_info())
         seen_tags: set[str] = set()
         for release in candidates:
@@ -260,16 +434,66 @@ class LlamaCppProvider(ProviderLifecycleMixin):
                 continue
             seen_tags.add(tag)
             assets = release.get("assets", [])
-            selected_assets = self._select_windows_assets(assets, variant=variant)
+            selected_assets = (
+                latest_selected
+                if release is latest
+                else self._select_windows_assets(assets, variant=variant, _probe_results=probes)
+            )
             if selected_assets:
-                return {
+                result = {
                     "release": release,
                     "assets": assets,
                     "selected_assets": selected_assets,
                 }
-        return {"release": latest, "assets": latest_assets, "selected_assets": []}
+                if probes is not None:
+                    result.update(probes)
+                return result
+        result = {"release": latest, "assets": latest_assets, "selected_assets": []}
+        if probes is not None:
+            result.update(probes)
+        return result
 
-    def _select_windows_assets(self, assets: list[JsonDict], *, variant: str) -> list[JsonDict]:
+    def _probe_auto_cuda(self) -> JsonDict:
+        try:
+            gpu_probe = probe_nvidia_gpu()
+        except Exception as exc:
+            gpu_probe = {
+                "available": False,
+                "inventory_available": False,
+                "devices": [],
+                "reason": f"NVIDIA GPU probe failed: {exc}",
+            }
+        if not bool(gpu_probe.get("available")):
+            cuda_probe = {
+                "available": False,
+                "device_count": 0,
+                "driver_library": None,
+                "status": "skipped",
+                "reason": "CUDA driver probe skipped because NVIDIA GPU inventory did not confirm a device",
+            }
+        else:
+            try:
+                cuda_probe = probe_cuda_driver()
+            except Exception as exc:
+                cuda_probe = {
+                    "available": False,
+                    "device_count": 0,
+                    "driver_library": None,
+                    "reason": f"CUDA driver probe failed: {exc}",
+                }
+        cuda_probe = dict(cuda_probe)
+        cuda_probe["available"] = bool(
+            cuda_probe.get("available") and int(cuda_probe.get("device_count") or 0) > 0
+        )
+        return {"gpu_probe": dict(gpu_probe), "cuda_probe": cuda_probe}
+
+    def _select_windows_assets(
+        self,
+        assets: list[JsonDict],
+        *,
+        variant: str,
+        _probe_results: JsonDict | None = None,
+    ) -> list[JsonDict]:
         candidates = [
             asset
             for asset in assets
@@ -278,36 +502,17 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             and isinstance(asset.get("browser_download_url"), str)
             and asset["name"].lower().endswith(".zip")
         ]
-        wants_cuda = variant.lower() in ("auto", "cuda", "cuda12", "cuda13")
-        wants_cpu = variant.lower() == "cpu"
+        selected_variant = variant.lower()
+        wants_cuda = selected_variant in ("cuda", "cuda12", "cuda13")
+        wants_cpu = selected_variant == "cpu"
         if variant.lower() == "auto":
-            wants_cuda = bool(os.environ.get("CUDA_PATH") or os.environ.get("CUDA_HOME"))
+            probes = _probe_results if _probe_results is not None else self._probe_auto_cuda()
+            wants_cuda = bool(
+                (probes.get("gpu_probe") or {}).get("available")
+                and (probes.get("cuda_probe") or {}).get("available")
+                and int((probes.get("cuda_probe") or {}).get("device_count") or 0) > 0
+            )
             wants_cpu = not wants_cuda
-
-        def score(asset: JsonDict) -> int:
-            name = str(asset["name"]).lower()
-            value = 0
-            if "win" in name:
-                value += 20
-            if "x64" in name or "amd64" in name:
-                value += 20
-            if "server" in name or "bin" in name:
-                value += 5
-            if wants_cpu:
-                if "cuda" in name or "vulkan" in name or "opencl" in name or "sycl" in name or "hip" in name:
-                    value -= 30
-                if "cpu" in name:
-                    value += 15
-            if wants_cuda:
-                if "cuda" in name or "cu12" in name or "cu13" in name:
-                    value += 25
-                if variant.lower() in ("cuda12", "auto") and ("cu12" in name or "cuda-12" in name or "cuda12" in name):
-                    value += 12
-                if variant.lower() == "cuda13" and ("cu13" in name or "cuda-13" in name or "cuda13" in name):
-                    value += 12
-                if "cudart" in name and "llama" not in name:
-                    value -= 8
-            return value
 
         primary_candidates = [
             asset
@@ -319,25 +524,177 @@ class LlamaCppProvider(ProviderLifecycleMixin):
             asset
             for asset in primary_candidates
             if not self._is_runtime_support_asset(str(asset["name"]))
+            and self._asset_matches_variant(str(asset["name"]), variant, wants_cuda=wants_cuda, wants_cpu=wants_cpu)
         ]
         if not binary_candidates:
             return []
-        binary_candidates.sort(key=score, reverse=True)
+        binary_candidates.sort(
+            key=lambda asset: (
+                "server" in str(asset["name"]).lower(),
+                "bin" in str(asset["name"]).lower(),
+                "cpu" in str(asset["name"]).lower() if wants_cpu else False,
+            ),
+            reverse=True,
+        )
         primary = binary_candidates[0]
         selected = [primary]
 
         primary_name = str(primary["name"]).lower()
-        if "cuda" in primary_name or "cu12" in primary_name or "cu13" in primary_name:
+        if self._is_cuda_build_asset(primary_name):
             cuda_runtime_assets = [
                 asset
                 for asset in primary_candidates
                 if asset is not primary
                 and self._is_runtime_support_asset(str(asset["name"]))
+                and self._asset_matches_variant(str(asset["name"]), variant, wants_cuda=True, wants_cpu=False)
             ]
-            cuda_runtime_assets.sort(key=score, reverse=True)
+            cuda_runtime_assets.sort(key=lambda asset: str(asset["name"]).lower())
             if cuda_runtime_assets:
                 selected.append(cuda_runtime_assets[0])
         return selected
+
+    @classmethod
+    def _asset_matches_variant(
+        cls,
+        name: str,
+        variant: str,
+        *,
+        wants_cuda: bool,
+        wants_cpu: bool,
+    ) -> bool:
+        lower = name.lower()
+        is_cuda = cls._is_cuda_build_asset(lower)
+        if wants_cuda:
+            if not is_cuda:
+                return False
+            if variant.lower() in ("cuda12", "cuda13"):
+                return cls._cuda_asset_version(lower) == variant[-2:]
+            return True
+        if wants_cpu:
+            return not is_cuda and not any(
+                accelerator in lower
+                for accelerator in ("vulkan", "opencl", "sycl", "hip", "rocm", "metal")
+            )
+        return False
+
+    @staticmethod
+    def _cuda_asset_version(name: str) -> str | None:
+        match = re.search(r"(?:cuda(?:runtime)?|cudart|cu)[._ -]?(12|13)(?:[._-]|$)", name.lower())
+        return match.group(1) if match else None
+
+    def _detect_target_server(self, target: Path) -> JsonDict:
+        """Detect only a llama-server executable contained in the just-installed target."""
+        canonical_target = target.resolve(strict=False)
+        names = ("llama-server.exe", "llama-server")
+        checked: list[str] = []
+        for name in names:
+            direct = target / name
+            checked.append(str(direct))
+            candidates = [direct]
+            if target.is_dir():
+                candidates.extend(target.rglob(name))
+            for candidate in candidates:
+                if not candidate.is_file() or candidate.is_symlink():
+                    continue
+                try:
+                    canonical = candidate.resolve(strict=True)
+                    canonical.relative_to(canonical_target)
+                except (OSError, ValueError):
+                    continue
+                if candidate not in (direct,):
+                    checked.append(str(candidate))
+                return self._detected(str(canonical), checked, source="rift-managed-install")
+        return {
+            "backend": self.name,
+            "available": False,
+            "executable": None,
+            "source": None,
+            "checked": checked,
+            "version": None,
+            "license": "MIT",
+        }
+
+    @staticmethod
+    def _is_cuda_build_asset(name: str) -> bool:
+        lower = name.lower()
+        return (
+            "cuda" in lower
+            or re.search(r"\bcu(?:12|13)(?:[._-]|$)", lower) is not None
+            or re.search(r"(?:^|[._ -])cudart[._ -]?(?:12|13)(?:[._-]|$)", lower) is not None
+        )
+
+    @staticmethod
+    def _probe_cuda_executable(executable: str | None) -> JsonDict:
+        if not executable:
+            return {
+                "available": False,
+                "status": "unknown",
+                "reason": "llama-server executable was not found for CUDA verification",
+            }
+        try:
+            completed = subprocess.run(
+                [str(executable), "--list-devices"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except Exception as exc:
+            return {
+                "available": False,
+                "status": "error",
+                "executable": str(executable),
+                "reason": f"llama-server --list-devices could not run: {exc}",
+            }
+        output = "\n".join(value for value in (completed.stdout, completed.stderr) if value).strip()
+        if completed.returncode != 0:
+            return {
+                "available": False,
+                "status": "error",
+                "executable": str(executable),
+                "returncode": completed.returncode,
+                "reason": f"llama-server --list-devices exited with code {completed.returncode}",
+                "output": output[-1000:],
+            }
+
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        header_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if re.search(r"available\s+devices\s*:|devices\s*:\s*$", line, re.IGNORECASE)
+            ),
+            None,
+        )
+        if header_index is None:
+            return {
+                "available": False,
+                "status": "unknown",
+                "executable": str(executable),
+                "reason": "llama-server --list-devices output could not be parsed",
+                "output": output[-1000:],
+            }
+        device_lines = lines[header_index + 1 :]
+        cuda_devices = [
+            line
+            for line in device_lines
+            if re.search(r"\bcuda(?:\d+)?\s*[:(\[]", line, re.IGNORECASE)
+        ]
+        if cuda_devices:
+            return {
+                "available": True,
+                "status": "verified",
+                "executable": str(executable),
+                "devices": cuda_devices,
+                "reason": None,
+            }
+        return {
+            "available": False,
+            "status": "verified",
+            "executable": str(executable),
+            "devices": device_lines,
+            "reason": "llama-server --list-devices did not list a CUDA device",
+        }
 
     def _is_runtime_support_asset(self, name: str) -> bool:
         lower = name.lower()

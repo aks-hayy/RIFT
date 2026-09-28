@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .cluster import RiftClusterController
 from .mesh.controller import MeshController
@@ -932,6 +932,14 @@ class RiftServerRuntime:
         cancel_check: Callable[[], bool] | None = None,
     ) -> JsonDict:
         path = path.replace("/api/rift/v2/tuning-runs", "/api/rift/v2/tuning/runs", 1)
+        if path.startswith("/api/rift/backends/") and path.endswith("/uninstall"):
+            parts = path.strip("/").split("/")
+            if len(parts) != 5 or parts[:3] != ["api", "rift", "backends"]:
+                raise KeyError(path)
+            backend_id = unquote(parts[3])
+            if payload.get("confirm") is not True:
+                raise ValueError("confirm must be true to uninstall a RIFT-managed backend")
+            return self.orchestrator_factory().uninstall_backend(backend_id, confirm=True)
         if path in {"/api/rift/v2/workloads/compile", "/api/rift/v2/workloads"}:
             request = payload.get("workload", payload.get("input", payload.get("request")))
             if request is None:

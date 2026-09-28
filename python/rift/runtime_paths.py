@@ -8,9 +8,38 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import time
 import zipfile
 from typing import Any
+
+
+def path_redirection_reason(path: str | Path) -> str | None:
+    """Find symlinks, junctions, and reparse points before path writes."""
+    absolute = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+    try:
+        resolved = absolute.resolve(strict=False)
+    except OSError as exc:
+        return f"path could not be canonicalized: {exc}"
+    if os.path.normcase(str(absolute)) != os.path.normcase(str(resolved)):
+        return f"path traverses a symlink or reparse point: {absolute}"
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"path component could not be inspected: {exc}"
+        attributes = int(getattr(info, "st_file_attributes", 0))
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or attributes & 0x400
+            or getattr(current, "is_junction", lambda: False)()
+        ):
+            return f"path traverses a symlink or reparse point: {current}"
+    return None
 
 
 @dataclass(frozen=True)
@@ -50,6 +79,17 @@ class RiftPaths:
     @property
     def backends(self) -> Path:
         return self.home / "backends"
+
+    @property
+    def backend_registry(self) -> Path:
+        return self.backends / "registry.json"
+
+    def backend_target(self, backend_id: str) -> Path:
+        """Return the dedicated default runtime directory for one backend."""
+        value = str(backend_id or "").strip()
+        if not value or value in {".", ".."} or Path(value).name != value:
+            raise ValueError("backend id is invalid")
+        return self.backends / value
 
     @property
     def operations(self) -> Path:

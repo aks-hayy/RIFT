@@ -52,6 +52,7 @@ server_mod = importlib.import_module("rift.server")
 cli_mod = importlib.import_module("rift.cli")
 providers_mod = importlib.import_module("rift.providers")
 llama_cpp_mod = importlib.import_module("rift.providers.llama_cpp")
+llama_backend_mod = importlib.import_module("rift.backends.llama_cpp.backend")
 vllm_mod = importlib.import_module("rift.providers.vllm")
 sglang_mod = importlib.import_module("rift.providers.sglang")
 lmcache_mod = importlib.import_module("rift.providers.lmcache_aware")
@@ -573,6 +574,7 @@ def test_llama_cpp_provider_install_from_fake_release_archive():
         original_latest = provider._latest_release_info
         original_download = provider._download_asset
         original_version = provider._version
+        original_subprocess_run = llama_cpp_mod.subprocess.run
         try:
             llama_cpp_mod.platform.system = lambda: "Windows"
             llama_cpp_mod.platform.machine = lambda: "AMD64"
@@ -592,6 +594,17 @@ def test_llama_cpp_provider_install_from_fake_release_archive():
             }
             provider._download_asset = lambda url, target: shutil.copy2(archive, target)
             provider._version = lambda executable: "fake llama.cpp"
+
+            def fake_list_devices(args, **_kwargs):
+                assert args == [str(root / "install" / "llama-fake" / "llama-server.exe"), "--list-devices"]
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="Available devices:\n  CUDA0: NVIDIA fixture\n",
+                    stderr="",
+                )
+
+            llama_cpp_mod.subprocess.run = fake_list_devices
             result = provider.install(target_dir=str(root / "install"), variant="cuda12", force=True)
         finally:
             llama_cpp_mod.platform.system = original_system
@@ -599,11 +612,126 @@ def test_llama_cpp_provider_install_from_fake_release_archive():
             provider._latest_release_info = original_latest
             provider._download_asset = original_download
             provider._version = original_version
+            llama_cpp_mod.subprocess.run = original_subprocess_run
 
         assert result["installed"] is True
         assert result["detection"]["available"] is True
         assert result["detection"]["executable"].endswith("llama-server.exe")
+        assert result["cuda_executable_probe"]["available"] is True
         assert (root / "install" / "rift-install.json").exists()
+
+
+def _install_fake_llama_cuda(tmp_path, monkeypatch, list_devices_output):
+    archive = tmp_path / "llama-fake-bin-win-cuda-cu12.4-x64.zip"
+    payload_dir = tmp_path / "payload"
+    payload_dir.mkdir()
+    (payload_dir / "llama-server.exe").write_bytes(b"fake executable")
+    with zipfile.ZipFile(archive, "w") as package:
+        package.write(payload_dir / "llama-server.exe", "llama-fake/llama-server.exe")
+
+    provider = llama_cpp_mod.LlamaCppProvider()
+    monkeypatch.setattr(llama_cpp_mod.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(llama_cpp_mod.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        provider,
+        "_latest_release_info",
+        lambda: {
+            "tag_name": "fake-cuda",
+            "html_url": "https://github.com/ggml-org/llama.cpp/releases/tag/fake-cuda",
+            "assets": [
+                {
+                    "name": archive.name,
+                    "browser_download_url": "https://example.test/llama-cuda.zip",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(provider, "_download_asset", lambda _url, target: shutil.copy2(archive, target))
+    monkeypatch.setattr(provider, "_version", lambda _executable: "fake llama.cpp")
+    commands = []
+
+    def run(args, **kwargs):
+        commands.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=list_devices_output, stderr="")
+
+    monkeypatch.setattr(llama_cpp_mod.subprocess, "run", run)
+    result = provider.install(target_dir=str(tmp_path / "install"), variant="cuda12", force=True)
+    return result, commands, tmp_path / "install" / "rift-install.json"
+
+
+def test_cuda_install_records_list_devices_capability(tmp_path, monkeypatch):
+    output = "Available devices:\n  CUDA0: NVIDIA GeForce fixture (8192 MiB)\n"
+
+    result, commands, record_path = _install_fake_llama_cuda(tmp_path, monkeypatch, output)
+
+    assert commands == [[result["detection"]["executable"], "--list-devices"]]
+    assert result["cuda_executable_probe"]["available"] is True
+    assert result["cuda_executable_probe"]["status"] == "verified"
+    assert json.loads(record_path.read_text(encoding="utf-8"))["cuda_executable_probe"]["available"] is True
+
+
+def test_cuda_install_probes_only_the_binary_inside_install_target(tmp_path, monkeypatch):
+    external = tmp_path / "external" / "llama-server.exe"
+    external.parent.mkdir()
+    external.write_bytes(b"external executable")
+    monkeypatch.setenv("LLAMA_CPP_SERVER", str(external))
+    output = "Available devices:\n  CUDA0: NVIDIA fixture\n"
+
+    result, commands, _record_path = _install_fake_llama_cuda(tmp_path, monkeypatch, output)
+
+    installed = (tmp_path / "install" / "llama-fake" / "llama-server.exe").resolve()
+    assert result["detection"]["executable"] == str(installed)
+    assert commands == [[str(installed), "--list-devices"]]
+
+
+def test_cuda_install_records_exact_managed_archive_files(tmp_path, monkeypatch):
+    result, _commands, record_path = _install_fake_llama_cuda(
+        tmp_path, monkeypatch, "Available devices:\n  CUDA0: NVIDIA fixture\n"
+    )
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    managed_paths = record["managed_installation"]["managed_paths"]
+
+    assert "rift-install.json" in managed_paths
+    assert "llama-fake/llama-server.exe" in managed_paths
+    assert any(path.startswith("_downloads/") for path in managed_paths)
+
+
+def test_llama_install_rejects_redirected_target_before_writing(tmp_path, monkeypatch):
+    provider = llama_cpp_mod.LlamaCppProvider()
+    target = tmp_path / "junction-target"
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "path_redirection_reason",
+        lambda path: "fixture junction" if Path(path) == target else None,
+    )
+
+    result = provider.install(target_dir=str(target), variant="auto", force=True)
+
+    assert result["installed"] is False
+    assert "fixture junction" in result["reason"]
+    assert not target.exists()
+
+
+def test_cuda_install_does_not_claim_ready_when_list_devices_has_no_cuda(tmp_path, monkeypatch):
+    output = "Available devices:\n  CPU: Intel fixture\n"
+
+    result, _commands, record_path = _install_fake_llama_cuda(tmp_path, monkeypatch, output)
+
+    assert result["cuda_executable_probe"]["available"] is False
+    assert result["cuda_executable_probe"]["status"] == "verified"
+    assert "did not list a CUDA device" in result["cuda_executable_probe"]["reason"]
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["cuda_executable_probe"]["available"] is False
+
+
+def test_cuda_install_reports_malformed_list_devices_output(tmp_path, monkeypatch):
+    result, _commands, _record_path = _install_fake_llama_cuda(
+        tmp_path, monkeypatch, "this is not a device listing\n"
+    )
+
+    assert result["cuda_executable_probe"]["available"] is False
+    assert result["cuda_executable_probe"]["status"] == "unknown"
+    assert "could not be parsed" in result["cuda_executable_probe"]["reason"]
 
 
 def test_hub_exact_artifact_flows_from_generate_to_launch():

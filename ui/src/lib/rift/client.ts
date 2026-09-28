@@ -2383,6 +2383,13 @@ export const rift = {
       signal,
     ),
   backends: (signal?: AbortSignal) => req<JsonObject>("GET", "/backends", undefined, signal),
+  uninstallBackend: (backendId: string, confirm: true) =>
+    req<JsonObject>("POST", `/backends/${encodeURIComponent(backendId)}/uninstall`, {
+      confirm,
+      request_id:
+        globalThis.crypto?.randomUUID?.() ??
+        `backend-uninstall-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    }),
   reports: (signal?: AbortSignal) => req<JsonObject>("GET", "/reports", undefined, signal),
   settings: async (signal?: AbortSignal): Promise<SettingsSnapshot> => {
     const payload = await req<JsonObject>("GET", "/v2/settings", undefined, signal);

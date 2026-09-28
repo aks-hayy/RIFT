@@ -19,7 +19,7 @@ sys.modules.setdefault("rift._core", core)
 
 from rift.cli.parser import build_parser
 from rift.cli.console import RiftConsole
-from rift.cli.commands import _monitoring_policy
+from rift.cli.commands import _backend, _monitoring_policy
 
 
 def test_apply_accepts_explicit_permissions_and_config() -> None:
@@ -109,6 +109,69 @@ def test_state_backup_and_restore_require_explicit_restore_confirmation() -> Non
     assert restore.system_command == "restore"
     assert restore.input == "state.db"
     assert restore.yes is True
+
+
+def test_backend_uninstall_parser_requires_backend_name() -> None:
+    try:
+        build_parser().parse_args(["backend", "uninstall"])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("backend uninstall should require a backend name")
+
+
+def test_backend_uninstall_without_confirm_only_previews() -> None:
+    class Orchestrator:
+        providers = {}
+
+        def __init__(self) -> None:
+            self.uninstall_called = False
+
+        def backend_uninstall_plan(self, backend_id: str):
+            assert backend_id == "llama.cpp"
+            return {
+                "backend_id": backend_id,
+                "managed": True,
+                "removable": True,
+                "target": "C:/rift/backends/llama.cpp",
+                "installation": {"managed": True, "removable": True},
+                "dependent_services": [],
+                "blockers": [],
+            }
+
+        def uninstall_backend(self, backend_id: str, *, confirm: bool):
+            self.uninstall_called = True
+            raise AssertionError("preview must never uninstall")
+
+    orchestrator = Orchestrator()
+    output = io.StringIO()
+    args = build_parser().parse_args(["backend", "uninstall", "llama.cpp"])
+    with contextlib.redirect_stdout(output):
+        code = _backend(args, RiftConsole(no_color=True), orchestrator)
+    assert code == 2
+    assert not orchestrator.uninstall_called
+    assert "C:/rift/backends/llama.cpp" in output.getvalue()
+    assert "--confirm" in output.getvalue()
+
+
+def test_backend_uninstall_confirm_executes_managed_removal() -> None:
+    class Orchestrator:
+        providers = {}
+
+        def backend_uninstall_plan(self, backend_id: str):
+            return {"backend_id": backend_id, "managed": True, "removable": True, "target": "C:/rift/backends/vllm", "blockers": []}
+
+        def uninstall_backend(self, backend_id: str, *, confirm: bool):
+            assert backend_id == "vllm"
+            assert confirm is True
+            return {"uninstalled": True, "backend_id": backend_id, "target": "C:/rift/backends/vllm"}
+
+    output = io.StringIO()
+    args = build_parser().parse_args(["backend", "uninstall", "vllm", "--confirm"])
+    with contextlib.redirect_stdout(output):
+        code = _backend(args, RiftConsole(no_color=True), Orchestrator())
+    assert code == 0
+    assert "Removed the RIFT-managed vllm runtime" in output.getvalue()
 
 
 def test_recommendation_render_prints_plan_handoff() -> None:
