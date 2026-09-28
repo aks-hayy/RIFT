@@ -100,7 +100,7 @@ class LMCacheAwareProvider(ProviderLifecycleMixin):
             unsupported["install_plan"] = self.install_plan()
             return unsupported
         result = install_python_packages_isolated(
-            ["vllm", "lmcache"], target_dir=target_dir, force=force
+            ["vllm", "lmcache"], target_dir=target_dir, backend_id=self.name, force=force
         )
         detection = self.detect(search_root=target_dir)
         return {

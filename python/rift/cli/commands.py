@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from rift.adapters.conformance import BackendConformanceSuite
+from rift.backends.managed_installation import record_install_result
 from rift.cluster import RiftClusterController, example_emulated_cluster
 from rift.dashboard import launch_dashboard_detached, serve_dashboard
 from rift.gateway import serve_gateway
@@ -1075,6 +1076,21 @@ def _backend(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) ->
         result = {"healthy": healthy, "checks": checks, "registry": orchestrator.backend_host.diagnostics()}
         console.render(result, title="Backend adapter doctor")
         return 0 if healthy else 1
+    if args.backend_command == "uninstall":
+        plan = orchestrator.backend_uninstall_plan(args.name)
+        if not args.confirm:
+            console.render(plan, view="backend_uninstall", title="Backend uninstall preview")
+            return 2
+        if not plan.get("removable"):
+            console.render(plan, view="backend_uninstall", title="Backend uninstall blocked")
+            return 1
+        try:
+            result = orchestrator.uninstall_backend(args.name, confirm=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            console.error(f"Could not uninstall {args.name}: {exc}")
+            return 1
+        console.render(result, view="backend_uninstall", title="Backend uninstall")
+        return 0 if result.get("uninstalled") else 1
     provider = providers.get(args.name)
     if provider is None:
         console.error(f"Unknown backend: {args.name}", hint="Run `rift backend list`.")
@@ -1087,11 +1103,26 @@ def _backend(args: Any, console: RiftConsole, orchestrator: RiftOrchestrator) ->
             console.warning("Backend installation was not authorized.")
             console.render(provider.install_plan(), title=f"{args.name} install plan")
             return 2
-        result = provider.install(
-            target_dir=args.target or str(Path(".rift") / "backends" / args.name),
-            variant=args.variant,
-            force=args.force,
-        )
+        target_dir = args.target or str(RiftPaths(orchestrator.rift_dir).backend_target(args.name))
+        with orchestrator._backend_runtime_lock(args.name):
+            result = provider.install(
+                target_dir=target_dir,
+                variant=args.variant,
+                force=args.force,
+            )
+            try:
+                result["managed_installation"] = record_install_result(
+                    orchestrator.rift_dir,
+                    args.name,
+                    target_dir,
+                    result,
+                )
+            except (OSError, ValueError) as exc:
+                result["managed_installation"] = {
+                    "managed": False,
+                    "removable": False,
+                    "reason": f"RIFT ownership could not be recorded: {exc}",
+                }
         console.render(result, title=f"{args.name} installation")
         return 0 if result.get("installed", True) else 1
     if args.backend_command == "health":

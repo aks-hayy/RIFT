@@ -313,7 +313,8 @@ class VllmProvider(ProviderLifecycleMixin):
                 unsupported["install_plan"] = self.install_plan()
                 return unsupported
             result = install_python_packages_isolated(
-                ["vllm"], target_dir=target_dir, pre=selected_variant in ("pre", "nightly"), force=force
+                ["vllm"], target_dir=target_dir, backend_id=self.name,
+                pre=selected_variant in ("pre", "nightly"), force=force
             )
         detection = self.detect(search_root=target_dir)
         return {

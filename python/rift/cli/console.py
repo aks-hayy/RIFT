@@ -460,6 +460,31 @@ class RiftConsole:
             )
         self._table(["BACKEND", "DETECTED", "VERSION", "SUPPORT", "FORMATS"], rows)
 
+    def _render_backend_uninstall(self, payload: JsonDict, *, title: str | None = None) -> None:
+        self._heading(title or "Backend uninstall")
+        if payload.get("uninstalled"):
+            self.success(f"Removed the RIFT-managed {payload.get('backend_id') or 'backend'} runtime.")
+            if payload.get("target"):
+                print(self._dim(f"Target: {payload['target']}"))
+            return
+        installation = payload.get("installation") or {}
+        self._key_values(
+            [
+                ("Backend", payload.get("backend_id") or "unknown"),
+                ("RIFT-managed", "yes" if payload.get("managed") else "no"),
+                ("Removable", "yes" if payload.get("removable") else "no"),
+                ("Installation type", payload.get("install_type") or installation.get("install_type") or "unknown"),
+                ("Target", payload.get("target") or installation.get("target") or "not recorded"),
+            ]
+        )
+        blockers = payload.get("blockers") or []
+        if blockers:
+            print()
+            self._bullets("Blocked", blockers)
+        else:
+            print()
+            print(self._dim("Preview only: no files were changed. Review the target, then rerun with --confirm."))
+
     def _render_hardware(self, payload: JsonDict, *, title: str | None = None) -> None:
         self._heading(title or "Local hardware")
         identity = payload.get("identity") or {}

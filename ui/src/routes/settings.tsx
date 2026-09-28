@@ -1,11 +1,13 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
 import { z } from "zod";
 import { AppShell } from "@/components/rift/app-shell";
 import { PageHeader, Panel, KV, SourceBadge, StatDot } from "@/components/rift/primitives";
 import { Unavailable } from "@/components/rift/unavailable";
 import { cn } from "@/lib/utils";
 import { rift } from "@/lib/rift/client";
-import { useBackends, useHealth, useSettings } from "@/lib/rift/hooks";
+import { keys, useBackends, useHealth, useSettings } from "@/lib/rift/hooks";
 
 const searchSchema = z.object({
   tab: z
@@ -141,8 +143,12 @@ function SourcesTab() {
   );
 }
 
-function BackendIntegrations() {
+export function BackendIntegrations() {
   const { data, unavailable, error, isLoading } = useBackends();
+  const queryClient = useQueryClient();
+  const [busyBackend, setBusyBackend] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   if (unavailable || error)
     return (
       <Unavailable
@@ -164,7 +170,7 @@ function BackendIntegrations() {
   return (
     <Panel title="Backend integrations" aside={<SourceBadge source="live" />} bodyClassName="p-0">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[680px] text-[12.5px]">
+        <table className="w-full min-w-[980px] text-[12.5px]">
           <thead className="rift-label">
             <tr className="border-b border-border">
               <th className="h-9 px-4 text-left font-normal">Provider</th>
@@ -172,12 +178,14 @@ function BackendIntegrations() {
               <th className="px-4 text-left font-normal">Version</th>
               <th className="px-4 text-left font-normal">License</th>
               <th className="px-4 text-left font-normal">Lifecycle gate</th>
+              <th className="px-4 text-left font-normal">RIFT runtime</th>
+              <th className="px-4 text-left font-normal">Action</th>
             </tr>
           </thead>
           <tbody>
             {providers.length === 0 ? (
               <tr>
-                <td colSpan={5} className="px-4 py-10 text-center text-[13px] text-ink-secondary">
+                <td colSpan={7} className="px-4 py-10 text-center text-[13px] text-ink-secondary">
                   The live controller returned no backend providers.
                 </td>
               </tr>
@@ -187,6 +195,14 @@ function BackendIntegrations() {
                 const detection = asRecord(provider.detection);
                 const gate = asRecord(provider.lifecycle_gate);
                 const manifest = asRecord(provider.manifest);
+                const uninstall = asRecord(provider.uninstall);
+                const installation = asRecord(uninstall.installation ?? provider.installation);
+                const target = String(uninstall.target ?? installation.target ?? "");
+                const managed = uninstall.managed === true;
+                const removable = uninstall.removable === true;
+                const blockers = Array.isArray(uninstall.blockers)
+                  ? uninstall.blockers.map(String)
+                  : [];
                 const available = detection.available === true;
                 return (
                   <tr key={name} className="border-b border-border last:border-0">
@@ -206,6 +222,56 @@ function BackendIntegrations() {
                     <td className="px-4 rift-mono text-[11px] text-ink-secondary">
                       {String(gate.advertised_status ?? "unknown")}
                     </td>
+                    <td className="px-4 py-3 text-[11px]">
+                      <div className="text-ink">{managed ? "RIFT-managed" : "Not RIFT-managed"}</div>
+                      {target && (
+                        <div className="mt-1 max-w-[360px] break-all rift-mono text-ink-secondary">
+                          {target}
+                        </div>
+                      )}
+                      {blockers.length > 0 && (
+                        <ul className="mt-1 grid gap-1 text-error">
+                          {blockers.map((blocker) => (
+                            <li key={blocker}>{blocker}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {removable ? (
+                        <button
+                          type="button"
+                          disabled={busyBackend !== null}
+                          onClick={async () => {
+                            if (
+                              !window.confirm(
+                                `Remove the RIFT-managed ${name} runtime at ${target}? Models, service configuration, and logs will be preserved.`,
+                              )
+                            )
+                              return;
+                            setBusyBackend(name);
+                            setActionNotice(null);
+                            setActionError(null);
+                            try {
+                              await rift.uninstallBackend(name, true);
+                              setActionNotice(`Removed ${name} from ${target}.`);
+                            } catch (removeError) {
+                              setActionError(
+                                removeError instanceof Error ? removeError.message : String(removeError),
+                              );
+                            } finally {
+                              setBusyBackend(null);
+                              await queryClient.invalidateQueries({ queryKey: keys.backends });
+                            }
+                          }}
+                          className="h-8 px-3 rounded-[4px] border border-error/40 text-[11px] text-error disabled:opacity-50"
+                        >
+                          {busyBackend === name ? "Removing…" : "Remove runtime"}
+                        </button>
+                      ) : (
+                        <span className="rift-mono text-[10px] text-ink-muted">Not removable</span>
+                      )}
+                    </td>
                   </tr>
                 );
               })
@@ -213,6 +279,18 @@ function BackendIntegrations() {
           </tbody>
         </table>
       </div>
+      {(actionNotice || actionError) && (
+        <div
+          className="border-t border-border px-4 py-3 text-[12px]"
+          role={actionError ? "alert" : "status"}
+        >
+          {actionError ? (
+            <span className="text-error">{actionError}</span>
+          ) : (
+            <span className="text-ink-secondary">{actionNotice}</span>
+          )}
+        </div>
+      )}
     </Panel>
   );
 }

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+import errno
 import hashlib
 import json
 import math
@@ -13,6 +15,7 @@ import signal
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Callable, Iterable, Mapping
@@ -32,6 +35,11 @@ from .benchmark_suite import (
     profile_catalog,
 )
 from .benchmarking import BenchmarkSuite, summarize_samples
+from .backends.managed_installation import (
+    inspect_managed_installation,
+    record_install_result,
+    remove_managed_installation,
+)
 from .evidence import EvidenceEngine
 from .governance import GovernancePolicy, deployment_manifest, write_deployment_manifest
 from .hf_hub import HfHubClient
@@ -69,6 +77,8 @@ from .tuning_coordinator import TuningCoordinatorMixin
 JsonDict = dict[str, Any]
 ApplyProgressCallback = Callable[[str, str, JsonDict], None]
 _TELEMETRY_RUNTIMES: dict[str, tuple[TelemetryStore, TelemetrySupervisor | None]] = {}
+_BACKEND_LOCKS: dict[str, threading.RLock] = {}
+_BACKEND_LOCKS_GUARD = threading.Lock()
 
 
 def _research_protocol_from_mapping(value: Mapping[str, Any] | None) -> ResearchProtocol:
@@ -170,6 +180,102 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         from .gateway import ApiKeyStore
 
         self.api_keys = ApiKeyStore(self.rift_dir / "gateway" / "api_keys.json")
+
+    def _record_managed_backend_install(
+        self,
+        backend_id: str,
+        target: str | Path,
+        install_result: JsonDict,
+    ) -> JsonDict:
+        try:
+            return record_install_result(self.rift_dir, backend_id, target, install_result)
+        except (OSError, ValueError) as exc:
+            return {
+                "backend_id": backend_id,
+                "managed": False,
+                "removable": False,
+                "reason": f"RIFT ownership could not be recorded: {exc}",
+            }
+
+    @contextmanager
+    def _backend_runtime_lock(self, backend_id: str):
+        """Serialize runtime launches, installs, and removal across RIFT processes."""
+        backend = str(backend_id or "").strip()
+        if not backend:
+            raise ValueError("backend id is required for runtime coordination")
+        lock_path = self.rift_dir / "backends" / ".locks" / f"{hashlib.sha256(backend.encode()).hexdigest()}.lock"
+        key = str(lock_path.resolve(strict=False))
+        with _BACKEND_LOCKS_GUARD:
+            local_lock = _BACKEND_LOCKS.setdefault(key, threading.RLock())
+        local_lock.acquire()
+        lock_file = None
+        os_locked = False
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = lock_path.open("a+b")
+            if os.name == "nt":
+                import msvcrt
+
+                lock_file.seek(0, os.SEEK_END)
+                if lock_file.tell() == 0:
+                    lock_file.write(b"0")
+                    lock_file.flush()
+                while not os_locked:
+                    lock_file.seek(0)
+                    try:
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        os_locked = True
+                    except OSError:
+                        time.sleep(0.05)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                os_locked = True
+            yield
+        finally:
+            if lock_file is not None:
+                if os_locked:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+            local_lock.release()
+
+    def _launch_backend_safely(
+        self,
+        backend_id: str,
+        provider: Any,
+        launch_plan: JsonDict,
+        *,
+        log_path: str,
+        on_launched: Callable[[JsonDict], None] | None = None,
+    ) -> JsonDict:
+        """Keep a launch and its state registration atomic with backend removal."""
+        with self._backend_runtime_lock(backend_id):
+            launched = provider.launch(launch_plan, log_path=log_path)
+            if on_launched is not None:
+                try:
+                    on_launched(launched)
+                except BaseException:
+                    pid_value = launched.get("pid")
+                    if pid_value not in (None, ""):
+                        try:
+                            provider.stop(pid=int(pid_value))
+                        except Exception:
+                            pass
+                    try:
+                        self._stop_container(launch_plan, launched)
+                    except Exception:
+                        pass
+                    raise
+            return launched
 
     @property
     def telemetry_store(self) -> TelemetryStore:
@@ -1540,13 +1646,20 @@ class RiftOrchestrator(TuningCoordinatorMixin):
         }
         runtime: JsonDict | None = None
         launch_plan: JsonDict = {}
+        runtime_lock_stack = ExitStack()
         try:
             detection = self._provider_probe(provider, backend)
             if not detection.get("available"):
-                install = provider.install(
-                    target_dir=str(self.rift_dir / "backends" / backend),
-                    variant="auto",
-                )
+                with self._backend_runtime_lock(backend):
+                    install = provider.install(
+                        target_dir=str(self.rift_dir / "backends" / backend),
+                        variant="auto",
+                    )
+                    install["managed_installation"] = self._record_managed_backend_install(
+                        backend,
+                        self.rift_dir / "backends" / backend,
+                        install,
+                    )
                 result["steps"].append({"kind": "install", "result": install})
                 detection = self._provider_probe(provider, backend)
                 if not detection.get("available"):
@@ -1599,6 +1712,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 hardware=hardware,
                 tuning={},
             )
+            runtime_lock_stack.enter_context(self._backend_runtime_lock(backend))
             runtime = provider.launch(
                 launch_plan,
                 log_path=str(self.rift_dir / "logs" / f"verify-{verification_id}-{backend}.log"),
@@ -1634,6 +1748,7 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 except Exception as exc:
                     result["teardown"] = {"stopped": False, "error": str(exc)}
             result["container_teardown"] = self._stop_container(launch_plan, runtime)
+            runtime_lock_stack.close()
         return result
 
     def _candidate_cached_model_path(
@@ -2160,10 +2275,16 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     total=len(install_actions),
                 )
                 try:
-                    result = provider.install(
-                        target_dir=str(self.rift_dir / "backends" / backend),
-                        variant=str(action.get("variant") or "auto"),
-                    )
+                    with self._backend_runtime_lock(backend):
+                        result = provider.install(
+                            target_dir=str(self.rift_dir / "backends" / backend),
+                            variant=str(action.get("variant") or "auto"),
+                        )
+                        result["managed_installation"] = self._record_managed_backend_install(
+                            backend,
+                            self.rift_dir / "backends" / backend,
+                            result,
+                        )
                 except Exception as exc:
                     report(
                         "installing",
@@ -2265,10 +2386,39 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 None,
                 {"service": service_name},
             )
+            def remember_launch(launched_runtime: JsonDict) -> None:
+                state.setdefault("services", {})[service_name] = {
+                    **service,
+                    "runtime": launched_runtime,
+                    "download": downloaded,
+                    "status": "started",
+                    "desired_state": "running",
+                    "supervisor": {
+                        "restart_count": 0,
+                        "consecutive_failures": 0,
+                        "next_retry_unix_seconds": 0.0,
+                        "last_restart_unix_seconds": None,
+                        "last_healthy_unix_seconds": None,
+                        "last_observation": None,
+                    },
+                    "last_known_good_launch_plan": None,
+                    "updated_unix_seconds": int(time.time()),
+                }
+                self._telemetry_start_service(
+                    service_name,
+                    state["services"][service_name],
+                    backend=str(service.get("backend") or "unknown"),
+                )
+                results.append({"service": service_name, "launched": launched_runtime})
+                self.write_state(state)
+
             try:
-                launched = provider.launch(
+                launched = self._launch_backend_safely(
+                    str(service["backend"]),
+                    provider,
                     launch_plan,
                     log_path=str(self.rift_dir / "logs" / f"{service_name}.log"),
+                    on_launched=remember_launch,
                 )
             except Exception as exc:
                 report(
@@ -2281,29 +2431,6 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     total=len(services),
                 )
                 raise
-            state.setdefault("services", {})[service_name] = {
-                **service,
-                "runtime": launched,
-                "download": downloaded,
-                "status": "started",
-                "desired_state": "running",
-                "supervisor": {
-                    "restart_count": 0,
-                    "consecutive_failures": 0,
-                    "next_retry_unix_seconds": 0.0,
-                    "last_restart_unix_seconds": None,
-                    "last_healthy_unix_seconds": None,
-                    "last_observation": None,
-                },
-                "last_known_good_launch_plan": None,
-                "updated_unix_seconds": int(time.time()),
-            }
-            self._telemetry_start_service(
-                service_name,
-                state["services"][service_name],
-                backend=str(service.get("backend") or "unknown"),
-            )
-            results.append({"service": service_name, "launched": launched})
             report("launching", f"Started {service_name}; waiting for health", 85.0, {"service": service_name})
         self.write_state(state)
         gateway_results: list[JsonDict] = []
@@ -3741,10 +3868,20 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "termination": termination,
                     "container_termination": old_container_termination,
                 }
+        def remember_restart(launched_runtime: JsonDict) -> None:
+            service["runtime"] = launched_runtime
+            service["launch_plan"] = recovery_plan
+            service["desired_state"] = "running"
+            service["status"] = "restarting"
+            self.write_state(state)
+
         try:
-            launched = provider.launch(
+            launched = self._launch_backend_safely(
+                backend,
+                provider,
                 recovery_plan,
                 log_path=str(self.rift_dir / "logs" / f"{name}.log"),
+                on_launched=remember_restart,
             )
         except Exception as exc:
             service["status"] = "degraded"
@@ -3880,23 +4017,28 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
                 handle = kernel32.OpenProcess(0x1000, False, int(pid))
                 if not handle:
-                    return False
+                    # ERROR_INVALID_PARAMETER means no such process. Access
+                    # denied and other API failures leave liveness unknown, so
+                    # fail closed for destructive backend removal.
+                    return ctypes.get_last_error() != 87
                 try:
                     code = wintypes.DWORD()
                     if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                        return False
+                        return True
                     return int(code.value) == 259
                 finally:
                     kernel32.CloseHandle(handle)
             except Exception:
-                return False
+                return True
         try:
             os.kill(int(pid), 0)
             return True
         except PermissionError:
             return True
-        except (ProcessLookupError, OSError):
+        except ProcessLookupError:
             return False
+        except OSError as exc:
+            return exc.errno != errno.ESRCH
 
     def _terminate_pid(self, pid: int, *, timeout_seconds: float = 5.0) -> JsonDict:
         if not self._process_alive(pid):
@@ -4214,6 +4356,8 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "manifest": provider.manifest.to_dict() if isinstance(getattr(provider, "manifest", None), AdapterManifest) else None,
                     "install_plan": provider.install_plan(),
                     "lifecycle_gate": provider_lifecycle_gate(provider),
+                    "installation": inspect_managed_installation(self.rift_dir, name),
+                    "uninstall": self.backend_uninstall_plan(name),
                 }
                 for name, provider in self.providers.items()
             },
@@ -4227,6 +4371,125 @@ class RiftOrchestrator(TuningCoordinatorMixin):
             },
             "registry": self.backend_host.diagnostics(),
         }
+
+    def _dependent_backend_services(self, backend_id: str) -> list[str]:
+        try:
+            state = self.read_state()
+        except Exception:
+            return ["(service state unavailable)"]
+        if not isinstance(state, dict):
+            return ["(service state unavailable)"]
+        # A missing services key is a valid empty state, but an explicit null,
+        # list, or other malformed value must not be silently treated as empty.
+        services = state.get("services", {})
+        if not isinstance(services, dict):
+            return ["(service state unavailable)"]
+        dependent = []
+        safe_stopped_states = {"stopped", "failed", "exited", "terminated"}
+        for name, service in services.items():
+            if not isinstance(service, dict):
+                dependent.append(f"(unverified service record: {name})")
+                continue
+            launch_plan = service.get("launch_plan")
+            backend_values = []
+            malformed_backend = False
+            for key in ("backend", "provider"):
+                value = service.get(key)
+                if value in (None, ""):
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    malformed_backend = True
+                    break
+                backend_values.append(value.strip())
+            if launch_plan is not None:
+                if not isinstance(launch_plan, dict):
+                    malformed_backend = True
+                else:
+                    launch_backend = launch_plan.get("backend")
+                    if launch_backend not in (None, ""):
+                        if not isinstance(launch_backend, str) or not launch_backend.strip():
+                            malformed_backend = True
+                        else:
+                            backend_values.append(launch_backend.strip())
+            if malformed_backend or not backend_values or len(set(backend_values)) != 1:
+                dependent.append(f"(unverified service record: {name})")
+                continue
+            service_backend = backend_values[0]
+            if service_backend != backend_id:
+                continue
+            raw_desired_state = service.get("desired_state", "running")
+            raw_status = service.get("status")
+            if (
+                not isinstance(raw_desired_state, str)
+                or raw_desired_state.lower() not in {"running", "stopped"}
+                or not isinstance(raw_status, str)
+                or not raw_status.strip()
+            ):
+                dependent.append(str(name))
+                continue
+            desired_state = raw_desired_state.lower()
+            status = raw_status.lower()
+            runtime = service.get("runtime")
+            if not isinstance(runtime, dict):
+                dependent.append(str(name))
+                continue
+            pid_value = runtime.get("pid")
+            if pid_value in (None, ""):
+                safely_stopped = desired_state == "stopped" and status in safe_stopped_states
+                if not safely_stopped:
+                    dependent.append(str(name))
+                continue
+            try:
+                if isinstance(pid_value, bool):
+                    raise ValueError("boolean is not a process id")
+                pid = int(pid_value)
+                if pid <= 0:
+                    raise ValueError("process id must be positive")
+                alive = self._process_alive(pid)
+            except Exception:
+                # If liveness cannot be established, fail closed and require
+                # the operator to stop or inspect the service first.
+                alive = True
+            safely_stopped = desired_state == "stopped" and status in safe_stopped_states
+            if alive or not safely_stopped:
+                dependent.append(str(name))
+        return sorted(set(dependent))
+
+    def backend_uninstall_plan(self, backend_id: str) -> JsonDict:
+        installation = inspect_managed_installation(self.rift_dir, backend_id)
+        dependent_services = self._dependent_backend_services(backend_id)
+        blockers = []
+        if not installation.get("managed"):
+            blockers.append(str(installation.get("reason") or "backend is not RIFT-managed"))
+        elif not installation.get("removable"):
+            blockers.append(str(installation.get("reason") or "RIFT ownership could not be verified"))
+        if dependent_services:
+            blockers.append(
+                "running or unverified RIFT service state blocks removal: "
+                + ", ".join(dependent_services)
+            )
+        return {
+            "backend_id": backend_id,
+            "installation": installation,
+            "managed": bool(installation.get("managed")),
+            "removable": bool(installation.get("removable")) and not dependent_services,
+            "target": installation.get("target"),
+            "install_type": installation.get("install_type"),
+            "dependent_services": dependent_services,
+            "blockers": blockers,
+            "requires_confirmation": True,
+        }
+
+    def uninstall_backend(self, backend_id: str, *, confirm: bool) -> JsonDict:
+        if not confirm:
+            raise ValueError("explicit confirmation is required to uninstall a backend")
+        with self._backend_runtime_lock(backend_id):
+            plan = self.backend_uninstall_plan(backend_id)
+            if plan["dependent_services"]:
+                raise ValueError(str(plan["blockers"][-1]))
+            if not plan["removable"]:
+                raise ValueError(str((plan.get("blockers") or ["backend is not removable"])[0]))
+            return remove_managed_installation(self.rift_dir, backend_id)
 
     def model_sources(self) -> JsonDict:
         """Return actual configured and managed model sources for the operator UI."""
@@ -6548,10 +6811,20 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                     "termination": termination,
                     "container_termination": old_container_termination,
                 }
+        def remember_process_restart(launched_runtime: JsonDict) -> None:
+            service["runtime"] = launched_runtime
+            service["launch_plan"] = launch_plan
+            service["status"] = "starting"
+            service["desired_state"] = "running"
+            self.write_state(state)
+
         try:
-            launched = provider.launch(
+            launched = self._launch_backend_safely(
+                str(service.get("backend") or getattr(provider, "name", "")),
+                provider,
                 launch_plan,
                 log_path=str(self.rift_dir / "logs" / f"{service_name}.log"),
+                on_launched=remember_process_restart,
             )
         except Exception as exc:
             return {
@@ -6560,11 +6833,6 @@ class RiftOrchestrator(TuningCoordinatorMixin):
                 "error": str(exc),
                 "termination": termination,
             }
-        service["runtime"] = launched
-        service["launch_plan"] = launch_plan
-        service["status"] = "starting"
-        service["desired_state"] = "running"
-        self.write_state(state)
         readiness = self._wait_for_readiness(
             provider=provider,
             runtime=launched,

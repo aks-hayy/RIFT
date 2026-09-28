@@ -151,13 +151,13 @@ class FakeMeshController:
         }
 
 
-def request_json(base_url, path, payload=None):
+def request_json(base_url, path, payload=None, headers=None):
     data = None
-    headers = {}
+    request_headers = dict(headers or {})
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(base_url + path, data=data, headers=headers)
+        request_headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(base_url + path, data=data, headers=request_headers)
     with urllib.request.urlopen(request, timeout=5) as response:
         body = response.read().decode("utf-8")
         return response.status, response.headers.get("Content-Type"), body
@@ -322,6 +322,107 @@ def test_service_accounting_api_reads_and_updates_the_selected_service(tmp_path)
         assert updated["electricity_price_per_kwh"] == 0.22
         assert updated["electricity_price_source"] == "service"
         assert runtime.control_get(path)["electricity_price_per_kwh"] == 0.22
+    finally:
+        runtime.shutdown()
+        orchestrator.close()
+
+
+def test_backend_uninstall_api_requires_confirmation(tmp_path):
+    class Orchestrator:
+        def uninstall_backend(self, backend_id, *, confirm):
+            raise AssertionError("confirmation must be checked before removal")
+
+    runtime = server_mod.RiftServerRuntime(orchestrator_factory=Orchestrator)
+    try:
+        try:
+            runtime.control_post("/api/rift/backends/llama.cpp/uninstall", {})
+        except ValueError as exc:
+            assert "confirm" in str(exc).lower()
+        else:
+            raise AssertionError("missing confirmation should be rejected")
+    finally:
+        runtime.shutdown()
+
+
+def test_backend_uninstall_api_rejects_unknown_or_external_runtime(tmp_path):
+    class Orchestrator:
+        def uninstall_backend(self, backend_id, *, confirm):
+            assert confirm is True
+            raise ValueError("backend is not a removable RIFT-managed installation")
+
+    runtime = server_mod.RiftServerRuntime(orchestrator_factory=Orchestrator)
+    try:
+        try:
+            runtime.control_post("/api/rift/backends/external/uninstall", {"confirm": True})
+        except ValueError as exc:
+            assert "not a removable RIFT-managed" in str(exc)
+        else:
+            raise AssertionError("external runtimes must not be removable")
+    finally:
+        runtime.shutdown()
+
+
+def test_backend_uninstall_api_replays_same_request_id(tmp_path):
+    class Orchestrator:
+        def __init__(self):
+            self.removal_count = 0
+
+        def uninstall_backend(self, backend_id, *, confirm):
+            assert backend_id == "llama.cpp"
+            assert confirm is True
+            self.removal_count += 1
+            return {"uninstalled": True, "backend_id": backend_id, "target": "fixture"}
+
+    orchestrator = Orchestrator()
+    runtime = server_mod.RiftServerRuntime(
+        orchestrator_factory=lambda: orchestrator,
+        operation_store=OperationStore(tmp_path / "operations"),
+    )
+    httpd = server_mod.create_rift_server(host="127.0.0.1", port=0, runtime=runtime)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{httpd.server_port}"
+    try:
+        path = "/api/rift/backends/llama.cpp/uninstall"
+        headers = {"X-Request-ID": "backend-uninstall-replay"}
+        first_status, _, first_body = request_json(base_url, path, {"confirm": True}, headers)
+        second_status, _, second_body = request_json(base_url, path, {"confirm": True}, headers)
+        assert first_status == 200
+        assert second_status == 200
+        assert json.loads(first_body)["uninstalled"] is True
+        assert json.loads(second_body)["replayed"] is True
+        assert orchestrator.removal_count == 1
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        runtime.shutdown()
+
+
+def test_backend_uninstall_api_removes_only_a_real_managed_fixture(tmp_path):
+    from rift.backends.managed_installation import record_managed_installation
+    from rift.orchestrator import RiftOrchestrator
+
+    runtime_home = tmp_path / "runtime"
+    target = runtime_home / "backends" / "vllm"
+    (target / "venv").mkdir(parents=True)
+    (target / "operator-note.txt").write_text("preserve", encoding="utf-8")
+    record_managed_installation(
+        runtime_home,
+        "vllm",
+        target,
+        "native-venv",
+        {"managed_paths": ["venv"]},
+    )
+    orchestrator = RiftOrchestrator(runtime_root=runtime_home)
+    runtime = server_mod.RiftServerRuntime(orchestrator_factory=lambda: orchestrator)
+    try:
+        result = runtime.control_post(
+            "/api/rift/backends/vllm/uninstall", {"confirm": True}
+        )
+        assert result["uninstalled"] is True
+        assert not (target / "venv").exists()
+        assert (target / "operator-note.txt").read_text(encoding="utf-8") == "preserve"
     finally:
         runtime.shutdown()
         orchestrator.close()

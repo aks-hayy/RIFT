@@ -22,6 +22,7 @@ sys.modules["rift._core"] = fake_core
 
 conformance = importlib.import_module("rift.adapters.conformance")
 llama_mod = importlib.import_module("rift.providers.llama_cpp")
+llama_backend_mod = importlib.import_module("rift.backends.llama_cpp.backend")
 vllm_mod = importlib.import_module("rift.providers.vllm")
 sglang_mod = importlib.import_module("rift.providers.sglang")
 mlx_mod = importlib.import_module("rift.providers.mlx_lm")
@@ -225,6 +226,195 @@ def test_llama_install_falls_back_when_latest_release_has_only_marker_assets():
     selected = provider._select_install_release(variant="cuda12")
     assert selected["release"]["tag_name"] == "b10486"
     assert selected["assets"] == [usable_asset]
+
+
+def _llama_variant_assets():
+    return [
+        {
+            "name": "llama-b123-bin-win-cpu-x64.zip",
+            "browser_download_url": "https://example.invalid/cpu.zip",
+        },
+        {
+            "name": "llama-b123-bin-win-cuda-12.4-x64.zip",
+            "browser_download_url": "https://example.invalid/cuda.zip",
+        },
+    ]
+
+
+def test_auto_selects_cuda_only_after_gpu_and_driver_probes(monkeypatch):
+    calls = []
+
+    def gpu_probe():
+        calls.append("gpu")
+        return {"available": True, "devices": [{"name": "RTX fixture"}]}
+
+    def cuda_probe():
+        calls.append("cuda")
+        return {"available": True, "device_count": 1}
+
+    monkeypatch.setattr(llama_backend_mod, "probe_nvidia_gpu", gpu_probe, raising=False)
+    monkeypatch.setattr(llama_backend_mod, "probe_cuda_driver", cuda_probe, raising=False)
+
+    selected = llama_mod.LlamaCppProvider()._select_windows_assets(_llama_variant_assets(), variant="auto")
+
+    assert calls == ["gpu", "cuda"]
+    assert "cuda" in selected[0]["name"].lower()
+
+
+def test_auto_selects_cpu_when_gpu_is_absent(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_nvidia_gpu",
+        lambda: calls.append("gpu") or {"available": False, "reason": "no NVIDIA GPU"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_cuda_driver",
+        lambda: calls.append("cuda") or {"available": True, "device_count": 1},
+        raising=False,
+    )
+
+    selected = llama_mod.LlamaCppProvider()._select_windows_assets(_llama_variant_assets(), variant="auto")
+
+    assert calls == ["gpu"]
+    assert "cpu" in selected[0]["name"].lower()
+
+
+def test_auto_selects_cpu_when_driver_probe_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_nvidia_gpu",
+        lambda: calls.append("gpu") or {"available": True, "devices": [{"name": "RTX fixture"}]},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_cuda_driver",
+        lambda: calls.append("cuda") or {"available": False, "reason": "cuInit failed"},
+        raising=False,
+    )
+
+    selected = llama_mod.LlamaCppProvider()._select_windows_assets(_llama_variant_assets(), variant="auto")
+
+    assert calls == ["gpu", "cuda"]
+    assert "cpu" in selected[0]["name"].lower()
+
+
+def test_auto_ignores_cuda_path_and_cuda_home(monkeypatch):
+    monkeypatch.setenv("CUDA_PATH", "C:/fixture/cuda")
+    monkeypatch.setenv("CUDA_HOME", "C:/fixture/cuda-home")
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_nvidia_gpu",
+        lambda: {"available": False, "reason": "no NVIDIA GPU"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_cuda_driver",
+        lambda: {"available": True, "device_count": 1},
+        raising=False,
+    )
+
+    selected = llama_mod.LlamaCppProvider()._select_windows_assets(_llama_variant_assets(), variant="auto")
+
+    assert "cpu" in selected[0]["name"].lower()
+
+
+def test_explicit_cuda_variant_is_not_silently_downgraded(monkeypatch):
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_nvidia_gpu",
+        lambda: {"available": False, "reason": "no NVIDIA GPU"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_cuda_driver",
+        lambda: {"available": False, "reason": "driver unavailable"},
+        raising=False,
+    )
+
+    selected = llama_mod.LlamaCppProvider()._select_windows_assets(_llama_variant_assets(), variant="cuda12")
+
+    assert "cuda" in selected[0]["name"].lower()
+
+
+def test_explicit_cuda_does_not_select_cpu_asset():
+    provider = llama_mod.LlamaCppProvider()
+    selected = provider._select_windows_assets(
+        [_llama_variant_assets()[0]], variant="cuda12"
+    )
+    assert selected == []
+
+
+def test_explicit_cpu_does_not_select_cuda_asset():
+    provider = llama_mod.LlamaCppProvider()
+    selected = provider._select_windows_assets(
+        [_llama_variant_assets()[1]], variant="cpu"
+    )
+    assert selected == []
+
+
+def test_cuda12_selection_includes_matching_cudart_companion_only():
+    provider = llama_mod.LlamaCppProvider()
+    assets = [
+        {
+            "name": "llama-b123-bin-win-cuda-12.4-x64.zip",
+            "browser_download_url": "https://example.invalid/llama-cuda12.zip",
+        },
+        {
+            "name": "cudart-12.4-win-x64.zip",
+            "browser_download_url": "https://example.invalid/cudart12.zip",
+        },
+        {
+            "name": "cudart-13.0-win-x64.zip",
+            "browser_download_url": "https://example.invalid/cudart13.zip",
+        },
+    ]
+
+    selected = provider._select_windows_assets(assets, variant="cuda12")
+
+    assert [asset["name"] for asset in selected] == [
+        "llama-b123-bin-win-cuda-12.4-x64.zip",
+        "cudart-12.4-win-x64.zip",
+    ]
+
+
+def test_auto_without_cuda_probe_does_not_select_cuda_only_asset(monkeypatch):
+    monkeypatch.setattr(
+        llama_backend_mod,
+        "probe_nvidia_gpu",
+        lambda: {"available": False, "reason": "no NVIDIA GPU"},
+        raising=False,
+    )
+    provider = llama_mod.LlamaCppProvider()
+    selected = provider._select_windows_assets(
+        [_llama_variant_assets()[1]], variant="auto"
+    )
+    assert selected == []
+
+
+def test_cuda_variant_searches_release_history_for_matching_flavor():
+    provider = llama_mod.LlamaCppProvider()
+    cpu_asset = _llama_variant_assets()[0]
+    cuda_asset = _llama_variant_assets()[1]
+    provider._latest_release_info = lambda: {
+        "tag_name": "latest-cpu-only",
+        "assets": [cpu_asset],
+    }
+    provider._release_history_info = lambda: [
+        {"tag_name": "latest-cpu-only", "assets": [cpu_asset]},
+        {"tag_name": "older-cuda", "assets": [cuda_asset]},
+    ]
+
+    selected = provider._select_install_release(variant="cuda12")
+
+    assert selected["release"]["tag_name"] == "older-cuda"
+    assert selected["selected_assets"] == [cuda_asset]
 
 
 class OpenAIHandler(BaseHTTPRequestHandler):
